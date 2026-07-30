@@ -1,0 +1,18 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # One step, invoking the same script developers run locally. Listing the
+      # gates here separately let CI drift from scripts/check.ps1 - it was
+      # missing `ruff format --check`, so unformatted code could reach main.
+      - name: gate
+        shell: pwsh
+        run: ./scripts/check.ps1

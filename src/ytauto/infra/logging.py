@@ -1,0 +1,123 @@
+"""Structured JSON-lines logging with correlation-ID propagation."""
+
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
+from typing import Any
+
+from ytauto.infra.paths import AppPaths
+
+_correlation_id: ContextVar[str] = ContextVar("correlation_id", default="-")
+
+# Attributes the stdlib puts on every LogRecord. Anything else is caller context
+# supplied via ``extra=`` and belongs in the emitted JSON.
+_RESERVED: frozenset[str] = frozenset(
+    {
+        "args",
+        "asctime",
+        "created",
+        "exc_info",
+        "exc_text",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "module",
+        "msecs",
+        "message",
+        "msg",
+        "name",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "taskName",
+        "thread",
+        "threadName",
+    }
+)
+
+
+def bind_correlation_id(cid: str | None = None) -> str:
+    """Set the correlation ID for this context, generating one when omitted."""
+    value = cid if cid is not None else uuid.uuid4().hex
+    _correlation_id.set(value)
+    return value
+
+
+def current_correlation_id() -> str:
+    return _correlation_id.get()
+
+
+class JsonFormatter(logging.Formatter):
+    """Render a LogRecord as a single-line JSON object."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Render a record as one JSON line.
+
+        Raises:
+            ValueError: a value passed via ``extra=`` contains a circular
+                reference. Non-serialisable values are coerced with ``str``
+                rather than raising, so this is the only failure mode.
+        """
+        payload: dict[str, Any] = {
+            "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "correlation_id": current_correlation_id(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        for key, value in record.__dict__.items():
+            if key not in _RESERVED and not key.startswith("_"):
+                payload[key] = value
+        return json.dumps(payload, default=str)
+
+
+def configure_logging(paths: AppPaths, *, level: str = "INFO") -> None:
+    """Install a rotating JSON-lines file handler and a plain console handler.
+
+    Raises:
+        ConfigurationError: paths.ensure() could not create a directory.
+        OSError: the log file itself cannot be opened. This is a *separate*
+            failure from the one above and is the one that actually fires on an
+            unwritable data root, because mkdir(exist_ok=True) on an existing
+            directory succeeds regardless of write permission - so ensure()
+            returns cleanly and the RotatingFileHandler constructor is what
+            fails. Callers guarding only ConfigurationError will still crash.
+    """
+    paths.ensure()
+    root = logging.getLogger("ytauto")
+    root.setLevel(level)
+    # Close before dropping: list.clear() alone would leak the open log file
+    # descriptor on every reconfiguration. On Windows that also locks the file,
+    # so a later attempt to remove or rotate it fails with WinError 32.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
+    root.propagate = False
+
+    file_handler = RotatingFileHandler(
+        paths.logs / "ytauto.jsonl",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(JsonFormatter())
+    root.addHandler(file_handler)
+
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+    root.addHandler(console)
+
+
+def get_logger(name: str) -> logging.Logger:
+    return logging.getLogger(name)

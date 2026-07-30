@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ytauto"
+version = "0.1.0"
+description = "Faceless YouTube video automation"
+requires-python = ">=3.12"
+dependencies = [
+    "platformdirs>=4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "import-linter>=2.0",
+]
+
+[project.scripts]
+ytauto = "ytauto.cli.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration tests shell out to a real ffmpeg and nvidia-smi, so they are
+# excluded by default: the unit suite must stay hermetic and runnable anywhere.
+# scripts/check.ps1 runs them as a separate, explicitly gated step.
+addopts = "-q --strict-markers -m 'not integration'"
+markers = ["integration: requires real external binaries"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# RUF100 flags noqa codes that suppress nothing. Without it, a `# noqa: S603`
+# for a rule that is not even selected looks like an active lint and isn't.
+select = ["E", "F", "I", "UP", "B", "SIM", "PTH", "RUF100"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["ytauto"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = "ytauto.core.*"
+strict = true
+
+[tool.importlinter]
+root_package = "ytauto"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "core is pure - depends on nothing internal"
+type = "forbidden"
+source_modules = ["ytauto.core"]
+forbidden_modules = [
+    "ytauto.infra",
+    "ytauto.app",
+    "ytauto.providers",
+    "ytauto.ui",
+    "ytauto.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "engine never imports Qt"
+type = "forbidden"
+source_modules = [
+    "ytauto.core",
+    "ytauto.app",
+    "ytauto.providers",
+    "ytauto.infra",
+    "ytauto.cli",
+]
+forbidden_modules = ["PySide6"]
+
+[[tool.importlinter.contracts]]
+name = "layered architecture"
+type = "layers"
+layers = ["ytauto.ui", "ytauto.app", "ytauto.core"]

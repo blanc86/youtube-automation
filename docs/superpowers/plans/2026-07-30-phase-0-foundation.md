@@ -276,22 +276,34 @@ Expected: 3 passed.
 `scripts/check.ps1`:
 
 ```powershell
+# NOTE: $ErrorActionPreference does NOT apply to native executable exit codes
+# in Windows PowerShell 5.1, so every step below needs its own explicit
+# $LASTEXITCODE check. Without them this script reports success while the
+# tools underneath it are failing. The repetition is deliberate: a helper
+# taking a scriptblock has subtle $LASTEXITCODE scoping behaviour in 5.1,
+# and for a five-step gate script obviousness beats DRY.
 $ErrorActionPreference = "Stop"
 $py = ".\.venv\Scripts\python.exe"
 
-Write-Host "== ruff ==" -ForegroundColor Cyan
+Write-Host "== ruff check ==" -ForegroundColor Cyan
 & $py -m ruff check src tests
+if ($LASTEXITCODE -ne 0) { Write-Host "ruff check FAILED" -ForegroundColor Red; exit 1 }
+
+Write-Host "== ruff format ==" -ForegroundColor Cyan
 & $py -m ruff format --check src tests
+if ($LASTEXITCODE -ne 0) { Write-Host "ruff format FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "== mypy ==" -ForegroundColor Cyan
 & $py -m mypy
+if ($LASTEXITCODE -ne 0) { Write-Host "mypy FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "== import-linter ==" -ForegroundColor Cyan
 & ".\.venv\Scripts\lint-imports.exe"
-if ($LASTEXITCODE -ne 0) { throw "import-linter contracts violated" }
+if ($LASTEXITCODE -ne 0) { Write-Host "import-linter FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "== pytest ==" -ForegroundColor Cyan
 & $py -m pytest
+if ($LASTEXITCODE -ne 0) { Write-Host "pytest FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "ALL CHECKS PASSED" -ForegroundColor Green
 ```
@@ -599,6 +611,8 @@ from pathlib import Path
 
 from platformdirs import user_data_dir
 
+from ytauto.core.errors import ConfigurationError
+
 _ENV_VAR = "YTAUTO_DATA_DIR"
 
 
@@ -636,9 +650,20 @@ class AppPaths:
         )
 
     def ensure(self) -> None:
-        """Create every directory. Idempotent."""
+        """Create every directory. Idempotent.
+
+        Raises ConfigurationError if a directory cannot be created. An
+        unwritable data root is a misconfiguration the user must resolve, not
+        a transient fault — so it enters the typed taxonomy here rather than
+        leaking a raw OSError to every caller.
+        """
         for directory in (self.root, self.projects, self.cas, self.logs, self.cache, self.exports):
-            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"cannot create application directory {directory}: {exc}"
+                ) from exc
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -754,9 +779,17 @@ def test_configure_logging_writes_a_log_file(tmp_path: Path) -> None:
     paths = AppPaths.resolve(override=tmp_path)
     paths.ensure()
     configure_logging(paths, level="DEBUG")
-    get_logger("ytauto.test").info("written to disk", extra={"stage": "doctor"})
+    try:
+        get_logger("ytauto.test").info("written to disk", extra={"stage": "doctor"})
+    finally:
+        # Close only the handlers this test installed. logging.shutdown() would
+        # close every handler in the interpreter, leaving closed-but-attached
+        # handlers on the "ytauto" logger for the rest of the session.
+        root = logging.getLogger("ytauto")
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
 
-    logging.shutdown()
     log_files = list(paths.logs.glob("*.jsonl"))
     assert log_files, "expected a .jsonl log file"
     lines = [json.loads(line) for line in log_files[0].read_text("utf-8").splitlines() if line]
@@ -839,7 +872,12 @@ def configure_logging(paths: AppPaths, *, level: str = "INFO") -> None:
     paths.ensure()
     root = logging.getLogger("ytauto")
     root.setLevel(level)
-    root.handlers.clear()
+    # Close before dropping: list.clear() alone would leak the open log file
+    # descriptor on every reconfiguration. On Windows that also locks the file,
+    # so a later attempt to remove or rotate it fails with WinError 32.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
     root.propagate = False
 
     file_handler = RotatingFileHandler(
@@ -1141,6 +1179,7 @@ from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import (
     HEAD_VERSION,
     MIGRATIONS,
+    Migration,
     apply_migrations,
     current_version,
 )
@@ -1198,6 +1237,34 @@ def test_cas_objects_rejects_duplicate_hashes(tmp_path: Path) -> None:
     conn.execute(insert, args)
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(insert, args)
+    conn.close()
+
+
+def test_failed_migration_rolls_back_schema_and_version_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The atomicity guarantee, asserted under an actual failure.
+
+    Without this, every other test in this file would still pass if the
+    `transaction()` wrapper were deleted outright — they only ever check
+    post-success state.
+    """
+    conn = connect(tmp_path / "t.db")
+    broken = Migration(
+        version=1,
+        name="broken",
+        statements=(
+            "CREATE TABLE will_not_survive (a TEXT)",
+            "THIS IS NOT VALID SQL",
+        ),
+    )
+    monkeypatch.setattr("ytauto.infra.db.migrations.MIGRATIONS", (broken,))
+
+    with pytest.raises(sqlite3.OperationalError):
+        apply_migrations(conn)
+
+    assert current_version(conn) == 0, "version row must not survive a failed migration"
+    assert "will_not_survive" not in _tables(conn), "DDL must roll back with the version row"
     conn.close()
 ```
 
@@ -1328,7 +1395,35 @@ git commit -m "feat: add idempotent schema migrations with cas_objects and setti
 
 **Files:**
 - Create: `src/ytauto/infra/cas/store.py`
+- Create: `tests/unit/infra/conftest.py`
 - Test: `tests/unit/infra/test_cas_store.py`
+
+**Shared fixture — `tests/unit/infra/conftest.py`.** Task 8 needs the same
+`store` fixture; defining it in both test files would be verbatim duplication.
+It lives in `conftest.py` so pytest injects it into both without an import.
+Note the `yield`/`finally`: returning the store without closing the connection
+leaves an open SQLite handle that prevents Windows from deleting `tmp_path`.
+
+```python
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+from ytauto.infra.cas.store import CasStore
+from ytauto.infra.db.engine import connect
+from ytauto.infra.db.migrations import apply_migrations
+
+
+@pytest.fixture()
+def store(tmp_path: Path) -> Iterator[CasStore]:
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    try:
+        yield CasStore(root=tmp_path / "cas", conn=conn)
+    finally:
+        conn.close()
+```
 
 **Interfaces:**
 - Consumes: `ytauto.core.errors.ValidationError`, `ytauto.infra.db.engine.transaction`, `ytauto.infra.clock.utc_now_iso`
@@ -1373,15 +1468,6 @@ import pytest
 
 from ytauto.core.errors import ValidationError
 from ytauto.infra.cas.store import CasStore, hash_bytes, hash_file
-from ytauto.infra.db.engine import connect
-from ytauto.infra.db.migrations import apply_migrations
-
-
-@pytest.fixture()
-def store(tmp_path: Path) -> CasStore:
-    conn = connect(tmp_path / "t.db")
-    apply_migrations(conn)
-    return CasStore(root=tmp_path / "cas", conn=conn)
 
 
 def test_hash_bytes_matches_sha256() -> None:
@@ -1745,16 +1831,8 @@ import pytest
 from ytauto.core.errors import ValidationError
 from ytauto.infra.cas.eviction import MAX_CEILING_BYTES, Evictor, EvictionPolicy
 from ytauto.infra.cas.store import CasStore
-from ytauto.infra.db.engine import connect
-from ytauto.infra.db.migrations import apply_migrations
 
-
-@pytest.fixture()
-def store(tmp_path: Path) -> CasStore:
-    conn = connect(tmp_path / "t.db")
-    apply_migrations(conn)
-    return CasStore(root=tmp_path / "cas", conn=conn)
-
+# `store` comes from tests/unit/infra/conftest.py — do NOT redefine it here.
 
 OLD = "2020-01-01T00:00:00+00:00"
 NEW = "2026-01-01T00:00:00+00:00"
@@ -2021,7 +2099,11 @@ def test_missing_ffprobe_beside_ffmpeg_is_rejected(
     (lonely / "ffmpeg.exe").write_text("stub")
     monkeypatch.delenv("YTAUTO_FFMPEG_DIR", raising=False)
     monkeypatch.setattr("shutil.which", lambda *_a, **_k: None)
-    with pytest.raises(FfmpegNotFound, match="ffprobe"):
+    # Match a phrase unique to the mismatched-pair message. Matching on
+    # "ffprobe" alone would also match the generic not-found message, so this
+    # test would still pass if _pair_in's error were caught inside the loop
+    # and the search fell through to exhaust every candidate.
+    with pytest.raises(FfmpegNotFound, match="beside it"):
         locate(configured_dir=lonely)
 
 
@@ -2295,12 +2377,18 @@ _ENCODER_RE = re.compile(r"^\s*[A-Z.]{6}\s+(\S+)")
 _FILTER_RE = re.compile(r"^\s*[A-Z.]{3}\s+(\S+)")
 
 
+# ffmpeg prints a legend above the real rows, e.g. " V..... = Video" and
+# "  T.. = Timeline support". Those flag runs satisfy the patterns above and
+# would capture "=" as a capability name, so the separator is excluded.
+_LEGEND_SEPARATOR = "="
+
+
 def parse_encoders(output: str) -> frozenset[str]:
     """Extract encoder names from ``ffmpeg -encoders`` output. Pure."""
     return frozenset(
         match.group(1)
         for line in output.splitlines()
-        if (match := _ENCODER_RE.match(line))
+        if (match := _ENCODER_RE.match(line)) and match.group(1) != _LEGEND_SEPARATOR
     )
 
 
@@ -2309,7 +2397,7 @@ def parse_filters(output: str) -> frozenset[str]:
     return frozenset(
         match.group(1)
         for line in output.splitlines()
-        if (match := _FILTER_RE.match(line))
+        if (match := _FILTER_RE.match(line)) and match.group(1) != _LEGEND_SEPARATOR
     )
 
 
@@ -2688,7 +2776,8 @@ def _check_paths(paths: AppPaths) -> CheckResult:
         probe_file = paths.cache / ".write-test"
         probe_file.write_text("ok", encoding="utf-8")
         probe_file.unlink()
-    except OSError as exc:
+    except (ConfigurationError, OSError) as exc:
+        # ensure() raises ConfigurationError; the write probe raises raw OSError.
         return CheckResult("data directories", Severity.FAIL, f"{paths.root}: {exc}")
     return CheckResult("data directories", Severity.OK, str(paths.root))
 
@@ -2733,7 +2822,18 @@ def _check_ffmpeg() -> list[CheckResult]:
         ]
 
     results = [CheckResult("ffmpeg", Severity.OK, f"{binaries.version} at {binaries.ffmpeg}")]
-    capabilities = probe(binaries)
+    try:
+        capabilities = probe(binaries)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # A present-but-broken binary (corrupt, unexecutable, hanging) is exactly
+        # what doctor exists to surface. probe() can raise TimeoutExpired, which
+        # is a SubprocessError and NOT an OSError. Letting it escape would show a
+        # traceback instead of the diagnosis.
+        detail = f"could not probe ffmpeg: {exc}"
+        results.append(CheckResult("h264 encoder", Severity.FAIL, detail))
+        results.append(CheckResult("subtitle burn-in", Severity.FAIL, detail))
+        return results
+
     try:
         encoder = capabilities.best_h264_encoder()
         severity = Severity.OK if encoder != "libx264" else Severity.WARN
@@ -2763,8 +2863,12 @@ def _check_gpu() -> CheckResult:
 
 
 def _check_disk(paths: AppPaths) -> CheckResult:
-    paths.ensure()
-    free_gb = shutil.disk_usage(paths.root).free / 1024**3
+    try:
+        paths.ensure()
+        free_gb = shutil.disk_usage(paths.root).free / 1024**3
+    except (ConfigurationError, OSError) as exc:
+        # Never let a failed check abort the run - doctor must report every row.
+        return CheckResult("free disk", Severity.FAIL, str(exc))
     severity = Severity.OK if free_gb >= _LOW_DISK_WARN_GB else Severity.WARN
     return CheckResult("free disk", severity, f"{free_gb:.1f} GB free")
 
@@ -2827,7 +2931,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     paths = AppPaths.resolve(override=args.data_dir)
-    configure_logging(paths)
+
+    # Deliberately non-fatal. configure_logging calls paths.ensure(), which
+    # raises ConfigurationError on an unwritable data root - precisely the
+    # condition `doctor` exists to report. Crashing here would show a traceback
+    # instead of the diagnosis, and would make the careful error handling in
+    # _check_paths/_check_disk unreachable on the real CLI path. File logging
+    # is simply unavailable for such a run; _check_paths surfaces the cause.
+    with contextlib.suppress(ConfigurationError):
+        configure_logging(paths)
     bind_correlation_id()
 
     if args.command == "doctor":
