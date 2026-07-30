@@ -8,8 +8,12 @@ binary (and, where present, ``nvidia-smi``) rather than monkeypatching it.
 
 from pathlib import Path
 
+import pytest
+
 from ytauto.cli.doctor import Severity, run_checks
 from ytauto.infra.paths import AppPaths
+
+pytestmark = pytest.mark.integration
 
 
 def test_run_checks_covers_the_expected_surface(tmp_path: Path) -> None:

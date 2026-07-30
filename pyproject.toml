@@ -28,14 +28,20 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
+# Integration tests shell out to a real ffmpeg and nvidia-smi, so they are
+# excluded by default: the unit suite must stay hermetic and runnable anywhere.
+# scripts/check.ps1 runs them as a separate, explicitly gated step.
+addopts = "-q --strict-markers -m 'not integration'"
+markers = ["integration: requires real external binaries"]
 
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "PTH"]
+# RUF100 flags noqa codes that suppress nothing. Without it, a `# noqa: S603`
+# for a rule that is not even selected looks like an active lint and isn't.
+select = ["E", "F", "I", "UP", "B", "SIM", "PTH", "RUF100"]
 
 [tool.mypy]
 python_version = "3.12"

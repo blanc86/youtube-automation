@@ -10,7 +10,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: ruff check src tests
-      - run: mypy
-      - run: lint-imports
-      - run: pytest
+      # One step, invoking the same script developers run locally. Listing the
+      # gates here separately let CI drift from scripts/check.ps1 - it was
+      # missing `ruff format --check`, so unformatted code could reach main.
+      - name: gate
+        shell: pwsh
+        run: ./scripts/check.ps1

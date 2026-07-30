@@ -21,6 +21,7 @@ ENCODERS_OUTPUT = """Encoders:
 """
 
 FILTERS_OUTPUT = """Filters:
+  T.. = Timeline support
   ... ass               V->V       Render ASS subtitles onto input video using the libass library.
   ... subtitles         V->V       Render text subtitles onto input video using the libass library.
   ... overlay_cuda      VV->V      Overlay one video on top of another using CUDA
@@ -48,6 +49,18 @@ def test_parse_encoders_excludes_header_and_legend_lines() -> None:
 def test_parse_filters_finds_subtitle_and_cuda_filters() -> None:
     filters = parse_filters(FILTERS_OUTPUT)
     assert {"ass", "subtitles", "scale_cuda", "zoompan", "xfade"} <= filters
+
+
+def test_parse_filters_excludes_header_and_legend_lines() -> None:
+    """Mirrors the encoders exclusion test.
+
+    The fixture previously had no legend row, so deleting the
+    `and match.group(1) != "="` guard from parse_filters broke no test.
+    """
+    filters = parse_filters(FILTERS_OUTPUT)
+    assert "Filters:" not in filters
+    assert "=" not in filters
+    assert "Timeline" not in filters
 
 
 def test_nvenc_is_preferred_when_available() -> None:
@@ -79,4 +92,15 @@ def test_subtitle_burn_in_requires_the_ass_filter() -> None:
     ).has_subtitle_burn_in()
     assert not FfmpegCapabilities(
         encoders=frozenset(), filters=frozenset({"zoompan"})
+    ).has_subtitle_burn_in()
+
+
+def test_the_subtitles_filter_alone_is_not_enough() -> None:
+    """Pins that the requirement is the `ass` filter specifically.
+
+    A build can expose `subtitles` without `ass`; the styled captions this
+    pipeline renders need libass, so that build is unusable.
+    """
+    assert not FfmpegCapabilities(
+        encoders=frozenset(), filters=frozenset({"subtitles"})
     ).has_subtitle_burn_in()

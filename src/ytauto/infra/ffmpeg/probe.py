@@ -62,10 +62,11 @@ class FfmpegCapabilities:
 
 
 def _run(binary: str, flag: str) -> str:
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(
         [binary, "-hide_banner", flag],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
         check=False,
     )

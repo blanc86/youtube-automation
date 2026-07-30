@@ -42,10 +42,15 @@ def detect() -> GpuInfo | None:
     if executable is None:
         return None
     try:
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(
             [executable, _QUERY, _FORMAT],
             capture_output=True,
-            text=True,
+            # Explicit over text=True: text=True decodes with the locale
+            # encoding, so a GPU name containing a non-ASCII byte raises
+            # UnicodeDecodeError on a cp1252 console. A mangled character in a
+            # display string must never be able to fail detection.
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )
