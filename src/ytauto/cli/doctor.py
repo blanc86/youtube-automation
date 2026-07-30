@@ -7,6 +7,7 @@ no video can ever be subtitled).
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 import sqlite3
 import subprocess
@@ -63,38 +64,58 @@ def _check_paths(paths: AppPaths) -> CheckResult:
 def _check_database(paths: AppPaths) -> list[CheckResult]:
     results: list[CheckResult] = []
     try:
-        conn = connect(paths.db_file)
-        version = apply_migrations(conn)
-        results.append(
-            CheckResult(
-                "database",
-                Severity.OK if version == HEAD_VERSION else Severity.FAIL,
-                f"schema v{version} (head v{HEAD_VERSION})",
+        # closing(): the connection must be released even when apply_migrations
+        # or the ceiling calculation raises. With conn.close() as the last
+        # statement of the try block, every failure below leaked it.
+        with contextlib.closing(connect(paths.db_file)) as conn:
+            version = apply_migrations(conn)
+            results.append(
+                CheckResult(
+                    "database",
+                    Severity.OK if version == HEAD_VERSION else Severity.FAIL,
+                    f"schema v{version} (head v{HEAD_VERSION})",
+                )
             )
-        )
-        store = CasStore(root=paths.cas, conn=conn)
-        current = store.total_size()
-        policy = EvictionPolicy.compute(paths.cas, current_size=current)
-        results.append(
-            CheckResult(
-                "cache ceiling",
-                Severity.OK,
-                f"{current / 1024**3:.2f} GB used of {policy.max_bytes / 1024**3:.1f} GB",
+            store = CasStore(root=paths.cas, conn=conn)
+            current = store.total_size()
+            policy = EvictionPolicy.compute(paths.cas, current_size=current)
+            results.append(
+                CheckResult(
+                    "cache ceiling",
+                    Severity.OK,
+                    f"{current / 1024**3:.2f} GB used of {policy.max_bytes / 1024**3:.1f} GB",
+                )
             )
-        )
-        conn.close()
     except (OSError, sqlite3.Error) as exc:
-        results.append(CheckResult("database", Severity.FAIL, str(exc)))
-        results.append(CheckResult("cache ceiling", Severity.FAIL, "unavailable"))
+        # Fill in only the rows that were not reached. The ceiling calculation
+        # runs after the database row is appended, so appending both
+        # unconditionally would emit a second, contradictory "database" row.
+        reported = {r.name for r in results}
+        if "database" not in reported:
+            results.append(CheckResult("database", Severity.FAIL, str(exc)))
+        if "cache ceiling" not in reported:
+            results.append(CheckResult("cache ceiling", Severity.FAIL, f"unavailable: {exc}"))
     return results
 
 
 def _check_ffmpeg() -> list[CheckResult]:
     try:
         binaries = locate()
-    except FfmpegNotFound as exc:
+    except (FfmpegNotFound, OSError, subprocess.SubprocessError) as exc:
+        # FfmpegNotFound covers plain absence. The other two cover a binary that
+        # is present but unusable: locate() calls _read_version(), which runs a
+        # subprocess with timeout=15, so a hanging ffmpeg raises TimeoutExpired
+        # (a SubprocessError, NOT an OSError) and a non-executable one raises
+        # OSError. Both are diagnoses doctor must print, not crash on.
+        # str() not repr(): TimeoutExpired never populates .args, so its repr is
+        # the empty "TimeoutExpired()". Its __str__ names the command and timeout.
+        detail = (
+            str(exc)
+            if isinstance(exc, FfmpegNotFound)
+            else f"ffmpeg is present but unusable: {type(exc).__name__}: {exc}"
+        )
         return [
-            CheckResult("ffmpeg", Severity.FAIL, str(exc)),
+            CheckResult("ffmpeg", Severity.FAIL, detail),
             CheckResult("h264 encoder", Severity.FAIL, "ffmpeg unavailable"),
             CheckResult("subtitle burn-in", Severity.FAIL, "ffmpeg unavailable"),
         ]

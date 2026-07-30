@@ -23,13 +23,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = AppPaths.resolve(override=args.data_dir)
 
-    # Deliberately non-fatal. configure_logging calls paths.ensure(), which
-    # raises ConfigurationError on an unwritable data root - precisely the
-    # condition `doctor` exists to report. Crashing here would show a traceback
-    # instead of the diagnosis, and would make the careful error handling in
-    # _check_paths/_check_disk unreachable on the real CLI path. File logging
-    # is simply unavailable for such a run; _check_paths surfaces the cause.
-    with contextlib.suppress(ConfigurationError):
+    # Deliberately non-fatal. An unwritable data root is precisely the condition
+    # `doctor` exists to report. Crashing here would show a traceback instead of
+    # the diagnosis, and would make the careful error handling in
+    # _check_paths/_check_disk unreachable on the real CLI path. File logging is
+    # simply unavailable for such a run; _check_paths surfaces the cause.
+    #
+    # BOTH exception types are required. paths.ensure() raises ConfigurationError,
+    # but it is not what fails first: Path.mkdir(parents=True, exist_ok=True) on an
+    # *existing* directory succeeds regardless of write permission, so ensure()
+    # returns cleanly and configure_logging goes on to construct a
+    # RotatingFileHandler - whose __init__ opens the log file and raises a raw
+    # OSError (PermissionError [Errno 13] on the reproduction).
+    with contextlib.suppress(ConfigurationError, OSError):
         configure_logging(paths)
     bind_correlation_id()
 

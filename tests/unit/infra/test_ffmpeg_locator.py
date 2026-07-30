@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,25 @@ def test_missing_ffprobe_beside_ffmpeg_is_rejected(
     # and the search fell through to exhaust every candidate.
     with pytest.raises(FfmpegNotFound, match="beside it"):
         locate(configured_dir=lonely)
+
+
+def test_a_binary_that_exits_non_zero_is_rejected_not_reported_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt build exits non-zero and prints nothing.
+
+    Parsing that empty stdout yields version "unknown", which reads as a
+    successful probe of a working install. The exit status must be believed.
+    """
+    _fake_pair(tmp_path / "bin")
+
+    def _fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    with pytest.raises(FfmpegNotFound, match="corrupt"):
+        locate(configured_dir=tmp_path / "bin")
 
 
 def test_raises_when_nothing_is_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

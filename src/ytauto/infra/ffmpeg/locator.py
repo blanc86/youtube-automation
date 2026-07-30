@@ -38,13 +38,22 @@ def parse_version(banner: str) -> str:
 
 
 def _read_version(ffmpeg: Path) -> str:
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(
         [str(ffmpeg), "-hide_banner", "-version"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=15,
         check=False,
     )
+    if result.returncode != 0:
+        # A non-zero exit means the binary is there but did not answer. Parsing
+        # its (likely empty) stdout would silently report version "unknown" for
+        # a corrupt build, which reads as a successful probe.
+        raise FfmpegNotFound(
+            f"{ffmpeg} exited {result.returncode} when asked for its version; "
+            "the installation looks corrupt"
+        )
     return parse_version(result.stdout)
 
 
