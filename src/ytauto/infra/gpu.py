@@ -1,0 +1,54 @@
+"""NVIDIA GPU detection.
+
+Absence of a GPU is a supported configuration, not an error: the render
+pipeline falls back to QSV or libx264. Phase 1's resource governor sizes the
+``gpu_compute`` lease pool from ``vram_mb``.
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from dataclasses import dataclass
+
+_QUERY = "--query-gpu=name,memory.total,driver_version"
+_FORMAT = "--format=csv,noheader"
+
+
+@dataclass(frozen=True)
+class GpuInfo:
+    name: str
+    vram_mb: int
+    driver: str
+
+
+def parse_nvidia_smi(csv_output: str) -> GpuInfo | None:
+    """Parse ``nvidia-smi`` CSV output. Returns None if unusable. Pure."""
+    for line in csv_output.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        name, memory, driver = parts
+        digits = memory.split()[0] if memory else ""
+        if not digits.isdigit():
+            continue
+        return GpuInfo(name=name, vram_mb=int(digits), driver=driver)
+    return None
+
+
+def detect() -> GpuInfo | None:
+    """Detect the first NVIDIA GPU, or None when nvidia-smi is absent or fails."""
+    executable = shutil.which("nvidia-smi")
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(  # noqa: S603
+            [executable, _QUERY, _FORMAT],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_nvidia_smi(result.stdout)
