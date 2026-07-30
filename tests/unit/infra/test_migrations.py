@@ -7,6 +7,7 @@ from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import (
     HEAD_VERSION,
     MIGRATIONS,
+    Migration,
     apply_migrations,
     current_version,
 )
@@ -64,4 +65,32 @@ def test_cas_objects_rejects_duplicate_hashes(tmp_path: Path) -> None:
     conn.execute(insert, args)
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(insert, args)
+    conn.close()
+
+
+def test_failed_migration_rolls_back_schema_and_version_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The atomicity guarantee, asserted under an actual failure.
+
+    Without this, every other test in this file would still pass if the
+    `transaction()` wrapper were deleted outright — they only ever check
+    post-success state.
+    """
+    conn = connect(tmp_path / "t.db")
+    broken = Migration(
+        version=1,
+        name="broken",
+        statements=(
+            "CREATE TABLE will_not_survive (a TEXT)",
+            "THIS IS NOT VALID SQL",
+        ),
+    )
+    monkeypatch.setattr("ytauto.infra.db.migrations.MIGRATIONS", (broken,))
+
+    with pytest.raises(sqlite3.OperationalError):
+        apply_migrations(conn)
+
+    assert current_version(conn) == 0, "version row must not survive a failed migration"
+    assert "will_not_survive" not in _tables(conn), "DDL must roll back with the version row"
     conn.close()
