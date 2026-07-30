@@ -1383,7 +1383,35 @@ git commit -m "feat: add idempotent schema migrations with cas_objects and setti
 
 **Files:**
 - Create: `src/ytauto/infra/cas/store.py`
+- Create: `tests/unit/infra/conftest.py`
 - Test: `tests/unit/infra/test_cas_store.py`
+
+**Shared fixture — `tests/unit/infra/conftest.py`.** Task 8 needs the same
+`store` fixture; defining it in both test files would be verbatim duplication.
+It lives in `conftest.py` so pytest injects it into both without an import.
+Note the `yield`/`finally`: returning the store without closing the connection
+leaves an open SQLite handle that prevents Windows from deleting `tmp_path`.
+
+```python
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+from ytauto.infra.cas.store import CasStore
+from ytauto.infra.db.engine import connect
+from ytauto.infra.db.migrations import apply_migrations
+
+
+@pytest.fixture()
+def store(tmp_path: Path) -> Iterator[CasStore]:
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    try:
+        yield CasStore(root=tmp_path / "cas", conn=conn)
+    finally:
+        conn.close()
+```
 
 **Interfaces:**
 - Consumes: `ytauto.core.errors.ValidationError`, `ytauto.infra.db.engine.transaction`, `ytauto.infra.clock.utc_now_iso`
@@ -1428,15 +1456,6 @@ import pytest
 
 from ytauto.core.errors import ValidationError
 from ytauto.infra.cas.store import CasStore, hash_bytes, hash_file
-from ytauto.infra.db.engine import connect
-from ytauto.infra.db.migrations import apply_migrations
-
-
-@pytest.fixture()
-def store(tmp_path: Path) -> CasStore:
-    conn = connect(tmp_path / "t.db")
-    apply_migrations(conn)
-    return CasStore(root=tmp_path / "cas", conn=conn)
 
 
 def test_hash_bytes_matches_sha256() -> None:
@@ -1800,16 +1819,8 @@ import pytest
 from ytauto.core.errors import ValidationError
 from ytauto.infra.cas.eviction import MAX_CEILING_BYTES, Evictor, EvictionPolicy
 from ytauto.infra.cas.store import CasStore
-from ytauto.infra.db.engine import connect
-from ytauto.infra.db.migrations import apply_migrations
 
-
-@pytest.fixture()
-def store(tmp_path: Path) -> CasStore:
-    conn = connect(tmp_path / "t.db")
-    apply_migrations(conn)
-    return CasStore(root=tmp_path / "cas", conn=conn)
-
+# `store` comes from tests/unit/infra/conftest.py — do NOT redefine it here.
 
 OLD = "2020-01-01T00:00:00+00:00"
 NEW = "2026-01-01T00:00:00+00:00"
