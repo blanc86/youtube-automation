@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from ytauto.core.errors import ConfigurationError
 from ytauto.infra.paths import AppPaths
 
 
@@ -48,3 +49,18 @@ def test_paths_are_frozen(tmp_path: Path) -> None:
     paths = AppPaths.resolve(override=tmp_path)
     with pytest.raises(AttributeError):
         paths.root = tmp_path  # type: ignore[misc]
+
+
+def test_ensure_translates_oserror_to_configuration_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = AppPaths.resolve(override=tmp_path / "denied")
+
+    def _deny(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(Path, "mkdir", _deny)
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        paths.ensure()
+    assert isinstance(excinfo.value.__cause__, PermissionError)
