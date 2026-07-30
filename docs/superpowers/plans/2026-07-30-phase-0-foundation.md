@@ -276,22 +276,34 @@ Expected: 3 passed.
 `scripts/check.ps1`:
 
 ```powershell
+# NOTE: $ErrorActionPreference does NOT apply to native executable exit codes
+# in Windows PowerShell 5.1, so every step below needs its own explicit
+# $LASTEXITCODE check. Without them this script reports success while the
+# tools underneath it are failing. The repetition is deliberate: a helper
+# taking a scriptblock has subtle $LASTEXITCODE scoping behaviour in 5.1,
+# and for a five-step gate script obviousness beats DRY.
 $ErrorActionPreference = "Stop"
 $py = ".\.venv\Scripts\python.exe"
 
-Write-Host "== ruff ==" -ForegroundColor Cyan
+Write-Host "== ruff check ==" -ForegroundColor Cyan
 & $py -m ruff check src tests
+if ($LASTEXITCODE -ne 0) { Write-Host "ruff check FAILED" -ForegroundColor Red; exit 1 }
+
+Write-Host "== ruff format ==" -ForegroundColor Cyan
 & $py -m ruff format --check src tests
+if ($LASTEXITCODE -ne 0) { Write-Host "ruff format FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "== mypy ==" -ForegroundColor Cyan
 & $py -m mypy
+if ($LASTEXITCODE -ne 0) { Write-Host "mypy FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "== import-linter ==" -ForegroundColor Cyan
 & ".\.venv\Scripts\lint-imports.exe"
-if ($LASTEXITCODE -ne 0) { throw "import-linter contracts violated" }
+if ($LASTEXITCODE -ne 0) { Write-Host "import-linter FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "== pytest ==" -ForegroundColor Cyan
 & $py -m pytest
+if ($LASTEXITCODE -ne 0) { Write-Host "pytest FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "ALL CHECKS PASSED" -ForegroundColor Green
 ```
