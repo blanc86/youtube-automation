@@ -71,7 +71,20 @@ def _pair_in(directory: Path) -> tuple[Path, Path] | None:
 
 
 def locate(configured_dir: Path | None = None) -> FfmpegBinaries:
-    """Find a matched ffmpeg/ffprobe pair. Raises FfmpegNotFound if unavailable."""
+    """Find a matched ffmpeg/ffprobe pair.
+
+    Note this does more than look at the filesystem: it executes the binary to
+    read its version, so it can fail in every way a subprocess can. Callers that
+    only catch FfmpegNotFound will be surprised - `ytauto doctor` was.
+
+    Raises:
+        FfmpegNotFound: no candidate directory held a usable pair; an ffmpeg was
+            found with no ffprobe beside it; or the binary exited non-zero when
+            asked for its version.
+        subprocess.TimeoutExpired: the binary did not respond within 15s.
+        OSError: the binary exists but cannot be executed (wrong architecture,
+            missing loader, permission denied).
+    """
     candidates: list[Path] = []
     if configured_dir is not None:
         candidates.append(Path(configured_dir))

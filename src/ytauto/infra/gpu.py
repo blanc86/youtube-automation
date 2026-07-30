@@ -37,7 +37,13 @@ def parse_nvidia_smi(csv_output: str) -> GpuInfo | None:
 
 
 def detect() -> GpuInfo | None:
-    """Detect the first NVIDIA GPU, or None when nvidia-smi is absent or fails."""
+    """Detect the first NVIDIA GPU, or None when nvidia-smi is absent or fails.
+
+    Raises nothing. Absence of a GPU is a supported configuration, not an
+    error, and a machine that cannot be interrogated is indistinguishable from
+    one with no GPU as far as encoder selection is concerned - so every
+    subprocess failure is folded into None rather than propagated.
+    """
     executable = shutil.which("nvidia-smi")
     if executable is None:
         return None

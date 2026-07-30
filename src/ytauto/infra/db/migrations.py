@@ -61,7 +61,11 @@ def _ensure_version_table(conn: sqlite3.Connection) -> None:
 
 
 def current_version(conn: sqlite3.Connection) -> int:
-    """Return the highest applied migration version, or 0 on a fresh database."""
+    """Return the highest applied migration version, or 0 on a fresh database.
+
+    Raises:
+        sqlite3.Error: the version table cannot be created or queried.
+    """
     _ensure_version_table(conn)
     row = conn.execute("SELECT max(version) AS v FROM schema_version").fetchone()
     return int(row["v"]) if row["v"] is not None else 0
@@ -75,6 +79,11 @@ def apply_migrations(conn: sqlite3.Connection) -> int:
 
     ``executescript`` is deliberately avoided: it implicitly commits any pending
     transaction, which would defeat that atomicity.
+
+    Raises:
+        sqlite3.Error: any statement in a migration fails. That migration is
+            rolled back whole, so the recorded version still describes the
+            schema actually present.
     """
     version = current_version(conn)
     for migration in MIGRATIONS:

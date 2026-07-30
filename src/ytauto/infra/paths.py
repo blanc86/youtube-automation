@@ -32,7 +32,16 @@ class AppPaths:
 
     @classmethod
     def resolve(cls, override: Path | None = None) -> AppPaths:
-        """Resolve the data root: explicit override, then env var, then platform default."""
+        """Resolve the data root: explicit override, then env var, then platform default.
+
+        Computes paths only - nothing is created and nothing is written, so this
+        succeeds even when the resulting root is unwritable. Call ensure() for
+        that.
+
+        Raises:
+            RuntimeError: a path used '~' and the home directory could not be
+                determined.
+        """
         if override is not None:
             root = Path(override)
         elif from_env := os.environ.get(_ENV_VAR):
@@ -54,10 +63,16 @@ class AppPaths:
     def ensure(self) -> None:
         """Create every directory. Idempotent.
 
-        Raises ConfigurationError if a directory cannot be created. An
-        unwritable data root is a misconfiguration the user must resolve, not
-        a transient fault — so it enters the typed taxonomy here rather than
-        leaking a raw OSError to every caller.
+        Note what this does NOT guarantee: mkdir(parents=True, exist_ok=True)
+        on an *existing* directory succeeds regardless of write permission, so
+        returning cleanly does not mean the directories are writable. Callers
+        that then open a file inside them must still handle OSError.
+
+        Raises:
+            ConfigurationError: a directory could not be created. An unwritable
+                data root is a misconfiguration the user must resolve, not a
+                transient fault - so it enters the typed taxonomy here rather
+                than leaking a raw OSError to every caller.
         """
         for directory in (self.root, self.projects, self.cas, self.logs, self.cache, self.exports):
             try:

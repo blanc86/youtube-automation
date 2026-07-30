@@ -47,7 +47,12 @@ class FfmpegCapabilities:
     filters: frozenset[str]
 
     def best_h264_encoder(self) -> str:
-        """Pick the fastest available H.264 encoder: NVENC, then QSV, then libx264."""
+        """Pick the fastest available H.264 encoder: NVENC, then QSV, then libx264.
+
+        Raises:
+            ConfigurationError: the build exposes none of them, so it cannot
+                produce H.264 at all.
+        """
         for candidate in ENCODER_PREFERENCE:
             if candidate in self.encoders:
                 return candidate
@@ -74,7 +79,14 @@ def _run(binary: str, flag: str) -> str:
 
 
 def probe(binaries: FfmpegBinaries) -> FfmpegCapabilities:
-    """Query the binary once for its encoders and filters."""
+    """Query the binary once for its encoders and filters.
+
+    Raises:
+        subprocess.TimeoutExpired: a probe call did not respond within 30s.
+            This is a SubprocessError, NOT an OSError - catching only OSError
+            here lets a hung ffmpeg escape.
+        OSError: the binary cannot be executed.
+    """
     return FfmpegCapabilities(
         encoders=parse_encoders(_run(str(binaries.ffmpeg), "-encoders")),
         filters=parse_filters(_run(str(binaries.ffmpeg), "-filters")),

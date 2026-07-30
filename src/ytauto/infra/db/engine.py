@@ -21,7 +21,13 @@ _PRAGMAS = (
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    """Open a connection with the pragmas this application requires."""
+    """Open a connection with the pragmas this application requires.
+
+    Raises:
+        OSError: the parent directory of ``db_path`` cannot be created.
+        sqlite3.Error: the database cannot be opened (missing, locked, or
+            corrupt), or a required pragma is rejected.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -32,7 +38,13 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Run a block in one transaction: commit on success, roll back on any error."""
+    """Run a block in one transaction: commit on success, roll back on any error.
+
+    Raises:
+        sqlite3.Error: BEGIN, COMMIT or ROLLBACK fails.
+        BaseException: anything the wrapped block raises is re-raised unchanged
+            after the transaction has been rolled back.
+    """
     conn.execute("BEGIN")
     try:
         yield conn

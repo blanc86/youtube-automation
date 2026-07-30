@@ -32,15 +32,30 @@ class CasStore:
     """Blob storage addressed by content hash, with refcounts held in SQLite."""
 
     def __init__(self, root: Path, conn: sqlite3.Connection) -> None:
+        """Open a store rooted at ``root``, creating the directory if needed.
+
+        Raises:
+            OSError: ``root`` cannot be created.
+        """
         self._root = root
         self._conn = conn
         self._root.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, digest: ContentHash) -> Path:
+        """Compute the sharded on-disk path for a digest. Does not touch disk.
+
+        Raises:
+            ValidationError: ``digest`` is not a valid sha256 hex digest.
+        """
         valid = validate_digest(digest)
         return self._root / valid[0:2] / valid[2:4] / valid
 
     def exists(self, digest: ContentHash) -> bool:
+        """Whether the object's file is present.
+
+        Raises:
+            ValidationError: ``digest`` is not a valid sha256 hex digest.
+        """
         return self.path_for(digest).is_file()
 
     def _staging_path(self, target: Path) -> Path:
@@ -52,6 +67,13 @@ class CasStore:
         return target.with_name(f"{target.name}.{os.getpid()}.tmp")
 
     def put_bytes(self, data: bytes, *, kind: str) -> ContentHash:
+        """Store an in-memory buffer, deduplicating on content. Idempotent.
+
+        Raises:
+            OSError: the staging file cannot be written, or the atomic replace
+                into place fails.
+            sqlite3.Error: the refcount row cannot be recorded.
+        """
         digest = hash_bytes(data)
         target = self.path_for(digest)
         if not target.is_file():
@@ -63,6 +85,13 @@ class CasStore:
         return digest
 
     def put_file(self, src: Path, *, kind: str, move: bool = False) -> ContentHash:
+        """Store a file's contents. With ``move=True`` the source is consumed.
+
+        Raises:
+            ValidationError: ``src`` does not exist or is not a regular file.
+            OSError: ``src`` cannot be read, or the copy/move/replace fails.
+            sqlite3.Error: the refcount row cannot be recorded.
+        """
         if not src.is_file():
             raise ValidationError(f"source file does not exist: {src}")
         digest = hash_file(src)
@@ -83,6 +112,13 @@ class CasStore:
         return digest
 
     def read_bytes(self, digest: ContentHash) -> bytes:
+        """Read an object's full contents into memory.
+
+        Raises:
+            ValidationError: ``digest`` is malformed, or no such object is
+                stored.
+            OSError: the object's file exists but cannot be read.
+        """
         path = self.path_for(digest)
         if not path.is_file():
             raise ValidationError(f"no such object in store: {digest}")
@@ -162,6 +198,12 @@ class CasStore:
                 raise ValidationError(f"no such object in store: {digest}")
 
     def refcount(self, digest: ContentHash) -> int:
+        """How many holders currently pin this object.
+
+        Raises:
+            ValidationError: no such object is stored.
+            sqlite3.Error: the query fails.
+        """
         row = self._conn.execute(
             "SELECT refcount FROM cas_objects WHERE hash = ?", (digest,)
         ).fetchone()
@@ -170,6 +212,12 @@ class CasStore:
         return int(row["refcount"])
 
     def size_of(self, digest: ContentHash) -> int:
+        """The object's recorded size in bytes.
+
+        Raises:
+            ValidationError: no such object is stored.
+            sqlite3.Error: the query fails.
+        """
         row = self._conn.execute(
             "SELECT size_bytes FROM cas_objects WHERE hash = ?", (digest,)
         ).fetchone()
@@ -178,6 +226,11 @@ class CasStore:
         return int(row["size_bytes"])
 
     def total_size(self) -> int:
+        """Total recorded bytes across every stored object.
+
+        Raises:
+            sqlite3.Error: the query fails.
+        """
         row = self._conn.execute("SELECT coalesce(sum(size_bytes), 0) AS s FROM cas_objects")
         return int(row.fetchone()["s"])
 
@@ -186,6 +239,9 @@ class CasStore:
 
         Objects with refcount > 0 are excluded: they belong to a project or an
         in-flight job and must survive eviction.
+
+        Raises:
+            sqlite3.Error: the query fails.
         """
         rows = self._conn.execute(
             """
@@ -197,7 +253,17 @@ class CasStore:
         return [(ContentHash(row["hash"]), int(row["size_bytes"])) for row in rows]
 
     def forget(self, digest: ContentHash) -> None:
-        """Delete the object's file and its row. Idempotent."""
+        """Delete the object's file and its row. Idempotent.
+
+        Deliberately does NOT raise on an unknown digest, unlike the refcount
+        mutators: deleting what is already gone is the intended outcome.
+
+        Raises:
+            ValidationError: ``digest`` is not a valid sha256 hex digest.
+            OSError: the file exists but cannot be removed (on Windows,
+                typically because another process holds it open).
+            sqlite3.Error: the row cannot be deleted.
+        """
         self.path_for(digest).unlink(missing_ok=True)
         with transaction(self._conn):
             self._conn.execute("DELETE FROM cas_objects WHERE hash = ?", (digest,))

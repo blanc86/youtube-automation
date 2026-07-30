@@ -76,7 +76,17 @@ class JsonFormatter(logging.Formatter):
 
 
 def configure_logging(paths: AppPaths, *, level: str = "INFO") -> None:
-    """Install a rotating JSON-lines file handler and a plain console handler."""
+    """Install a rotating JSON-lines file handler and a plain console handler.
+
+    Raises:
+        ConfigurationError: paths.ensure() could not create a directory.
+        OSError: the log file itself cannot be opened. This is a *separate*
+            failure from the one above and is the one that actually fires on an
+            unwritable data root, because mkdir(exist_ok=True) on an existing
+            directory succeeds regardless of write permission - so ensure()
+            returns cleanly and the RotatingFileHandler constructor is what
+            fails. Callers guarding only ConfigurationError will still crash.
+    """
     paths.ensure()
     root = logging.getLogger("ytauto")
     root.setLevel(level)

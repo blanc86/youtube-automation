@@ -27,6 +27,10 @@ class EvictionPolicy:
 
         Including ``current_size`` keeps the ceiling stable as the cache grows;
         computing against raw free space alone makes it shrink on every run.
+
+        Raises:
+            OSError: ``cas_root`` cannot be created, or its free space cannot
+                be queried.
         """
         cas_root.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(cas_root).free
@@ -47,7 +51,13 @@ class Evictor:
         self._policy = policy
 
     def run(self) -> EvictionReport:
-        """Evict least-recently-used unreferenced objects until under the ceiling."""
+        """Evict least-recently-used unreferenced objects until under the ceiling.
+
+        Raises:
+            OSError: an object's file cannot be removed.
+            sqlite3.Error: the store cannot be queried, or a row cannot be
+                deleted.
+        """
         total = self._store.total_size()
         if total <= self._policy.max_bytes:
             return EvictionReport(evicted=0, bytes_freed=0, bytes_remaining=total)
