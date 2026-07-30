@@ -7,39 +7,25 @@ protect in-use objects from the evictor.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import NewType
 
 from ytauto.core.errors import ValidationError
+from ytauto.core.models.content_hash import (
+    ContentHash,
+    hash_bytes,
+    hash_file,
+    validate_digest,
+)
 from ytauto.infra.clock import utc_now_iso
 from ytauto.infra.db.engine import transaction
 
-ContentHash = NewType("ContentHash", str)
-
-_CHUNK = 1024 * 1024
-_HEX = frozenset("0123456789abcdef")
-
-
-def _validate(digest: str) -> ContentHash:
-    if len(digest) != 64 or not set(digest) <= _HEX:
-        raise ValidationError(f"not a valid sha256 hex digest: {digest!r}")
-    return ContentHash(digest)
-
-
-def hash_bytes(data: bytes) -> ContentHash:
-    return ContentHash(hashlib.sha256(data).hexdigest())
-
-
-def hash_file(path: Path) -> ContentHash:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(_CHUNK):
-            digest.update(chunk)
-    return ContentHash(digest.hexdigest())
+# Re-exported: the hashing primitives moved to core (Phase 1 needs them there,
+# and core cannot import infra), but the store remains their natural entry
+# point for callers that are already talking to the CAS.
+__all__ = ["CasStore", "ContentHash", "hash_bytes", "hash_file"]
 
 
 class CasStore:
@@ -51,7 +37,7 @@ class CasStore:
         self._root.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, digest: ContentHash) -> Path:
-        valid = _validate(digest)
+        valid = validate_digest(digest)
         return self._root / valid[0:2] / valid[2:4] / valid
 
     def exists(self, digest: ContentHash) -> bool:

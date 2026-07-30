@@ -1,4 +1,3 @@
-import hashlib
 from pathlib import Path
 
 import pytest
@@ -7,20 +6,13 @@ from ytauto.core.errors import ValidationError
 from ytauto.infra.cas.store import CasStore, hash_bytes, hash_file
 
 
-def test_hash_bytes_matches_sha256() -> None:
-    assert hash_bytes(b"hello") == hashlib.sha256(b"hello").hexdigest()
+def test_store_re_exports_the_hashing_primitives() -> None:
+    """The primitives now live in core; this import path must keep working."""
+    from ytauto.core.models.content_hash import hash_bytes as core_hash_bytes
+    from ytauto.core.models.content_hash import hash_file as core_hash_file
 
-
-def test_hash_is_full_length_lowercase_hex() -> None:
-    digest = hash_bytes(b"anything")
-    assert len(digest) == 64
-    assert digest == digest.lower()
-
-
-def test_hash_file_matches_hash_bytes(tmp_path: Path) -> None:
-    f = tmp_path / "x.bin"
-    f.write_bytes(b"payload")
-    assert hash_file(f) == hash_bytes(b"payload")
+    assert hash_bytes is core_hash_bytes
+    assert hash_file is core_hash_file
 
 
 def test_put_bytes_stores_and_returns_content(store: CasStore) -> None:
