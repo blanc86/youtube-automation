@@ -599,6 +599,8 @@ from pathlib import Path
 
 from platformdirs import user_data_dir
 
+from ytauto.core.errors import ConfigurationError
+
 _ENV_VAR = "YTAUTO_DATA_DIR"
 
 
@@ -636,9 +638,20 @@ class AppPaths:
         )
 
     def ensure(self) -> None:
-        """Create every directory. Idempotent."""
+        """Create every directory. Idempotent.
+
+        Raises ConfigurationError if a directory cannot be created. An
+        unwritable data root is a misconfiguration the user must resolve, not
+        a transient fault — so it enters the typed taxonomy here rather than
+        leaking a raw OSError to every caller.
+        """
         for directory in (self.root, self.projects, self.cas, self.logs, self.cache, self.exports):
-            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"cannot create application directory {directory}: {exc}"
+                ) from exc
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -754,9 +767,17 @@ def test_configure_logging_writes_a_log_file(tmp_path: Path) -> None:
     paths = AppPaths.resolve(override=tmp_path)
     paths.ensure()
     configure_logging(paths, level="DEBUG")
-    get_logger("ytauto.test").info("written to disk", extra={"stage": "doctor"})
+    try:
+        get_logger("ytauto.test").info("written to disk", extra={"stage": "doctor"})
+    finally:
+        # Close only the handlers this test installed. logging.shutdown() would
+        # close every handler in the interpreter, leaving closed-but-attached
+        # handlers on the "ytauto" logger for the rest of the session.
+        root = logging.getLogger("ytauto")
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
 
-    logging.shutdown()
     log_files = list(paths.logs.glob("*.jsonl"))
     assert log_files, "expected a .jsonl log file"
     lines = [json.loads(line) for line in log_files[0].read_text("utf-8").splitlines() if line]
@@ -839,7 +860,12 @@ def configure_logging(paths: AppPaths, *, level: str = "INFO") -> None:
     paths.ensure()
     root = logging.getLogger("ytauto")
     root.setLevel(level)
-    root.handlers.clear()
+    # Close before dropping: list.clear() alone would leak the open log file
+    # descriptor on every reconfiguration. On Windows that also locks the file,
+    # so a later attempt to remove or rotate it fails with WinError 32.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
     root.propagate = False
 
     file_handler = RotatingFileHandler(
@@ -1141,6 +1167,7 @@ from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import (
     HEAD_VERSION,
     MIGRATIONS,
+    Migration,
     apply_migrations,
     current_version,
 )
@@ -1198,6 +1225,34 @@ def test_cas_objects_rejects_duplicate_hashes(tmp_path: Path) -> None:
     conn.execute(insert, args)
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(insert, args)
+    conn.close()
+
+
+def test_failed_migration_rolls_back_schema_and_version_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The atomicity guarantee, asserted under an actual failure.
+
+    Without this, every other test in this file would still pass if the
+    `transaction()` wrapper were deleted outright — they only ever check
+    post-success state.
+    """
+    conn = connect(tmp_path / "t.db")
+    broken = Migration(
+        version=1,
+        name="broken",
+        statements=(
+            "CREATE TABLE will_not_survive (a TEXT)",
+            "THIS IS NOT VALID SQL",
+        ),
+    )
+    monkeypatch.setattr("ytauto.infra.db.migrations.MIGRATIONS", (broken,))
+
+    with pytest.raises(sqlite3.OperationalError):
+        apply_migrations(conn)
+
+    assert current_version(conn) == 0, "version row must not survive a failed migration"
+    assert "will_not_survive" not in _tables(conn), "DDL must roll back with the version row"
     conn.close()
 ```
 
@@ -2688,7 +2743,8 @@ def _check_paths(paths: AppPaths) -> CheckResult:
         probe_file = paths.cache / ".write-test"
         probe_file.write_text("ok", encoding="utf-8")
         probe_file.unlink()
-    except OSError as exc:
+    except (ConfigurationError, OSError) as exc:
+        # ensure() raises ConfigurationError; the write probe raises raw OSError.
         return CheckResult("data directories", Severity.FAIL, f"{paths.root}: {exc}")
     return CheckResult("data directories", Severity.OK, str(paths.root))
 
@@ -2763,8 +2819,12 @@ def _check_gpu() -> CheckResult:
 
 
 def _check_disk(paths: AppPaths) -> CheckResult:
-    paths.ensure()
-    free_gb = shutil.disk_usage(paths.root).free / 1024**3
+    try:
+        paths.ensure()
+        free_gb = shutil.disk_usage(paths.root).free / 1024**3
+    except (ConfigurationError, OSError) as exc:
+        # Never let a failed check abort the run - doctor must report every row.
+        return CheckResult("free disk", Severity.FAIL, str(exc))
     severity = Severity.OK if free_gb >= _LOW_DISK_WARN_GB else Severity.WARN
     return CheckResult("free disk", severity, f"{free_gb:.1f} GB free")
 
