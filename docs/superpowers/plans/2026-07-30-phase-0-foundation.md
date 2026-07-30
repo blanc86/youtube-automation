@@ -2822,7 +2822,18 @@ def _check_ffmpeg() -> list[CheckResult]:
         ]
 
     results = [CheckResult("ffmpeg", Severity.OK, f"{binaries.version} at {binaries.ffmpeg}")]
-    capabilities = probe(binaries)
+    try:
+        capabilities = probe(binaries)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # A present-but-broken binary (corrupt, unexecutable, hanging) is exactly
+        # what doctor exists to surface. probe() can raise TimeoutExpired, which
+        # is a SubprocessError and NOT an OSError. Letting it escape would show a
+        # traceback instead of the diagnosis.
+        detail = f"could not probe ffmpeg: {exc}"
+        results.append(CheckResult("h264 encoder", Severity.FAIL, detail))
+        results.append(CheckResult("subtitle burn-in", Severity.FAIL, detail))
+        return results
+
     try:
         encoder = capabilities.best_h264_encoder()
         severity = Severity.OK if encoder != "libx264" else Severity.WARN
@@ -2920,7 +2931,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     paths = AppPaths.resolve(override=args.data_dir)
-    configure_logging(paths)
+
+    # Deliberately non-fatal. configure_logging calls paths.ensure(), which
+    # raises ConfigurationError on an unwritable data root - precisely the
+    # condition `doctor` exists to report. Crashing here would show a traceback
+    # instead of the diagnosis, and would make the careful error handling in
+    # _check_paths/_check_disk unreachable on the real CLI path. File logging
+    # is simply unavailable for such a run; _check_paths surfaces the cause.
+    with contextlib.suppress(ConfigurationError):
+        configure_logging(paths)
     bind_correlation_id()
 
     if args.command == "doctor":

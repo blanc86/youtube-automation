@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass
 from enum import StrEnum
@@ -99,7 +100,18 @@ def _check_ffmpeg() -> list[CheckResult]:
         ]
 
     results = [CheckResult("ffmpeg", Severity.OK, f"{binaries.version} at {binaries.ffmpeg}")]
-    capabilities = probe(binaries)
+    try:
+        capabilities = probe(binaries)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # A present-but-broken binary (corrupt, unexecutable, hanging) is exactly
+        # what doctor exists to surface. probe() can raise TimeoutExpired, which
+        # is a SubprocessError and NOT an OSError. Letting it escape would show a
+        # traceback instead of the diagnosis.
+        detail = f"could not probe ffmpeg: {exc}"
+        results.append(CheckResult("h264 encoder", Severity.FAIL, detail))
+        results.append(CheckResult("subtitle burn-in", Severity.FAIL, detail))
+        return results
+
     try:
         encoder = capabilities.best_h264_encoder()
         severity = Severity.OK if encoder != "libx264" else Severity.WARN
