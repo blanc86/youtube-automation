@@ -96,6 +96,42 @@ def test_malformed_hash_raises_validation_error(store: CasStore) -> None:
         store.path_for("not-a-hash")  # type: ignore[arg-type]
 
 
+def test_refcount_mutators_reject_a_well_formed_but_unknown_digest(store: CasStore) -> None:
+    """These used to UPDATE ... WHERE hash = ? and silently match nothing.
+
+    retain() is the only thing protecting an in-flight job's assets from the
+    evictor. A no-op on a wrong or already-evicted digest reports success, the
+    job proceeds, and the evictor deletes an asset the render depends on - data
+    loss that surfaces much later as a mid-render missing file.
+    """
+    unknown = "b" * 64
+    for mutate in (store.retain, store.release, store.touch):
+        with pytest.raises(ValidationError, match="no such object"):
+            mutate(unknown)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="no such object"):
+        store.set_last_accessed(unknown, "2026-01-01T00:00:00+00:00")  # type: ignore[arg-type]
+
+
+def test_refcount_mutators_reject_a_malformed_digest(store: CasStore) -> None:
+    """The read side (refcount/size_of/read_bytes) already raises here; the
+    write side silently accepted anything at all, including "oops".
+    """
+    for mutate in (store.retain, store.release, store.touch):
+        with pytest.raises(ValidationError, match="not a valid sha256"):
+            mutate("oops")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="not a valid sha256"):
+        store.set_last_accessed("oops", "2026-01-01T00:00:00+00:00")  # type: ignore[arg-type]
+
+
+def test_a_rejected_retain_leaves_the_refcount_untouched(store: CasStore) -> None:
+    """The failed UPDATE must roll back, not half-apply."""
+    digest = store.put_bytes(b"real", kind="blob")
+    store.retain(digest)
+    with pytest.raises(ValidationError):
+        store.retain("c" * 64)  # type: ignore[arg-type]
+    assert store.refcount(digest) == 1
+
+
 def test_iter_evictable_orders_least_recently_used_first(store: CasStore) -> None:
     recent = store.put_bytes(b"recent", kind="blob")
     stale = store.put_bytes(b"stale", kind="blob")

@@ -100,6 +100,11 @@ class CasStore:
             )
 
     def touch(self, digest: ContentHash) -> None:
+        """Mark the object as accessed now, deferring the eviction that follows.
+
+        Raises:
+            ValidationError: ``digest`` is malformed, or names no stored object.
+        """
         self.set_last_accessed(digest, utc_now_iso())
 
     def set_last_accessed(self, digest: ContentHash, timestamp: str) -> None:
@@ -107,23 +112,54 @@ class CasStore:
 
         Public because the evictor's LRU ordering must be assertable in tests,
         and because restore-from-backup needs to preserve original access times.
+
+        Raises:
+            ValidationError: ``digest`` is malformed, or names no stored object.
         """
-        with transaction(self._conn):
-            self._conn.execute(
-                "UPDATE cas_objects SET last_accessed_at = ? WHERE hash = ?", (timestamp, digest)
-            )
+        self._update_one(
+            "UPDATE cas_objects SET last_accessed_at = ? WHERE hash = ?",
+            (timestamp, validate_digest(digest)),
+            digest,
+        )
 
     def retain(self, digest: ContentHash) -> None:
-        with transaction(self._conn):
-            self._conn.execute(
-                "UPDATE cas_objects SET refcount = refcount + 1 WHERE hash = ?", (digest,)
-            )
+        """Pin the object against eviction. Every retain needs a later release.
+
+        Raises:
+            ValidationError: ``digest`` is malformed, or names no stored object.
+        """
+        self._update_one(
+            "UPDATE cas_objects SET refcount = refcount + 1 WHERE hash = ?",
+            (validate_digest(digest),),
+            digest,
+        )
 
     def release(self, digest: ContentHash) -> None:
+        """Drop one pin. Clamped at zero, so an extra release cannot go negative.
+
+        Raises:
+            ValidationError: ``digest`` is malformed, or names no stored object.
+        """
+        self._update_one(
+            "UPDATE cas_objects SET refcount = max(0, refcount - 1) WHERE hash = ?",
+            (validate_digest(digest),),
+            digest,
+        )
+
+    def _update_one(self, sql: str, params: tuple[object, ...], digest: str) -> None:
+        """Run an UPDATE that must match exactly one row.
+
+        Without the rowcount check these mutators silently no-op on an unknown
+        hash. That matters most for retain(): it is the only thing protecting an
+        in-flight job's assets from the evictor, so a retain against a wrong or
+        already-evicted digest would report success, the job would proceed, and
+        the evictor would delete an asset a running render depends on - silent
+        data loss surfacing much later as a mid-render missing file.
+        """
         with transaction(self._conn):
-            self._conn.execute(
-                "UPDATE cas_objects SET refcount = max(0, refcount - 1) WHERE hash = ?", (digest,)
-            )
+            cursor = self._conn.execute(sql, params)
+            if cursor.rowcount == 0:
+                raise ValidationError(f"no such object in store: {digest}")
 
     def refcount(self, digest: ContentHash) -> int:
         row = self._conn.execute(
