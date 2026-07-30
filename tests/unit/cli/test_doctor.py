@@ -313,3 +313,27 @@ def test_main_does_not_crash_when_configure_logging_fails(
     # and is the banned pattern. The mocked ffmpeg absence guarantees a FAIL
     # row, so 1 is the only correct exit code.
     assert result == 1
+
+
+def test_main_survives_a_genuinely_unopenable_log_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same crash with no mock on configure_logging at all.
+
+    Occupying logs/ytauto.jsonl with a *directory* reproduces the real shape of
+    the bug without touching ACLs: paths.ensure() succeeds because every
+    directory already exists, and then the RotatingFileHandler constructor
+    raises a genuine OSError trying to open that path for writing.
+    """
+    from ytauto.cli.__main__ import main
+    from ytauto.infra.ffmpeg.locator import FfmpegNotFound
+
+    def _boom_locate(*_args: object, **_kwargs: object) -> None:
+        raise FfmpegNotFound("simulated absence")
+
+    monkeypatch.setattr("ytauto.cli.doctor.locate", _boom_locate)
+    monkeypatch.setattr("ytauto.cli.doctor.gpu.detect", lambda: None)
+
+    (tmp_path / "logs" / "ytauto.jsonl").mkdir(parents=True)
+
+    assert main(["--data-dir", str(tmp_path), "doctor"]) == 1

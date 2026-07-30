@@ -60,6 +60,13 @@ class JsonFormatter(logging.Formatter):
     """Render a LogRecord as a single-line JSON object."""
 
     def format(self, record: logging.LogRecord) -> str:
+        """Render a record as one JSON line.
+
+        Raises:
+            ValueError: a value passed via ``extra=`` contains a circular
+                reference. Non-serialisable values are coerced with ``str``
+                rather than raising, so this is the only failure mode.
+        """
         payload: dict[str, Any] = {
             "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
