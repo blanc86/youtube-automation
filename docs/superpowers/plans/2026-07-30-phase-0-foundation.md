@@ -2377,12 +2377,18 @@ _ENCODER_RE = re.compile(r"^\s*[A-Z.]{6}\s+(\S+)")
 _FILTER_RE = re.compile(r"^\s*[A-Z.]{3}\s+(\S+)")
 
 
+# ffmpeg prints a legend above the real rows, e.g. " V..... = Video" and
+# "  T.. = Timeline support". Those flag runs satisfy the patterns above and
+# would capture "=" as a capability name, so the separator is excluded.
+_LEGEND_SEPARATOR = "="
+
+
 def parse_encoders(output: str) -> frozenset[str]:
     """Extract encoder names from ``ffmpeg -encoders`` output. Pure."""
     return frozenset(
         match.group(1)
         for line in output.splitlines()
-        if (match := _ENCODER_RE.match(line))
+        if (match := _ENCODER_RE.match(line)) and match.group(1) != _LEGEND_SEPARATOR
     )
 
 
@@ -2391,7 +2397,7 @@ def parse_filters(output: str) -> frozenset[str]:
     return frozenset(
         match.group(1)
         for line in output.splitlines()
-        if (match := _FILTER_RE.match(line))
+        if (match := _FILTER_RE.match(line)) and match.group(1) != _LEGEND_SEPARATOR
     )
 
 
