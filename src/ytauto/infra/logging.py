@@ -80,7 +80,12 @@ def configure_logging(paths: AppPaths, *, level: str = "INFO") -> None:
     paths.ensure()
     root = logging.getLogger("ytauto")
     root.setLevel(level)
-    root.handlers.clear()
+    # Close before dropping: list.clear() alone would leak the open log file
+    # descriptor on every reconfiguration. On Windows that also locks the file,
+    # so a later attempt to remove or rotate it fails with WinError 32.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
     root.propagate = False
 
     file_handler = RotatingFileHandler(

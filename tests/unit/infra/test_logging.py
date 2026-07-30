@@ -72,10 +72,46 @@ def test_configure_logging_writes_a_log_file(tmp_path: Path) -> None:
     paths = AppPaths.resolve(override=tmp_path)
     paths.ensure()
     configure_logging(paths, level="DEBUG")
-    get_logger("ytauto.test").info("written to disk", extra={"stage": "doctor"})
+    try:
+        get_logger("ytauto.test").info("written to disk", extra={"stage": "doctor"})
+    finally:
+        # Close only the handlers this test installed. logging.shutdown() would
+        # close every handler in the interpreter, leaving closed-but-attached
+        # handlers on the "ytauto" logger for the rest of the session.
+        root = logging.getLogger("ytauto")
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
 
-    logging.shutdown()
     log_files = list(paths.logs.glob("*.jsonl"))
     assert log_files, "expected a .jsonl log file"
     lines = [json.loads(line) for line in log_files[0].read_text("utf-8").splitlines() if line]
     assert any(entry["msg"] == "written to disk" and entry["stage"] == "doctor" for entry in lines)
+
+
+def test_configure_logging_closes_previous_handlers_on_reconfigure(tmp_path: Path) -> None:
+    paths = AppPaths.resolve(override=tmp_path)
+    paths.ensure()
+
+    configure_logging(paths, level="DEBUG")
+    # Only FileHandler (RotatingFileHandler) closes its underlying stream and
+    # sets it to None; the console StreamHandler wraps sys.stderr and is never
+    # closed, so it is not part of this assertion.
+    first_file_handlers = [
+        handler
+        for handler in logging.getLogger("ytauto").handlers
+        if isinstance(handler, logging.FileHandler)
+    ]
+    assert first_file_handlers, "expected configure_logging to install a FileHandler"
+
+    configure_logging(paths, level="DEBUG")
+    try:
+        for handler in first_file_handlers:
+            assert handler.stream is None, (
+                f"{handler!r} left its file descriptor open after reconfigure"
+            )
+    finally:
+        root = logging.getLogger("ytauto")
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
