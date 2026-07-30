@@ -2099,7 +2099,11 @@ def test_missing_ffprobe_beside_ffmpeg_is_rejected(
     (lonely / "ffmpeg.exe").write_text("stub")
     monkeypatch.delenv("YTAUTO_FFMPEG_DIR", raising=False)
     monkeypatch.setattr("shutil.which", lambda *_a, **_k: None)
-    with pytest.raises(FfmpegNotFound, match="ffprobe"):
+    # Match a phrase unique to the mismatched-pair message. Matching on
+    # "ffprobe" alone would also match the generic not-found message, so this
+    # test would still pass if _pair_in's error were caught inside the loop
+    # and the search fell through to exhaust every candidate.
+    with pytest.raises(FfmpegNotFound, match="beside it"):
         locate(configured_dir=lonely)
 
 
