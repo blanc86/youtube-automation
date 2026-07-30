@@ -58,6 +58,20 @@ def test_put_file_with_move_removes_source(store: CasStore, tmp_path: Path) -> N
     assert not src.exists()
 
 
+def test_put_file_with_move_removes_source_when_content_already_stored(
+    store: CasStore, tmp_path: Path
+) -> None:
+    """The dedup-hit branch must still consume the source file."""
+    store.put_bytes(b"wavdata", kind="audio")
+
+    src = tmp_path / "duplicate.wav"
+    src.write_bytes(b"wavdata")
+    digest = store.put_file(src, kind="audio", move=True)
+
+    assert not src.exists(), "move=True must consume the source even on a dedup hit"
+    assert store.read_bytes(digest) == b"wavdata"
+
+
 def test_refcount_starts_at_zero_and_tracks_retain_release(store: CasStore) -> None:
     digest = store.put_bytes(b"tracked", kind="blob")
     assert store.refcount(digest) == 0
