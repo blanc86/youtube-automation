@@ -20,6 +20,7 @@ _RESERVED: frozenset[str] = frozenset(
     {
         "args",
         "asctime",
+        "correlation_id",
         "created",
         "exc_info",
         "exc_text",
@@ -56,6 +57,21 @@ def current_correlation_id() -> str:
     return _correlation_id.get()
 
 
+class CorrelationIdFilter(logging.Filter):
+    """Stamp the current correlation ID onto records that lack one.
+
+    Stamping happens at emission rather than at format time so that records
+    relayed from a worker subprocess keep the ID they were created with. A
+    formatter that read the ContextVar directly would overwrite every relayed
+    line with the parent process's ID.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "correlation_id"):
+            record.correlation_id = current_correlation_id()
+        return True
+
+
 class JsonFormatter(logging.Formatter):
     """Render a LogRecord as a single-line JSON object."""
 
@@ -72,7 +88,7 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
-            "correlation_id": current_correlation_id(),
+            "correlation_id": getattr(record, "correlation_id", current_correlation_id()),
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
@@ -82,19 +98,17 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
-def configure_logging(paths: AppPaths, *, level: str = "INFO") -> None:
-    """Install a rotating JSON-lines file handler and a plain console handler.
+def configure_logging(paths: AppPaths, *, level: str = "INFO", file_logging: bool = True) -> None:
+    """Install log handlers on the ``ytauto`` logger.
+
+    Pass ``file_logging=False`` in worker subprocesses: concurrent
+    RotatingFileHandler rollover across processes fails on Windows with
+    WinError 32. Workers report through the pipe and the parent writes the file.
 
     Raises:
-        ConfigurationError: paths.ensure() could not create a directory.
-        OSError: the log file itself cannot be opened. This is a *separate*
-            failure from the one above and is the one that actually fires on an
-            unwritable data root, because mkdir(exist_ok=True) on an existing
-            directory succeeds regardless of write permission - so ensure()
-            returns cleanly and the RotatingFileHandler constructor is what
-            fails. Callers guarding only ConfigurationError will still crash.
+        ConfigurationError: if the data directories cannot be created.
+        OSError: if the log file cannot be opened.
     """
-    paths.ensure()
     root = logging.getLogger("ytauto")
     root.setLevel(level)
     # Close before dropping: list.clear() alone would leak the open log file
@@ -104,15 +118,18 @@ def configure_logging(paths: AppPaths, *, level: str = "INFO") -> None:
         root.removeHandler(handler)
         handler.close()
     root.propagate = False
+    root.addFilter(CorrelationIdFilter())
 
-    file_handler = RotatingFileHandler(
-        paths.logs / "ytauto.jsonl",
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(JsonFormatter())
-    root.addHandler(file_handler)
+    if file_logging:
+        paths.ensure()
+        file_handler = RotatingFileHandler(
+            paths.logs / "ytauto.jsonl",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(JsonFormatter())
+        root.addHandler(file_handler)
 
     console = logging.StreamHandler()
     console.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))

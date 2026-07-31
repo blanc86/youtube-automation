@@ -1,8 +1,10 @@
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from ytauto.infra.logging import (
+    CorrelationIdFilter,
     JsonFormatter,
     bind_correlation_id,
     configure_logging,
@@ -110,6 +112,45 @@ def test_configure_logging_closes_previous_handlers_on_reconfigure(tmp_path: Pat
             assert handler.stream is None, (
                 f"{handler!r} left its file descriptor open after reconfigure"
             )
+    finally:
+        root = logging.getLogger("ytauto")
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
+
+
+def test_a_record_keeps_its_own_correlation_id() -> None:
+    """A relayed worker record must not be restamped with the parent's ID."""
+    bind_correlation_id("parent-job")
+    record = _make_record(correlation_id="worker-job")
+    CorrelationIdFilter().filter(record)
+    assert json.loads(JsonFormatter().format(record))["correlation_id"] == "worker-job"
+
+
+def test_a_record_without_an_id_gets_the_current_context_id() -> None:
+    bind_correlation_id("ambient-job")
+    record = _make_record()
+    CorrelationIdFilter().filter(record)
+    assert json.loads(JsonFormatter().format(record))["correlation_id"] == "ambient-job"
+
+
+def test_formatter_falls_back_when_the_filter_never_ran() -> None:
+    """Direct formatter use (as in these tests) must not raise."""
+    bind_correlation_id("fallback-job")
+    assert json.loads(JsonFormatter().format(_make_record()))["correlation_id"] == "fallback-job"
+
+
+def test_file_logging_can_be_disabled(tmp_path: Path) -> None:
+    """Workers must not own a rotating file handler - concurrent rollover
+    fails on Windows with WinError 32."""
+    paths = AppPaths.resolve(override=tmp_path)
+    paths.ensure()
+    configure_logging(paths, file_logging=False)
+    try:
+        handlers = logging.getLogger("ytauto").handlers
+        assert not any(isinstance(h, RotatingFileHandler) for h in handlers)
+        assert handlers, "console logging must still be installed"
+        assert not list(paths.logs.glob("*.jsonl"))
     finally:
         root = logging.getLogger("ytauto")
         for handler in list(root.handlers):
