@@ -1,4 +1,8 @@
+import os
+import sqlite3
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -10,6 +14,12 @@ from ytauto.infra.cas.store import CasStore
 
 OLD = "2020-01-01T00:00:00+00:00"
 NEW = "2026-01-01T00:00:00+00:00"
+
+
+def _age_file(path: Path, *, seconds: float) -> None:
+    """Backdate a file's mtime so age-based sweeping is deterministic."""
+    past = time.time() - seconds
+    os.utime(path, (past, past))
 
 
 def test_ceiling_is_capped_at_40_gib(tmp_path: Path) -> None:
@@ -90,3 +100,88 @@ def test_database_rows_are_removed_with_the_files(store: CasStore) -> None:
     assert not store.exists(digest)
     with pytest.raises(ValidationError):
         store.refcount(digest)
+
+
+def test_sweep_removes_a_blob_with_no_row(store: CasStore, db_conn: sqlite3.Connection) -> None:
+    digest = store.put_bytes(b"orphaned", kind="blob")
+    path = store.path_for(digest)
+    db_conn.execute("DELETE FROM cas_objects WHERE hash = ?", (digest,))
+    _age_file(path, seconds=3600)
+
+    report = Evictor(store, EvictionPolicy(max_bytes=10**9)).sweep_orphans()
+
+    assert report.orphan_blobs == 1
+    assert report.orphan_bytes == len(b"orphaned")
+    assert not path.exists()
+
+
+def test_sweep_keeps_blobs_that_have_rows(store: CasStore) -> None:
+    digest = store.put_bytes(b"legitimate", kind="blob")
+    _age_file(store.path_for(digest), seconds=3600)
+
+    report = Evictor(store, EvictionPolicy(max_bytes=10**9)).sweep_orphans()
+
+    assert report.orphan_blobs == 0
+    assert store.exists(digest)
+
+
+def test_sweep_spares_recently_written_blobs(store: CasStore, db_conn: sqlite3.Connection) -> None:
+    """put_bytes writes the file before recording the row; a blob written
+    microseconds ago is indistinguishable from an orphan."""
+    digest = store.put_bytes(b"just written", kind="blob")
+    path = store.path_for(digest)
+    db_conn.execute("DELETE FROM cas_objects WHERE hash = ?", (digest,))
+
+    report = Evictor(store, EvictionPolicy(max_bytes=10**9)).sweep_orphans()
+
+    assert report.orphan_blobs == 0, "a fresh blob must not be swept"
+    assert path.exists()
+
+
+def test_sweep_removes_stale_staging_files(store: CasStore) -> None:
+    shard = store.path_for("a" * 64).parent  # type: ignore[arg-type]
+    shard.mkdir(parents=True, exist_ok=True)
+    stale = shard / f"{'a' * 64}.99999.tmp"
+    stale.write_bytes(b"partial")
+    _age_file(stale, seconds=3600)
+
+    report = Evictor(store, EvictionPolicy(max_bytes=10**9)).sweep_orphans()
+
+    assert report.stale_staging == 1
+    assert report.stale_staging_bytes == len(b"partial")
+    assert not stale.exists()
+
+
+def test_sweep_spares_recent_staging_files(store: CasStore) -> None:
+    """A live worker's in-progress write must survive a concurrent sweep."""
+    shard = store.path_for("b" * 64).parent  # type: ignore[arg-type]
+    shard.mkdir(parents=True, exist_ok=True)
+    fresh = shard / f"{'b' * 64}.{os.getpid()}.tmp"
+    fresh.write_bytes(b"in progress")
+
+    report = Evictor(store, EvictionPolicy(max_bytes=10**9)).sweep_orphans()
+
+    assert report.stale_staging == 0
+    assert fresh.exists()
+
+
+def test_forget_deletes_the_row_before_unlinking(
+    store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """Ordering matters: a crash between the two must leave a reclaimable
+    orphan, never a phantom row that makes total_size() overcount."""
+    digest = store.put_bytes(b"doomed", kind="blob")
+    observed: list[bool] = []
+    original_unlink = Path.unlink
+
+    def _spy(self: Path, *args: object, **kwargs: object) -> None:
+        observed.append(
+            db_conn.execute("SELECT 1 FROM cas_objects WHERE hash = ?", (digest,)).fetchone()
+            is None
+        )
+        original_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with patch.object(Path, "unlink", _spy):
+        store.forget(digest)
+
+    assert observed == [True], "row must already be gone when unlink runs"

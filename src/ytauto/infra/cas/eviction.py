@@ -8,6 +8,7 @@ project or an in-flight job and are never evicted.
 from __future__ import annotations
 
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,8 @@ from ytauto.infra.cas.store import CasStore
 
 MAX_CEILING_BYTES = 40 * 1024**3
 _FREE_FRACTION = 0.40
+_STAGING_SUFFIX = ".tmp"
+_DEFAULT_MIN_AGE_S = 900.0
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,14 @@ class EvictionReport:
     bytes_remaining: int
 
 
+@dataclass(frozen=True)
+class SweepReport:
+    orphan_blobs: int
+    orphan_bytes: int
+    stale_staging: int
+    stale_staging_bytes: int
+
+
 class Evictor:
     def __init__(self, store: CasStore, policy: EvictionPolicy) -> None:
         self._store = store
@@ -72,3 +83,44 @@ class Evictor:
             evicted += 1
 
         return EvictionReport(evicted=evicted, bytes_freed=freed, bytes_remaining=total - freed)
+
+    def sweep_orphans(self, *, min_age_s: float = _DEFAULT_MIN_AGE_S) -> SweepReport:
+        """Reclaim blobs with no row and staging files from dead workers.
+
+        ``min_age_s`` is a correctness requirement, not tuning: put_bytes writes
+        the file before recording the row, so a blob written moments ago is
+        indistinguishable from an orphan. Only files older than the threshold
+        are touched, which makes this safe to run while workers are writing.
+
+        Raises:
+            OSError: if the cache directory cannot be walked.
+        """
+        known = self._store.known_digests()
+        cutoff = time.time() - min_age_s
+        orphans = orphan_bytes = staging = staging_bytes = 0
+
+        for path in self._store.root.glob("*/*/*"):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue  # a concurrent sweep or writer got there first
+            if stat.st_mtime > cutoff:
+                continue
+
+            if path.name.endswith(_STAGING_SUFFIX):
+                path.unlink(missing_ok=True)
+                staging += 1
+                staging_bytes += stat.st_size
+            elif path.name not in known:
+                path.unlink(missing_ok=True)
+                orphans += 1
+                orphan_bytes += stat.st_size
+
+        return SweepReport(
+            orphan_blobs=orphans,
+            orphan_bytes=orphan_bytes,
+            stale_staging=staging,
+            stale_staging_bytes=staging_bytes,
+        )

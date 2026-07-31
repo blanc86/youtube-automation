@@ -41,6 +41,11 @@ class CasStore:
         self._conn = conn
         self._root.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def root(self) -> Path:
+        """The content-addressed store's base directory."""
+        return self._root
+
     def path_for(self, digest: ContentHash) -> Path:
         """Compute the sharded on-disk path for a digest. Does not touch disk.
 
@@ -252,18 +257,30 @@ class CasStore:
         ).fetchall()
         return [(ContentHash(row["hash"]), int(row["size_bytes"])) for row in rows]
 
-    def forget(self, digest: ContentHash) -> None:
-        """Delete the object's file and its row. Idempotent.
+    def known_digests(self) -> frozenset[ContentHash]:
+        """Every digest with a row in ``cas_objects``.
 
-        Deliberately does NOT raise on an unknown digest, unlike the refcount
-        mutators: deleting what is already gone is the intended outcome.
+        Used by the evictor's orphan sweep to tell recorded blobs from garbage.
 
         Raises:
-            ValidationError: ``digest`` is not a valid sha256 hex digest.
-            OSError: the file exists but cannot be removed (on Windows,
-                typically because another process holds it open).
-            sqlite3.Error: the row cannot be deleted.
+            sqlite3.Error: the query fails.
         """
-        self.path_for(digest).unlink(missing_ok=True)
+        rows = self._conn.execute("SELECT hash FROM cas_objects").fetchall()
+        return frozenset(ContentHash(row["hash"]) for row in rows)
+
+    def forget(self, digest: ContentHash) -> None:
+        """Delete the object's row and then its file. Idempotent.
+
+        The row goes first on purpose: a crash between the two steps leaves a
+        file with no row, which the orphan sweep reclaims. The reverse order
+        would leave a row with no file - which makes total_size() overcount and
+        read_bytes() fail for a digest size_of() still answers.
+
+        Raises:
+            ValidationError: if ``digest`` is not a valid sha256 hex digest.
+            OSError: if the file exists but cannot be removed.
+        """
+        path = self.path_for(digest)
         with transaction(self._conn):
             self._conn.execute("DELETE FROM cas_objects WHERE hash = ?", (digest,))
+        path.unlink(missing_ok=True)
