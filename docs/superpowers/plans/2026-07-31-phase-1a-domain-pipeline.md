@@ -1309,6 +1309,7 @@ Deliberate rules:
 
 ```python
 import json
+import os
 import subprocess
 import sys
 from enum import StrEnum
@@ -1460,7 +1461,11 @@ def test_is_stable_across_interpreter_restarts() -> None:
             capture_output=True,
             encoding="utf-8",
             errors="replace",
-            env={"PYTHONHASHSEED": seed, "PATH": ""},
+            # Inherit the environment and override only the seed. A minimal env
+            # is not an option on Windows: without SystemRoot the interpreter
+            # fails to initialize, and the test would fail for a reason that has
+            # nothing to do with fingerprint stability.
+            env={**os.environ, "PYTHONHASHSEED": seed},
             check=True,
         )
         seen.add(result.stdout.strip())
