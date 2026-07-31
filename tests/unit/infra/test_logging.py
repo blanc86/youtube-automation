@@ -156,3 +156,59 @@ def test_file_logging_can_be_disabled(tmp_path: Path) -> None:
         for handler in list(root.handlers):
             root.removeHandler(handler)
             handler.close()
+
+
+def test_every_handler_carries_the_correlation_id_filter(tmp_path: Path) -> None:
+    """Structural check: the filter must live on each handler, not the logger.
+
+    Logger.filter() only runs for records logged through that exact logger
+    object. A record from a child logger reaches this logger's handlers via
+    callHandlers(), which walks ancestors' .handlers and never consults their
+    .filters - so a logger-attached filter silently never fires for any real
+    call site."""
+    paths = AppPaths.resolve(override=tmp_path)
+    paths.ensure()
+    configure_logging(paths, file_logging=False)
+    try:
+        handlers = logging.getLogger("ytauto").handlers
+        assert handlers, "expected at least one handler to be installed"
+        for handler in handlers:
+            assert any(isinstance(f, CorrelationIdFilter) for f in handler.filters), (
+                f"{handler!r} is missing a CorrelationIdFilter"
+            )
+    finally:
+        root = logging.getLogger("ytauto")
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
+
+
+def test_the_filter_stamps_records_on_the_real_dispatch_path(tmp_path: Path) -> None:
+    """The other filter tests call filter() directly. This one goes through
+    configure_logging -> get_logger(child).info -> callHandlers, which is how
+    every real call site logs, and is exactly where a logger-attached filter
+    silently does not fire."""
+    paths = AppPaths.resolve(override=tmp_path)
+    paths.ensure()
+    configure_logging(paths, file_logging=False)
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    root = logging.getLogger("ytauto")
+    probe = _Capture()
+    root.addHandler(probe)
+    try:
+        bind_correlation_id("stamped-at-emission")
+        get_logger("ytauto.core.pipeline").info("child record")
+    finally:
+        root.removeHandler(probe)
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
+
+    assert captured, "the child logger's record never reached a handler"
+    assert getattr(captured[0], "correlation_id", None) == "stamped-at-emission"

@@ -64,6 +64,14 @@ class CorrelationIdFilter(logging.Filter):
     relayed from a worker subprocess keep the ID they were created with. A
     formatter that read the ContextVar directly would overwrite every relayed
     line with the parent process's ID.
+
+    Attach this to HANDLERS, never to the logger. ``Logger.filter()`` runs only
+    inside ``Logger.handle()``, i.e. only for records logged through that exact
+    logger object. A record from a child logger such as
+    ``ytauto.core.pipeline`` reaches this logger's handlers through
+    ``callHandlers()``, which walks ancestors' ``.handlers`` and never consults
+    their ``.filters`` - so a logger-attached filter silently never fires for
+    any real call site.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -117,8 +125,12 @@ def configure_logging(paths: AppPaths, *, level: str = "INFO", file_logging: boo
     for handler in list(root.handlers):
         root.removeHandler(handler)
         handler.close()
+    # Filters live on handlers (see CorrelationIdFilter's docstring for why a
+    # logger-attached filter never fires for child-logger records), so they
+    # must be dropped here too or repeated calls stack duplicate instances on
+    # the process-wide "ytauto" logger.
+    root.filters.clear()
     root.propagate = False
-    root.addFilter(CorrelationIdFilter())
 
     if file_logging:
         paths.ensure()
@@ -129,10 +141,12 @@ def configure_logging(paths: AppPaths, *, level: str = "INFO", file_logging: boo
             encoding="utf-8",
         )
         file_handler.setFormatter(JsonFormatter())
+        file_handler.addFilter(CorrelationIdFilter())
         root.addHandler(file_handler)
 
     console = logging.StreamHandler()
     console.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+    console.addFilter(CorrelationIdFilter())
     root.addHandler(console)
 
 
