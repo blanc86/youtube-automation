@@ -566,6 +566,7 @@ class SweepReport:
     orphan_bytes: int
     stale_staging: int
     stale_staging_bytes: int
+    phantom_rows: int
 ```
 
 Add to `Evictor`:
@@ -600,16 +601,24 @@ Add to `Evictor`:
                 path.unlink(missing_ok=True)
                 staging += 1
                 staging_bytes += stat.st_size
-            elif path.name not in known:
+            elif path.name not in known and not self._store.has_row(path.name):
+                # Re-check immediately before unlinking. `known` is a snapshot,
+                # and put_bytes is idempotent: a worker storing identical
+                # content between the snapshot and here sees the file already
+                # present, skips the write, and records a row - after which
+                # deleting the file would strand that row.
                 path.unlink(missing_ok=True)
                 orphans += 1
                 orphan_bytes += stat.st_size
+
+        phantoms = self._store.forget_rows_without_files()
 
         return SweepReport(
             orphan_blobs=orphans,
             orphan_bytes=orphan_bytes,
             stale_staging=staging,
             stale_staging_bytes=staging_bytes,
+            phantom_rows=phantoms,
         )
 ```
 

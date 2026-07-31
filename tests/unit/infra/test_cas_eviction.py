@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from ytauto.core.errors import ValidationError
-from ytauto.infra.cas.eviction import MAX_CEILING_BYTES, EvictionPolicy, Evictor
+from ytauto.infra.cas.eviction import MAX_CEILING_BYTES, EvictionPolicy, Evictor, SweepReport
 from ytauto.infra.cas.store import CasStore
 
 # `store` comes from tests/unit/infra/conftest.py — do NOT redefine it here.
@@ -185,3 +185,54 @@ def test_forget_deletes_the_row_before_unlinking(
         store.forget(digest)
 
     assert observed == [True], "row must already be gone when unlink runs"
+
+
+def test_sweep_rechecks_before_unlinking_when_snapshot_is_stale(
+    store: CasStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates the TOCTOU race: known_digests() is a snapshot taken once at
+    sweep start, but put_bytes is idempotent, so a second writer can record a
+    row for an already-existing file after the snapshot was taken but before
+    the loop reaches that file. A sweep that trusts the stale snapshot alone
+    would delete a file whose row genuinely exists by the time it gets there -
+    recreating the exact phantom-row state forget()'s reordering exists to
+    prevent. The per-candidate has_row() re-check is what closes this window."""
+    digest = store.put_bytes(b"raced", kind="blob")
+    path = store.path_for(digest)
+    _age_file(path, seconds=3600)
+    monkeypatch.setattr(store, "known_digests", lambda: frozenset())
+
+    report = Evictor(store, EvictionPolicy(max_bytes=10**9)).sweep_orphans()
+
+    assert report.orphan_blobs == 0
+    assert path.exists()
+
+
+def test_sweep_reclaims_a_row_whose_file_vanished(store: CasStore) -> None:
+    """The mirror of an orphan blob: a row with no backing file is never a
+    legitimate transient state (both put paths write the file first), so it
+    is reclaimed unconditionally - no age guard needed."""
+    digest = store.put_bytes(b"vanished", kind="blob")
+    store.path_for(digest).unlink()
+
+    report = Evictor(store, EvictionPolicy(max_bytes=10**9)).sweep_orphans()
+
+    assert report.phantom_rows == 1
+    with pytest.raises(ValidationError):
+        store.refcount(digest)
+
+
+def test_healthy_store_sweeps_to_all_zeros(store: CasStore) -> None:
+    """No false positives: a blob whose row and file both exist and are
+    fresh must not be touched by any part of the sweep."""
+    store.put_bytes(b"healthy", kind="blob")
+
+    report = Evictor(store, EvictionPolicy(max_bytes=10**9)).sweep_orphans()
+
+    assert report == SweepReport(
+        orphan_blobs=0,
+        orphan_bytes=0,
+        stale_staging=0,
+        stale_staging_bytes=0,
+        phantom_rows=0,
+    )

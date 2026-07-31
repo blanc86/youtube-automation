@@ -268,6 +268,40 @@ class CasStore:
         rows = self._conn.execute("SELECT hash FROM cas_objects").fetchall()
         return frozenset(ContentHash(row["hash"]) for row in rows)
 
+    def has_row(self, digest: str) -> bool:
+        """True if this digest currently has a row in ``cas_objects``.
+
+        Used by the orphan sweep to re-check a candidate immediately before
+        unlinking, rather than trusting a snapshot taken at sweep start.
+
+        Raises:
+            sqlite3.Error: the query fails.
+        """
+        row = self._conn.execute("SELECT 1 FROM cas_objects WHERE hash = ?", (digest,)).fetchone()
+        return row is not None
+
+    def forget_rows_without_files(self) -> int:
+        """Drop rows whose blob file is missing. Returns the number removed.
+
+        The mirror of an orphan blob. Both put paths write the file before
+        recording the row, so a row without a file is never a legitimate
+        transient state - it means the file was lost, and the row is stale.
+        No age guard is needed for that reason.
+
+        Raises:
+            ValidationError: a row's hash is not a valid sha256 hex digest.
+            sqlite3.Error: the query or a delete fails.
+        """
+        stale = [
+            ContentHash(row["hash"])
+            for row in self._conn.execute("SELECT hash FROM cas_objects").fetchall()
+            if not self.path_for(ContentHash(row["hash"])).is_file()
+        ]
+        for digest in stale:
+            with transaction(self._conn, immediate=True):
+                self._conn.execute("DELETE FROM cas_objects WHERE hash = ?", (digest,))
+        return len(stale)
+
     def forget(self, digest: ContentHash) -> None:
         """Delete the object's row and then its file. Idempotent.
 
