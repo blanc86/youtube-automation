@@ -37,15 +37,25 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(
+    conn: sqlite3.Connection, *, immediate: bool = False
+) -> Iterator[sqlite3.Connection]:
     """Run a block in one transaction: commit on success, roll back on any error.
 
+    Pass ``immediate=True`` for read-then-write work such as claiming a queued
+    job or acquiring a resource lease. A deferred ``BEGIN`` upgrades to a write
+    lock lazily, and in WAL mode that upgrade returns SQLITE_BUSY_SNAPSHOT
+    *immediately* without invoking the busy handler - so ``busy_timeout`` does
+    not apply and the caller sees a spurious failure under concurrency.
+
+    Nesting two transactions on one connection raises OperationalError; keep
+    transactions at the outermost call site.
+
     Raises:
-        sqlite3.Error: BEGIN, COMMIT or ROLLBACK fails.
-        BaseException: anything the wrapped block raises is re-raised unchanged
-            after the transaction has been rolled back.
+        sqlite3.OperationalError: if a transaction is already open on ``conn``.
+        BaseException: anything raised inside the block, after rolling back.
     """
-    conn.execute("BEGIN")
+    conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
         yield conn
     except BaseException:
