@@ -52,7 +52,10 @@ def transaction(
     transactions at the outermost call site.
 
     Raises:
-        sqlite3.OperationalError: if a transaction is already open on ``conn``.
+        sqlite3.OperationalError: if a transaction is already open on ``conn``
+            (a programming error), or if the write lock could not be acquired
+            within ``busy_timeout`` (legitimate contention - callers competing
+            for a job or a lease must expect and handle this).
         BaseException: anything raised inside the block, after rolling back.
     """
     conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
