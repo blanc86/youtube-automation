@@ -237,9 +237,12 @@ class ArtifactStore:
                 because its ``cas_objects`` row is already gone is tolerated
                 rather than reported, so a caller seeing ValidationError from
                 ``forget`` can rely on "bad input, nothing happened".
-            sqlite3.OperationalError: if a delete cannot acquire the write lock
-                within ``busy_timeout`` (legitimate contention), or if a
-                transaction is already open on the connection.
+            sqlite3.OperationalError: if the row delete, or a ``release``'s own
+                transaction, cannot acquire the write lock within
+                ``busy_timeout`` (legitimate contention), or if a transaction is
+                already open on the connection. Unlike ValidationError above,
+                this one can arrive from the release loop *after* the rows are
+                committed, leaving the blobs partly released.
         """
         self._validate_fingerprint(fingerprint)
         existing = self.lookup(fingerprint)
