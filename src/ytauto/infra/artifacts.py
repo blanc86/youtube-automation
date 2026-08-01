@@ -45,8 +45,14 @@ class ArtifactStore:
         evictable blobs. Reporting a hit for artifacts that no longer exist
         would make the scheduler skip a stage whose output is gone.
 
+        Must be called outside an open transaction: the self-healing path opens
+        its own, and ``transaction`` is not re-entrant.
+
         Raises:
             ValidationError: if ``fingerprint`` is malformed.
+            sqlite3.OperationalError: if the self-healing delete cannot acquire
+                the write lock within ``busy_timeout`` (legitimate contention),
+                or if a transaction is already open on the connection.
         """
         self._validate_fingerprint(fingerprint)
         rows = self._conn.execute(
@@ -71,6 +77,29 @@ class ArtifactStore:
 
         Used when the blobs are already gone, so releasing would drive
         refcounts below what the remaining holders expect.
+
+        Not releasing is right for one of the two callers and lossy for the
+        other, and the rows alone cannot tell them apart:
+
+        - Crash window (``record`` committed rows, then died before retaining):
+          no retain ever happened, so releasing would push the refcount below
+          what other holders expect. Dropping the rows is exactly correct.
+        - Retained-then-vanished (``record`` completed, the blob file was later
+          lost): the +1 from ``retain`` is still on the ``cas_objects`` row and
+          this path strands it - a refcount above zero with no holder, which
+          makes the blob permanently unevictable.
+
+        The stranded count is normally reclaimed by
+        ``CasStore.forget_rows_without_files()`` (driven by
+        ``Evictor.sweep_orphans``), which deletes the whole row, refcount
+        included. That reclamation is lost if identical content is re-stored
+        before the sweep runs: ``put_bytes``'s ``ON CONFLICT DO UPDATE`` touches
+        only ``last_accessed_at``, so the phantom +1 survives forever.
+
+        Telling the two branches apart needs a ``retained`` marker column, an
+        append-only migration that belongs with the Phase 1b savepoint work
+        (carry-forward 1.2) that makes ``record`` atomic and dissolves this
+        whole class of window.
         """
         with transaction(self._conn, immediate=True):
             self._conn.execute("DELETE FROM artifacts WHERE fingerprint = ?", (fingerprint,))
@@ -79,17 +108,58 @@ class ArtifactStore:
         """Store the artifacts for a fingerprint and retain their blobs.
 
         Returns True on a first write, False if this fingerprint was already
-        recorded. On False nothing is retained again - double-retaining on every
-        resume would inflate refcounts and make the artifact permanently
-        unevictable.
+        recorded.
+
+        The already-recorded check buys idempotence, not refcount protection.
+        ``PRIMARY KEY (fingerprint, name)`` rejects the duplicate INSERT before
+        the retain loop below can run a second time, so refcounts stay symmetric
+        with or without the check. What it converts is the failure mode: a
+        crash-resume re-executing a completed stage would otherwise take an
+        ``IntegrityError`` and kill the worker on every single resume. The guard
+        turns that would-be primary-key violation into the documented False.
+
+        The same violation is also reachable legitimately. The check reads in
+        one transaction and the INSERT runs in another with no lock held across
+        the gap, so a concurrent writer - normal here, since cross-project dedup
+        means shared fingerprints are expected - can commit in between. Both
+        callers see a miss, both INSERT, and the loser collides. That collision
+        is proof somebody else recorded it, which is precisely the False
+        contract, so it is caught and reported as False. The loser must not
+        retain: the winner already did, and a second retain would be the
+        inflation this docstring used to wrongly claim the check prevents.
+
+        Must be called outside an open transaction: it opens its own, and
+        ``transaction`` is not re-entrant.
 
         Raises:
-            ValidationError: if ``fingerprint`` is malformed, ``artifacts`` is
-                empty, or a referenced blob is absent from the CAS.
+            ValidationError: if ``fingerprint`` is malformed, ``stage_id`` is
+                blank, ``artifacts`` is empty, two artifacts in the batch share
+                a name, or a referenced blob is absent from the CAS. The last is
+                also raised late, from ``retain`` after the rows are committed,
+                for a blob whose file is present but whose ``cas_objects`` row
+                is not - the orphan state the eviction sweep exists to reclaim.
+            sqlite3.OperationalError: if the write lock cannot be acquired
+                within ``busy_timeout`` (legitimate contention), or if a
+                transaction is already open on the connection.
         """
         self._validate_fingerprint(fingerprint)
+        if not stage_id.strip():
+            raise ValidationError(f"stage_id must not be blank for {fingerprint}")
         if not artifacts:
             raise ValidationError(f"no artifacts to record for {fingerprint}")
+
+        # Two artifacts sharing a name is malformed input, not a race: the
+        # primary key would reject it, and (unlike the concurrent-writer
+        # collision below) reporting False for it would silently swallow a
+        # caller bug. It has to be caught here, before any write, so the
+        # IntegrityError handler never sees it.
+        seen: set[str] = set()
+        for artifact in artifacts:
+            if artifact.name in seen:
+                raise ValidationError(
+                    f"duplicate artifact name in one batch for {fingerprint}: {artifact.name!r}"
+                )
+            seen.add(artifact.name)
 
         for artifact in artifacts:
             if not self._cas.exists(artifact.digest):
@@ -102,21 +172,29 @@ class ArtifactStore:
             return False
 
         now = utc_now_iso()
-        with transaction(self._conn, immediate=True):
-            for artifact in artifacts:
-                self._conn.execute(
-                    "INSERT INTO artifacts "
-                    "(fingerprint, name, stage_id, kind, digest, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        fingerprint,
-                        artifact.name,
-                        stage_id,
-                        artifact.kind,
-                        artifact.digest,
-                        now,
-                    ),
-                )
+        try:
+            with transaction(self._conn, immediate=True):
+                for artifact in artifacts:
+                    self._conn.execute(
+                        "INSERT INTO artifacts "
+                        "(fingerprint, name, stage_id, kind, digest, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            fingerprint,
+                            artifact.name,
+                            stage_id,
+                            artifact.kind,
+                            artifact.digest,
+                            now,
+                        ),
+                    )
+        except sqlite3.IntegrityError:
+            # Only the primary key can fire here - duplicate names within the
+            # batch were rejected above, so the collision is against rows a
+            # concurrent writer committed after our lookup missed. Somebody else
+            # recorded this fingerprint, which is the documented False. No
+            # retain: the winner holds the pin.
+            return False
         for artifact in artifacts:
             self._cas.retain(artifact.digest)
         return True
@@ -124,8 +202,18 @@ class ArtifactStore:
     def forget(self, fingerprint: str) -> None:
         """Drop a fingerprint's artifacts and release their blobs. Idempotent.
 
+        Must be called outside an open transaction: it opens its own, and
+        ``transaction`` is not re-entrant.
+
         Raises:
-            ValidationError: if ``fingerprint`` is malformed.
+            ValidationError: if ``fingerprint`` is malformed. Note this can only
+                be raised before anything is written; a release that fails
+                because its ``cas_objects`` row is already gone is tolerated
+                rather than reported, so a caller seeing ValidationError from
+                ``forget`` can rely on "bad input, nothing happened".
+            sqlite3.OperationalError: if a delete cannot acquire the write lock
+                within ``busy_timeout`` (legitimate contention), or if a
+                transaction is already open on the connection.
         """
         self._validate_fingerprint(fingerprint)
         existing = self.lookup(fingerprint)
@@ -133,4 +221,20 @@ class ArtifactStore:
             return
         self._drop_rows(fingerprint)
         for artifact in existing:
-            self._cas.release(artifact.digest)
+            try:
+                self._cas.release(artifact.digest)
+            except ValidationError:
+                # release() raises ValidationError for exactly two reasons: a
+                # malformed digest, or no cas_objects row for that digest. Every
+                # ArtifactRef validates its digest in __post_init__, and these
+                # refs were constructed by lookup(), so the digest is provably
+                # well-formed - the only reachable cause here is the missing
+                # row. Without that argument this catch would be swallowing two
+                # different failures.
+                #
+                # A missing row means the pin is already gone, which is the end
+                # state forget() is driving towards. Propagating instead would
+                # be actively worse: _drop_rows has already committed, so the
+                # caller would get "bad input" semantics for a half-finished
+                # release with the rows irrecoverably deleted.
+                continue

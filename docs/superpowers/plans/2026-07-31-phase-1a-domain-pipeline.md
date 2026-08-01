@@ -2397,8 +2397,15 @@ git commit -m "feat: add provider ports and capability descriptors"
 
 Three correctness details:
 
-- **`record` retains each digest exactly once**, so the evictor cannot delete a cached stage output. It returns `True` on a first write and `False` when the fingerprint was already recorded — and on `False` it must **not** retain again, or refcounts inflate on every resume and nothing is ever evictable.
-- **`forget` releases** what `record` retained, keeping refcounts symmetric.
+- **`record` retains each digest exactly once**, so the evictor cannot delete a cached stage output. It returns `True` on a first write and `False` when the fingerprint was already recorded.
+
+  **The already-recorded check buys idempotence, not refcount protection.** `PRIMARY KEY (fingerprint, name)` rejects the duplicate INSERT before the retain loop can run a second time, so refcounts stay symmetric with or without the check — the "refcounts inflate on every resume" rationale this plan originally gave is false under this schema. What the check actually converts is the *failure mode*: a crash-resume re-executing a completed stage would otherwise take an `IntegrityError` and kill the worker on **every single resume**. The check turns that would-be primary-key violation into the documented `False`.
+
+  That same violation is also reachable legitimately, and must be handled separately from malformed input:
+
+  - **Concurrent writer (not an error).** The check reads in one transaction and the INSERT runs in another, with no lock held across the gap. Two workers recording the same fingerprint — normal, since cross-project dedup means shared fingerprints are expected and Phase 1b runs a multi-worker dispatcher — both see a miss, both INSERT, and the loser collides. Catch `sqlite3.IntegrityError` **narrowly** around the INSERT block and return `False`: the collision is proof somebody else recorded it. The loser must **not** retain — the winner already did, and a second retain *would* be genuine inflation.
+  - **Duplicate names within one batch (caller error).** `record(FP, "tts", [ref("narration"), ref("narration")])` violates the same primary key, but it is malformed input, not a race. It needs a **pre-flight** duplicate-name check raising `ValidationError`, placed with the other input guards and **before** the INSERT — otherwise the `IntegrityError` handler above silently swallows a caller bug as `False`.
+- **`forget` releases** what `record` retained, keeping refcounts symmetric. It is *not* atomic: `_drop_rows` commits before the release loop runs, so a `release` that raises leaves rows deleted and blobs half-released behind an exception a caller reasonably reads as "bad input, nothing happened". The one reachable failure — the blob's `cas_objects` row is already gone — is therefore tolerated per-artifact and the loop continues. That catch is only safe because `ArtifactRef.__post_init__` validates the digest, so a `ValidationError` from `release` on refs returned by `lookup` can only mean "no such object", never "malformed digest"; without that argument the catch would be swallowing two different failures.
 - **`lookup` verifies the blobs still exist and self-heals when they don't.**
   This closes a real window: `record` commits its rows inside a transaction but
   retains blobs *after* it, because `CasStore.retain()` opens its own
@@ -2437,6 +2444,36 @@ def _put(store: CasStore, name: str, data: bytes) -> ArtifactRef:
     return ArtifactRef(name=name, kind="blob", digest=store.put_bytes(data, kind="blob"))
 
 
+def _row_count(conn: sqlite3.Connection, fingerprint: str) -> int:
+    return int(
+        conn.execute(
+            "SELECT count(*) FROM artifacts WHERE fingerprint = ?", (fingerprint,)
+        ).fetchone()[0]
+    )
+
+
+class _FailsOnSecondInsert:
+    """A connection stand-in that dies partway through record()'s INSERT loop.
+
+    ``sqlite3.Connection.execute`` is a read-only C attribute, so it cannot be
+    patched in place; wrapping the connection is the only way to inject a
+    failure *between* two INSERTs of one batch. Everything else - including
+    transaction()'s own BEGIN/COMMIT/ROLLBACK - forwards untouched, so the
+    rollback under test is the real one.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._inserts = 0
+
+    def execute(self, sql: str, *params: object) -> sqlite3.Cursor:
+        if sql.startswith("INSERT INTO artifacts"):
+            self._inserts += 1
+            if self._inserts == 2:
+                raise sqlite3.OperationalError("injected mid-batch failure")
+        return self._conn.execute(sql, *params)  # type: ignore[arg-type]
+
+
 def test_lookup_misses_on_an_unknown_fingerprint(artifacts: ArtifactStore) -> None:
     assert artifacts.lookup(FP) is None
 
@@ -2450,6 +2487,13 @@ def test_record_then_lookup_round_trips(artifacts: ArtifactStore, store: CasStor
 def test_lookup_returns_several_artifacts_in_name_order(
     artifacts: ArtifactStore, store: CasStore
 ) -> None:
+    # Deliberate, recorded exception to the guard-pinning rule: the ORDER BY
+    # name ASC clause this pins cannot be falsified by deleting it, because
+    # PRIMARY KEY (fingerprint, name) indexes exactly that pair and SQLite
+    # returns the rows name-ordered anyway. The clause is kept as an explicit
+    # guarantee against a future schema or index change silently reordering
+    # results. Non-vacuity was instead proven by mutating the clause to
+    # ORDER BY rowid (insertion order), which makes this test fail.
     timings = _put(store, "timings", b"json")
     narration = _put(store, "narration", b"audio")
     artifacts.record(FP, "tts", [timings, narration])
@@ -2464,11 +2508,15 @@ def test_record_retains_each_digest_once(artifacts: ArtifactStore, store: CasSto
     assert store.refcount(ref.digest) == 1
 
 
-def test_recording_the_same_fingerprint_twice_does_not_inflate_refcounts(
+def test_recording_the_same_fingerprint_twice_is_idempotent(
     artifacts: ArtifactStore, store: CasStore
 ) -> None:
-    """A resume re-records the same fingerprint. Double-retaining would make
-    the artifact permanently unevictable."""
+    """A crash-resume re-records a completed stage's fingerprint. Without the
+    already-recorded check that second call would hit PRIMARY KEY
+    (fingerprint, name) and kill the worker on every resume; the check converts
+    it into the documented False. It is not what keeps refcounts symmetric -
+    the primary key rejects the duplicate INSERT before the retain loop runs
+    again either way."""
     ref = _put(store, "narration", b"audio")
     assert artifacts.record(FP, "tts", [ref]) is True
     assert artifacts.record(FP, "tts", [ref]) is False
@@ -2496,9 +2544,7 @@ def test_recording_no_artifacts_is_rejected(artifacts: ArtifactStore) -> None:
         artifacts.record(FP, "tts", [])
 
 
-def test_a_malformed_fingerprint_is_rejected(
-    artifacts: ArtifactStore, store: CasStore
-) -> None:
+def test_a_malformed_fingerprint_is_rejected(artifacts: ArtifactStore, store: CasStore) -> None:
     with pytest.raises(ValidationError, match="fingerprint"):
         artifacts.record("not-a-fingerprint", "tts", [_put(store, "n", b"x")])
 
@@ -2508,10 +2554,14 @@ def test_lookup_rejects_a_malformed_fingerprint(artifacts: ArtifactStore) -> Non
         artifacts.lookup("nope")
 
 
-def test_a_failed_record_leaves_no_partial_state(
+def test_a_batch_naming_an_unknown_blob_is_rejected_before_any_write(
     artifacts: ArtifactStore, store: CasStore
 ) -> None:
-    """The row write and the retain must land together or not at all."""
+    """The blob-existence check is pre-flight: it runs before transaction() is
+    ever entered, so one unknown digest rejects the whole batch with nothing
+    written and nothing retained - including for the artifacts that were fine.
+    This pins rejection ordering, not rollback; rollback is pinned by
+    test_a_failure_inside_the_insert_loop_rolls_back_the_whole_batch."""
     good = _put(store, "narration", b"audio")
     missing = ArtifactRef(name="ghost", kind="blob", digest="c" * 64)  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
@@ -2520,9 +2570,88 @@ def test_a_failed_record_leaves_no_partial_state(
     assert store.refcount(good.digest) == 0
 
 
-def test_lookup_treats_a_vanished_blob_as_a_miss(
+def test_duplicate_names_in_one_batch_are_rejected(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """Two artifacts sharing a name violate PRIMARY KEY (fingerprint, name).
+    That is malformed input, so it must surface as ValidationError rather than
+    an undeclared IntegrityError - and it must not be swallowed as False by the
+    concurrent-writer handler, which is why the check is pre-flight."""
+    first = _put(store, "narration", b"audio")
+    second = ArtifactRef(
+        name="narration", kind="blob", digest=store.put_bytes(b"other audio", kind="blob")
+    )
+
+    with pytest.raises(ValidationError, match="duplicate artifact name"):
+        artifacts.record(FP, "tts", [first, second])
+
+    assert _row_count(db_conn, FP) == 0
+    assert store.refcount(first.digest) == 0
+    assert store.refcount(second.digest) == 0
+
+
+def test_record_returns_false_when_a_concurrent_writer_won_the_race(
+    artifacts: ArtifactStore, store: CasStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """record() reads its already-recorded check in one transaction and INSERTs
+    in another, holding no lock across the gap, so a second worker can commit in
+    between - normal, since cross-project dedup means shared fingerprints are
+    expected. Monkeypatching lookup to miss reproduces the loser's stale
+    pre-commit snapshot deterministically, without threads. The loser must
+    return False, not raise, and must not retain: the winner holds the pin."""
+    ref = _put(store, "narration", b"audio")
+    assert artifacts.record(FP, "tts", [ref]) is True
+
+    monkeypatch.setattr(artifacts, "lookup", lambda fingerprint: None)
+
+    assert artifacts.record(FP, "tts", [ref]) is False
+    assert store.refcount(ref.digest) == 1, "the loser must not retain a second time"
+
+
+def test_a_failure_inside_the_insert_loop_rolls_back_the_whole_batch(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """The rows of one batch land together or not at all. Failing the second
+    INSERT of two must leave the first one gone too - in autocommit it would
+    already be committed and permanent."""
+    narration = _put(store, "narration", b"audio")
+    timings = _put(store, "timings", b"json")
+    artifacts._conn = _FailsOnSecondInsert(db_conn)  # type: ignore[assignment]
+
+    with pytest.raises(sqlite3.OperationalError):
+        artifacts.record(FP, "tts", [narration, timings])
+
+    assert _row_count(db_conn, FP) == 0, "the first INSERT must have rolled back too"
+    assert store.refcount(narration.digest) == 0
+
+
+def test_forget_tolerates_a_blob_whose_cas_row_already_vanished(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """forget() commits its row deletes before releasing, so a release that
+    raises leaves the caller with 'rows gone, blobs half-released' behind an
+    exception that reads as 'bad input, nothing happened'. A missing
+    cas_objects row is the end state forget() wants anyway, so it is tolerated."""
+    ref = _put(store, "narration", b"audio")
+    artifacts.record(FP, "tts", [ref])
+    db_conn.execute("DELETE FROM cas_objects WHERE hash = ?", (ref.digest,))
+
+    artifacts.forget(FP)
+
+    assert _row_count(db_conn, FP) == 0
+
+
+def test_recording_with_a_blank_stage_id_is_rejected(
     artifacts: ArtifactStore, store: CasStore
 ) -> None:
+    """An empty artifact list is rejected two lines below; a stage_id that
+    identifies no stage is no more usable to a resuming scheduler."""
+    ref = _put(store, "narration", b"audio")
+    with pytest.raises(ValidationError, match="stage_id"):
+        artifacts.record(FP, "   ", [ref])
+
+
+def test_lookup_treats_a_vanished_blob_as_a_miss(artifacts: ArtifactStore, store: CasStore) -> None:
     """record() commits rows before retaining blobs, so a crash in that window
     leaves rows pointing at evictable blobs. Reporting a hit for artifacts that
     no longer exist would make the scheduler skip a stage whose output is gone."""
@@ -2550,9 +2679,7 @@ def test_lookup_drops_the_stale_rows_it_finds(
     assert remaining == 0
 
 
-def test_a_partially_vanished_set_is_a_miss(
-    artifacts: ArtifactStore, store: CasStore
-) -> None:
+def test_a_partially_vanished_set_is_a_miss(artifacts: ArtifactStore, store: CasStore) -> None:
     """One missing artifact invalidates the whole stage output, not just itself."""
     narration = _put(store, "narration", b"audio")
     timings = _put(store, "timings", b"json")
@@ -2622,22 +2749,25 @@ class ArtifactStore:
         evictable blobs. Reporting a hit for artifacts that no longer exist
         would make the scheduler skip a stage whose output is gone.
 
+        Must be called outside an open transaction: the self-healing path opens
+        its own, and ``transaction`` is not re-entrant.
+
         Raises:
             ValidationError: if ``fingerprint`` is malformed.
+            sqlite3.OperationalError: if the self-healing delete cannot acquire
+                the write lock within ``busy_timeout`` (legitimate contention),
+                or if a transaction is already open on the connection.
         """
         self._validate_fingerprint(fingerprint)
         rows = self._conn.execute(
-            "SELECT name, kind, digest FROM artifacts WHERE fingerprint = ? "
-            "ORDER BY name ASC",
+            "SELECT name, kind, digest FROM artifacts WHERE fingerprint = ? ORDER BY name ASC",
             (fingerprint,),
         ).fetchall()
         if not rows:
             return None
 
         found = tuple(
-            ArtifactRef(
-                name=row["name"], kind=row["kind"], digest=ContentHash(row["digest"])
-            )
+            ArtifactRef(name=row["name"], kind=row["kind"], digest=ContentHash(row["digest"]))
             for row in rows
         )
         if all(self._cas.exists(artifact.digest) for artifact in found):
@@ -2651,29 +2781,89 @@ class ArtifactStore:
 
         Used when the blobs are already gone, so releasing would drive
         refcounts below what the remaining holders expect.
+
+        Not releasing is right for one of the two callers and lossy for the
+        other, and the rows alone cannot tell them apart:
+
+        - Crash window (``record`` committed rows, then died before retaining):
+          no retain ever happened, so releasing would push the refcount below
+          what other holders expect. Dropping the rows is exactly correct.
+        - Retained-then-vanished (``record`` completed, the blob file was later
+          lost): the +1 from ``retain`` is still on the ``cas_objects`` row and
+          this path strands it - a refcount above zero with no holder, which
+          makes the blob permanently unevictable.
+
+        The stranded count is normally reclaimed by
+        ``CasStore.forget_rows_without_files()`` (driven by
+        ``Evictor.sweep_orphans``), which deletes the whole row, refcount
+        included. That reclamation is lost if identical content is re-stored
+        before the sweep runs: ``put_bytes``'s ``ON CONFLICT DO UPDATE`` touches
+        only ``last_accessed_at``, so the phantom +1 survives forever.
+
+        Telling the two branches apart needs a ``retained`` marker column, an
+        append-only migration that belongs with the Phase 1b savepoint work
+        (carry-forward 1.2) that makes ``record`` atomic and dissolves this
+        whole class of window.
         """
         with transaction(self._conn, immediate=True):
-            self._conn.execute(
-                "DELETE FROM artifacts WHERE fingerprint = ?", (fingerprint,)
-            )
+            self._conn.execute("DELETE FROM artifacts WHERE fingerprint = ?", (fingerprint,))
 
-    def record(
-        self, fingerprint: str, stage_id: str, artifacts: Sequence[ArtifactRef]
-    ) -> bool:
+    def record(self, fingerprint: str, stage_id: str, artifacts: Sequence[ArtifactRef]) -> bool:
         """Store the artifacts for a fingerprint and retain their blobs.
 
         Returns True on a first write, False if this fingerprint was already
-        recorded. On False nothing is retained again - double-retaining on every
-        resume would inflate refcounts and make the artifact permanently
-        unevictable.
+        recorded.
+
+        The already-recorded check buys idempotence, not refcount protection.
+        ``PRIMARY KEY (fingerprint, name)`` rejects the duplicate INSERT before
+        the retain loop below can run a second time, so refcounts stay symmetric
+        with or without the check. What it converts is the failure mode: a
+        crash-resume re-executing a completed stage would otherwise take an
+        ``IntegrityError`` and kill the worker on every single resume. The guard
+        turns that would-be primary-key violation into the documented False.
+
+        The same violation is also reachable legitimately. The check reads in
+        one transaction and the INSERT runs in another with no lock held across
+        the gap, so a concurrent writer - normal here, since cross-project dedup
+        means shared fingerprints are expected - can commit in between. Both
+        callers see a miss, both INSERT, and the loser collides. That collision
+        is proof somebody else recorded it, which is precisely the False
+        contract, so it is caught and reported as False. The loser must not
+        retain: the winner already did, and a second retain would be the
+        inflation this docstring used to wrongly claim the check prevents.
+
+        Must be called outside an open transaction: it opens its own, and
+        ``transaction`` is not re-entrant.
 
         Raises:
-            ValidationError: if ``fingerprint`` is malformed, ``artifacts`` is
-                empty, or a referenced blob is absent from the CAS.
+            ValidationError: if ``fingerprint`` is malformed, ``stage_id`` is
+                blank, ``artifacts`` is empty, two artifacts in the batch share
+                a name, or a referenced blob is absent from the CAS. The last is
+                also raised late, from ``retain`` after the rows are committed,
+                for a blob whose file is present but whose ``cas_objects`` row
+                is not - the orphan state the eviction sweep exists to reclaim.
+            sqlite3.OperationalError: if the write lock cannot be acquired
+                within ``busy_timeout`` (legitimate contention), or if a
+                transaction is already open on the connection.
         """
         self._validate_fingerprint(fingerprint)
+        if not stage_id.strip():
+            raise ValidationError(f"stage_id must not be blank for {fingerprint}")
         if not artifacts:
             raise ValidationError(f"no artifacts to record for {fingerprint}")
+
+        # Two artifacts sharing a name is malformed input, not a race: the
+        # primary key would reject it, and (unlike the concurrent-writer
+        # collision below) reporting False for it would silently swallow a
+        # caller bug. It has to be caught here, before any write, so the
+        # IntegrityError handler never sees it.
+        seen: set[str] = set()
+        for artifact in artifacts:
+            if artifact.name in seen:
+                raise ValidationError(
+                    f"duplicate artifact name in one batch for {fingerprint}: {artifact.name!r}"
+                )
+            seen.add(artifact.name)
 
         for artifact in artifacts:
             if not self._cas.exists(artifact.digest):
@@ -2686,21 +2876,29 @@ class ArtifactStore:
             return False
 
         now = utc_now_iso()
-        with transaction(self._conn, immediate=True):
-            for artifact in artifacts:
-                self._conn.execute(
-                    "INSERT INTO artifacts "
-                    "(fingerprint, name, stage_id, kind, digest, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        fingerprint,
-                        artifact.name,
-                        stage_id,
-                        artifact.kind,
-                        artifact.digest,
-                        now,
-                    ),
-                )
+        try:
+            with transaction(self._conn, immediate=True):
+                for artifact in artifacts:
+                    self._conn.execute(
+                        "INSERT INTO artifacts "
+                        "(fingerprint, name, stage_id, kind, digest, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            fingerprint,
+                            artifact.name,
+                            stage_id,
+                            artifact.kind,
+                            artifact.digest,
+                            now,
+                        ),
+                    )
+        except sqlite3.IntegrityError:
+            # Only the primary key can fire here - duplicate names within the
+            # batch were rejected above, so the collision is against rows a
+            # concurrent writer committed after our lookup missed. Somebody else
+            # recorded this fingerprint, which is the documented False. No
+            # retain: the winner holds the pin.
+            return False
         for artifact in artifacts:
             self._cas.retain(artifact.digest)
         return True
@@ -2708,8 +2906,18 @@ class ArtifactStore:
     def forget(self, fingerprint: str) -> None:
         """Drop a fingerprint's artifacts and release their blobs. Idempotent.
 
+        Must be called outside an open transaction: it opens its own, and
+        ``transaction`` is not re-entrant.
+
         Raises:
-            ValidationError: if ``fingerprint`` is malformed.
+            ValidationError: if ``fingerprint`` is malformed. Note this can only
+                be raised before anything is written; a release that fails
+                because its ``cas_objects`` row is already gone is tolerated
+                rather than reported, so a caller seeing ValidationError from
+                ``forget`` can rely on "bad input, nothing happened".
+            sqlite3.OperationalError: if a delete cannot acquire the write lock
+                within ``busy_timeout`` (legitimate contention), or if a
+                transaction is already open on the connection.
         """
         self._validate_fingerprint(fingerprint)
         existing = self.lookup(fingerprint)
@@ -2717,7 +2925,23 @@ class ArtifactStore:
             return
         self._drop_rows(fingerprint)
         for artifact in existing:
-            self._cas.release(artifact.digest)
+            try:
+                self._cas.release(artifact.digest)
+            except ValidationError:
+                # release() raises ValidationError for exactly two reasons: a
+                # malformed digest, or no cas_objects row for that digest. Every
+                # ArtifactRef validates its digest in __post_init__, and these
+                # refs were constructed by lookup(), so the digest is provably
+                # well-formed - the only reachable cause here is the missing
+                # row. Without that argument this catch would be swallowing two
+                # different failures.
+                #
+                # A missing row means the pin is already gone, which is the end
+                # state forget() is driving towards. Propagating instead would
+                # be actively worse: _drop_rows has already committed, so the
+                # caller would get "bad input" semantics for a half-finished
+                # release with the rows irrecoverably deleted.
+                continue
 ```
 
 - [ ] **Step 4: Run to verify they pass**
@@ -2726,11 +2950,22 @@ class ArtifactStore:
 .\.venv\Scripts\python.exe -m pytest tests/unit/infra/test_artifacts.py -v
 ```
 
-Expected: 14 passed.
+Expected: 19 passed.
 
-- [ ] **Step 5: Prove the double-retain guard is load-bearing**
+- [ ] **Step 5: Prove each guard is load-bearing**
 
-Temporarily delete the `if self.lookup(fingerprint) is not None: return False` early return (leaving the insert to fail or succeed as it may). Confirm `test_recording_the_same_fingerprint_twice_does_not_inflate_refcounts` FAILS. Restore, confirm PASS. Paste both outputs.
+"Confirm the test FAILS" is not a sufficient bar — *any* failure reason satisfies it, including one unrelated to the guard. Each proof below names the **specific** failure that must appear. Restore the code after each and re-confirm PASS. Paste both outputs for all four.
+
+| # | Mutation | Test that must fail | The failure that must appear |
+|---|---|---|---|
+| 1a | Delete the pre-flight duplicate-name check | `test_duplicate_names_in_one_batch_are_rejected` | `Failed: DID NOT RAISE ValidationError` — note it is *not* an escaping `IntegrityError`: the concurrent-writer handler swallows it as `False`. That is precisely why the pre-flight check must come first. |
+| 1b | Delete the `except sqlite3.IntegrityError` handler | `test_record_returns_false_when_a_concurrent_writer_won_the_race` | `sqlite3.IntegrityError: UNIQUE constraint failed: artifacts.fingerprint, artifacts.name` escaping `record` |
+| 3 | Mutate `ORDER BY name ASC` to `ORDER BY rowid` | `test_lookup_returns_several_artifacts_in_name_order` | `assert ['timings', 'narration'] == ['narration', 'timings']` |
+| 4 | Remove `with transaction(self._conn, immediate=True):`, leaving the loop in autocommit | `test_a_failure_inside_the_insert_loop_rolls_back_the_whole_batch` | `assert 1 == 0` — the first INSERT persisted |
+
+**Recorded exception for `ORDER BY name ASC`.** That clause is *inherently unfalsifiable by deletion* under this schema: `PRIMARY KEY (fingerprint, name)` creates an implicit index over exactly that pair, so SQLite returns rows name-ordered for free and deleting the clause leaves the whole suite green (verified). Do not attempt to manufacture a test that fails on its absence — that is a property of the schema, not a test defect. **Keep the clause**: relying on implicit index order is exactly the fragility it defends against, and a future schema or index change would silently reorder results. Prove *non-vacuity* by the `ORDER BY rowid` mutation above instead, and record the exception in a comment on the test so it is visible rather than silently ignored.
+
+Note that the double-retain guard is **not** on this list, and cannot be. Deleting `if self.lookup(fingerprint) is not None: return False` does not change any refcount — the primary key rejects the duplicate INSERT before the retain loop reruns. It is pinned by `test_recording_the_same_fingerprint_twice_is_idempotent` asserting the `True`/`False` contract, which is what the guard genuinely provides.
 
 - [ ] **Step 6: Run the full gate and confirm `doctor` still passes**
 
