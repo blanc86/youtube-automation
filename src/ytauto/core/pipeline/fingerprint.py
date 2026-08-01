@@ -39,7 +39,11 @@ def _encode(obj: object) -> Any:
     if isinstance(obj, (set, frozenset)):
         return sorted(obj, key=canonical_json)
     if isinstance(obj, bytes):
-        return obj.hex()
+        # Tagged, not bare hex: a bare hex string would make b"\xab\xcd" and
+        # the string "abcd" fingerprint identically - a false cache HIT, which
+        # serves one stage's output as another's. Every other guard here
+        # defends against false misses; this one defends against the worse case.
+        return {"__bytes__": obj.hex()}
     raise ValidationError(f"cannot fingerprint a value of type {type(obj).__name__}: {obj!r}")
 
 
