@@ -2098,6 +2098,18 @@ def test_quality_tier_must_be_one_to_five(tier: int) -> None:
         _descriptor(quality_tier=tier)
 
 
+@pytest.mark.parametrize("tier", [1, 5])
+def test_quality_tier_accepts_both_boundaries(tier: int) -> None:
+    """Pins the boundaries positively as well as negatively.
+
+    Without this, mutating the check to the off-by-one ``1 < tier < 5`` passes
+    every rejection test - 0, 6 and -1 stay rejected - because nothing ever
+    constructs a descriptor at 1 or 5 to notice they became wrongly rejected.
+    The fixture default is 4, an interior value.
+    """
+    assert _descriptor(quality_tier=tier).quality_tier == tier
+
+
 def test_a_gpu_provider_must_declare_its_vram() -> None:
     """The governor sizes GPU leases from this; None would mean 'unbounded'
     on a 4 GB card."""
