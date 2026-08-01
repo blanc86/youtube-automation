@@ -44,7 +44,56 @@ _M001 = Migration(
     ),
 )
 
-MIGRATIONS: tuple[Migration, ...] = (_M001,)
+_M002 = Migration(
+    version=2,
+    name="jobs_stages_artifacts",
+    statements=(
+        """
+        CREATE TABLE jobs (
+            id               TEXT PRIMARY KEY,
+            project_id       TEXT NOT NULL,
+            pipeline_id      TEXT NOT NULL,
+            state            TEXT NOT NULL,
+            priority         INTEGER NOT NULL DEFAULT 0,
+            attempts         INTEGER NOT NULL DEFAULT 0,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL,
+            lease_owner      TEXT,
+            lease_expires_at TEXT,
+            last_error       TEXT
+        )
+        """,
+        "CREATE INDEX idx_jobs_claimable ON jobs (state, priority DESC, created_at)",
+        "CREATE INDEX idx_jobs_lease ON jobs (lease_expires_at)",
+        """
+        CREATE TABLE job_stages (
+            job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            stage_id    TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            fingerprint TEXT,
+            started_at  TEXT,
+            finished_at TEXT,
+            error       TEXT,
+            PRIMARY KEY (job_id, stage_id)
+        )
+        """,
+        """
+        CREATE TABLE artifacts (
+            fingerprint TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            stage_id    TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            digest      TEXT NOT NULL,
+            meta_json   TEXT NOT NULL DEFAULT '{}',
+            created_at  TEXT NOT NULL,
+            PRIMARY KEY (fingerprint, name)
+        )
+        """,
+        "CREATE INDEX idx_artifacts_digest ON artifacts (digest)",
+    ),
+)
+
+MIGRATIONS: tuple[Migration, ...] = (_M001, _M002)
 HEAD_VERSION: int = MIGRATIONS[-1].version
 
 
