@@ -1382,10 +1382,18 @@ def test_dict_insertion_order_does_not_matter() -> None:
     assert compute_fingerprint(a) == compute_fingerprint(b)
 
 
-def test_set_iteration_order_does_not_matter() -> None:
-    a = _spec(settings={"langs": {"en", "fr", "de"}})
-    b = _spec(settings={"langs": {"de", "en", "fr"}})
-    assert compute_fingerprint(a) == compute_fingerprint(b)
+def test_sets_encode_in_sorted_order() -> None:
+    """White-box, because a black-box pairwise comparison cannot catch this.
+
+    Within one process, two sets built from the same elements iterate
+    identically - order depends on element hashes and table size, not on
+    insertion sequence - so comparing two equal sets proves nothing about
+    whether a sort happened. Ten elements make an accidentally-sorted
+    iteration order about a 1-in-3.6-million coincidence.
+    """
+    langs = {"pt", "de", "ja", "en", "fr", "ko", "it", "es", "zh", "ru"}
+    encoded = json.loads(canonical_json({"langs": langs}))
+    assert encoded["langs"] == sorted(langs)
 
 
 def test_input_digest_order_does_matter() -> None:
@@ -1419,10 +1427,35 @@ def test_int_and_float_are_distinct_settings() -> None:
     )
 
 
-def test_schema_version_is_part_of_the_payload() -> None:
-    """A future canonicalisation change must invalidate, not collide."""
-    payload = json.loads(canonical_json({"schema": FINGERPRINT_SCHEMA_VERSION}))
-    assert payload["schema"] == FINGERPRINT_SCHEMA_VERSION
+def test_changing_the_schema_version_changes_every_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A future canonicalisation change must invalidate, not collide.
+
+    Asserted against compute_fingerprint itself: round-tripping the constant
+    through canonical_json would pass for any working JSON encoder even if the
+    payload never carried the version at all.
+    """
+    before = compute_fingerprint(_spec())
+    monkeypatch.setattr(
+        "ytauto.core.pipeline.fingerprint.FINGERPRINT_SCHEMA_VERSION",
+        FINGERPRINT_SCHEMA_VERSION + 1,
+    )
+    assert compute_fingerprint(_spec()) != before
+
+
+def test_bytes_do_not_collide_with_their_hex_string() -> None:
+    """A false cache HIT is worse than a miss: it serves one stage's output as
+    another's. Bare hex encoding would make these two settings identical."""
+    as_bytes = compute_fingerprint(_spec(settings={"payload": b"\xab\xcd"}))
+    as_text = compute_fingerprint(_spec(settings={"payload": "abcd"}))
+    assert as_bytes != as_text
+
+
+def test_bytes_fingerprint_deterministically() -> None:
+    assert compute_fingerprint(_spec(settings={"payload": b"\x00\xff"})) == (
+        compute_fingerprint(_spec(settings={"payload": b"\x00\xff"}))
+    )
 
 
 def test_enums_encode_as_their_value() -> None:
@@ -1554,7 +1587,11 @@ def _encode(obj: object) -> Any:
     if isinstance(obj, (set, frozenset)):
         return sorted(obj, key=canonical_json)
     if isinstance(obj, bytes):
-        return obj.hex()
+        # Tagged, not bare hex: a bare hex string would make b"\xab\xcd" and
+        # the string "abcd" fingerprint identically - a false cache HIT, which
+        # serves one stage's output as another's. Every other guard here
+        # defends against false misses; this one defends against the worse case.
+        return {"__bytes__": obj.hex()}
     raise ValidationError(
         f"cannot fingerprint a value of type {type(obj).__name__}: {obj!r}"
     )
