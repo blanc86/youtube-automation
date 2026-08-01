@@ -1737,16 +1737,48 @@ def test_topological_order_respects_dependencies() -> None:
 
 
 def test_topological_order_is_deterministic_regardless_of_declaration_order() -> None:
-    """Two runs must plan identically; a varying order could vary fingerprints."""
-    shuffled = Pipeline(
-        id="shorts",
-        stages=(
-            FakeStage("tts", ("rewrite",)),
-            FakeStage("ingest"),
-            FakeStage("rewrite", ("ingest",)),
-        ),
+    """Two runs must plan identically; a varying order could vary fingerprints.
+
+    The fixture needs INDEPENDENT stages. A linear chain has a unique
+    topological order regardless of tie-breaking, so a chain-based fixture
+    would pass even with the tiebreak removed - proving nothing.
+    """
+    forward = Pipeline(
+        id="p",
+        stages=(FakeStage("alpha"), FakeStage("beta"), FakeStage("gamma", ("alpha",))),
     )
-    assert [s.id for s in shuffled.topological_order()] == ["ingest", "rewrite", "tts"]
+    shuffled = Pipeline(
+        id="p",
+        stages=(FakeStage("gamma", ("alpha",)), FakeStage("beta"), FakeStage("alpha")),
+    )
+    assert [s.id for s in forward.topological_order()] == [
+        s.id for s in shuffled.topological_order()
+    ]
+
+
+def test_dependency_declaration_order_does_not_affect_the_plan() -> None:
+    """The inner sort, over each stage's own depends_on tuple.
+
+    Without it, a stage declaring ("right", "left") plans differently from one
+    declaring ("left", "right") - silently changing which artifacts feed a
+    downstream fingerprint. The diamond test alone cannot catch this: it
+    asserts only that left and right both appear, never their relative order.
+    """
+
+    def _pipeline(join_deps: tuple[str, ...]) -> Pipeline:
+        return Pipeline(
+            id="p",
+            stages=(
+                FakeStage("root"),
+                FakeStage("left", ("root",)),
+                FakeStage("right", ("root",)),
+                FakeStage("join", join_deps),
+            ),
+        )
+
+    forward = [s.id for s in _pipeline(("left", "right")).topological_order()]
+    backward = [s.id for s in _pipeline(("right", "left")).topological_order()]
+    assert forward == backward == ["root", "left", "right", "join"]
 
 
 def test_independent_stages_are_ordered_by_id() -> None:
