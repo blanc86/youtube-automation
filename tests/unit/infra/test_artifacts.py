@@ -50,6 +50,23 @@ class _FailsOnSecondInsert:
         return self._conn.execute(sql, *params)  # type: ignore[arg-type]
 
 
+class _InsertViolatesSomeOtherConstraint:
+    """A connection stand-in whose INSERTs raise IntegrityError for a non-PK reason.
+
+    Stands in for a constraint a later migration might add to ``artifacts`` (a
+    CHECK, a FOREIGN KEY). Everything else forwards untouched, so record()'s
+    post-collision row probe sees the real, empty table.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, *params: object) -> sqlite3.Cursor:
+        if sql.startswith("INSERT INTO artifacts"):
+            raise sqlite3.IntegrityError("CHECK constraint failed: some_future_rule")
+        return self._conn.execute(sql, *params)  # type: ignore[arg-type]
+
+
 def test_lookup_misses_on_an_unknown_fingerprint(artifacts: ArtifactStore) -> None:
     assert artifacts.lookup(FP) is None
 
@@ -182,6 +199,25 @@ def test_record_returns_false_when_a_concurrent_writer_won_the_race(
 
     assert artifacts.record(FP, "tts", [ref]) is False
     assert store.refcount(ref.digest) == 1, "the loser must not retain a second time"
+
+
+def test_an_integrity_error_that_is_not_a_collision_is_re_raised(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """Reporting False means 'somebody else already recorded this'. An
+    IntegrityError from any other constraint - one a future migration might add
+    to this table - is not that, and swallowing it would tell the caller its
+    stage output is cached when nothing was ever written. The handler proves the
+    claim by checking the table instead of assuming the primary key is the only
+    constraint that can fire."""
+    ref = _put(store, "narration", b"audio")
+    artifacts._conn = _InsertViolatesSomeOtherConstraint(db_conn)  # type: ignore[assignment]
+
+    with pytest.raises(sqlite3.IntegrityError, match="some_future_rule"):
+        artifacts.record(FP, "tts", [ref])
+
+    assert _row_count(db_conn, FP) == 0
+    assert store.refcount(ref.digest) == 0
 
 
 def test_a_failure_inside_the_insert_loop_rolls_back_the_whole_batch(

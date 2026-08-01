@@ -104,6 +104,19 @@ class ArtifactStore:
         with transaction(self._conn, immediate=True):
             self._conn.execute("DELETE FROM artifacts WHERE fingerprint = ?", (fingerprint,))
 
+    def _has_rows(self, fingerprint: str) -> bool:
+        """Whether any row exists for this fingerprint, without self-healing.
+
+        ``lookup`` cannot answer this question: it treats a row whose blob is
+        gone as a miss and deletes it. This is the raw table state, which is what
+        distinguishes a concurrent writer's committed rows from an integrity
+        violation that has nothing to do with the primary key.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM artifacts WHERE fingerprint = ? LIMIT 1", (fingerprint,)
+        ).fetchone()
+        return row is not None
+
     def record(self, fingerprint: str, stage_id: str, artifacts: Sequence[ArtifactRef]) -> bool:
         """Store the artifacts for a fingerprint and retain their blobs.
 
@@ -124,9 +137,12 @@ class ArtifactStore:
         means shared fingerprints are expected - can commit in between. Both
         callers see a miss, both INSERT, and the loser collides. That collision
         is proof somebody else recorded it, which is precisely the False
-        contract, so it is caught and reported as False. The loser must not
-        retain: the winner already did, and a second retain would be the
-        inflation this docstring used to wrongly claim the check prevents.
+        contract, so it is caught and reported as False - but only after
+        confirming rows for this fingerprint actually exist, so that an
+        integrity violation from some future constraint is re-raised rather than
+        silently reported as a cache hit. The loser must not retain: the winner
+        already did, and a second retain would be the inflation this docstring
+        used to wrongly claim the check prevents.
 
         Must be called outside an open transaction: it opens its own, and
         ``transaction`` is not re-entrant.
@@ -141,6 +157,10 @@ class ArtifactStore:
             sqlite3.OperationalError: if the write lock cannot be acquired
                 within ``busy_timeout`` (legitimate contention), or if a
                 transaction is already open on the connection.
+            sqlite3.IntegrityError: if an INSERT violates a constraint other
+                than the primary-key collision described above - today
+                unreachable, since the primary key is this table's only
+                constraint, but re-raised rather than assumed away.
         """
         self._validate_fingerprint(fingerprint)
         if not stage_id.strip():
@@ -189,11 +209,17 @@ class ArtifactStore:
                         ),
                     )
         except sqlite3.IntegrityError:
-            # Only the primary key can fire here - duplicate names within the
-            # batch were rejected above, so the collision is against rows a
-            # concurrent writer committed after our lookup missed. Somebody else
-            # recorded this fingerprint, which is the documented False. No
-            # retain: the winner holds the pin.
+            # Today the primary key is the only constraint on this table, so a
+            # collision can only mean a concurrent writer committed after our
+            # lookup missed - the documented False. Rather than trust that as a
+            # standing assumption, verify it: a later migration adding a CHECK or
+            # FOREIGN KEY would otherwise turn this handler into a silent
+            # swallower of real errors. Ask the table directly instead of calling
+            # lookup(), whose self-healing path would report a miss (and delete
+            # the winner's rows) if the blobs had since vanished.
+            if not self._has_rows(fingerprint):
+                raise
+            # Somebody else recorded it. No retain: the winner holds the pin.
             return False
         for artifact in artifacts:
             self._cas.retain(artifact.digest)
