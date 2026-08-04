@@ -171,13 +171,36 @@ def test_migration_003_adds_per_stage_attempts(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_the_claim_index_leads_with_state_then_available_at(tmp_path: Path) -> None:
-    """The claim query filters on state AND available_at before ordering. An
-    index that does not lead with both cannot serve it as a covering scan."""
+def test_the_claim_index_follows_esr_order(tmp_path: Path) -> None:
+    """ESR: equality, sort, range. The claim query is WHERE state=? AND
+    available_at<=? ORDER BY priority DESC, created_at. state is the equality
+    column; priority/created_at are the sort columns; available_at is the
+    range-filtered column and must trail the sort columns, not lead them, or
+    SQLite cannot use the index to satisfy ORDER BY."""
     conn = connect(tmp_path / "t.db")
     apply_migrations(conn)
     cols = [r["name"] for r in conn.execute("PRAGMA index_info(idx_jobs_claimable)")]
-    assert cols[:2] == ["state", "available_at"]
+    assert cols == ["state", "priority", "created_at", "available_at"]
+    conn.close()
+
+
+def test_the_claim_index_avoids_a_sort_pass(tmp_path: Path) -> None:
+    """ESR: equality, sort, range. Putting the range-filtered available_at
+    ahead of the sort columns makes SQLite build a temp b-tree on every claim,
+    which the v2 index did not need. The claim query is the dispatcher's hot
+    polling path."""
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    plan = [
+        row[3]
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT id FROM jobs WHERE state = ? AND available_at <= ? "
+            "ORDER BY priority DESC, created_at LIMIT 1",
+            ("queued", utc_now_iso()),
+        )
+    ]
+    assert not any("TEMP B-TREE" in step for step in plan), plan
     conn.close()
 
 
@@ -239,4 +262,37 @@ def test_migration_003_is_applied_on_top_of_an_existing_002(tmp_path: Path) -> N
         "SELECT attempts FROM job_stages WHERE job_id = 'j1' AND stage_id = 'rewrite'"
     ).fetchone()
     assert stage_row["attempts"] == 0
+    conn.close()
+
+
+def test_a_job_inserted_under_v2_is_claimable_after_a_real_upgrade_to_v3(
+    tmp_path: Path,
+) -> None:
+    """End-to-end version of the '' default property: build a genuine v2
+    database, insert a queued job the way v2 code would (no available_at
+    column exists yet to write to), upgrade to v3 for real, and confirm the
+    claim predicate finds that same row with no backfill in between.
+
+    The other two tests each cover half of this: one runs the claim predicate
+    but only against a row inserted straight into an already-v3 schema; the
+    other performs a genuine v2->v3 upgrade but only checks available_at ==
+    "" directly, never runs the claim predicate. Neither exercises the actual
+    scenario the default exists for.
+    """
+    conn = connect(tmp_path / "t.db")
+    with patch("ytauto.infra.db.migrations.MIGRATIONS", MIGRATIONS[:2]):
+        assert apply_migrations(conn) == 2
+    now = utc_now_iso()
+    conn.execute(
+        "INSERT INTO jobs (id, project_id, pipeline_id, state, created_at, updated_at) "
+        "VALUES ('j1', 'p1', 'pipe', 'queued', ?, ?)",
+        (now, now),
+    )
+
+    assert apply_migrations(conn) == 3
+
+    row = conn.execute(
+        "SELECT id FROM jobs WHERE state = 'queued' AND available_at <= ?", (now,)
+    ).fetchone()
+    assert row["id"] == "j1"
     conn.close()
