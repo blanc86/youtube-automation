@@ -42,6 +42,10 @@ class _FailsOnSecondInsert:
         self._conn = conn
         self._inserts = 0
 
+    @property
+    def in_transaction(self) -> bool:
+        return self._conn.in_transaction
+
     def execute(self, sql: str, *params: object) -> sqlite3.Cursor:
         if sql.startswith("INSERT INTO artifacts"):
             self._inserts += 1
@@ -60,6 +64,10 @@ class _InsertViolatesSomeOtherConstraint:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._conn.in_transaction
 
     def execute(self, sql: str, *params: object) -> sqlite3.Cursor:
         if sql.startswith("INSERT INTO artifacts"):

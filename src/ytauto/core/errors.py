@@ -26,6 +26,18 @@ class ResourceExhausted(YtautoError):
     """A finite local resource (disk, VRAM, lease) was unavailable."""
 
 
+class TransactionError(YtautoError):
+    """A transaction was opened on a connection that already had one.
+
+    Deliberately distinct from ``sqlite3.OperationalError``, which the same
+    helper raises for legitimate lock contention. This one always means a
+    programming error - the transaction helper is not re-entrant - and must
+    never be retried. A scheduler claiming a job needs to tell "my code is
+    broken, crash" from "someone else holds the lock, back off" without
+    string-matching an error message.
+    """
+
+
 class RenderError(YtautoError):
     """Video composition or export failed."""
 

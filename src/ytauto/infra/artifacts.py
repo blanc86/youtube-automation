@@ -51,8 +51,10 @@ class ArtifactStore:
         Raises:
             ValidationError: if ``fingerprint`` is malformed.
             sqlite3.OperationalError: if the self-healing delete cannot acquire
-                the write lock within ``busy_timeout`` (legitimate contention),
-                or if a transaction is already open on the connection.
+                the write lock within ``busy_timeout`` (legitimate contention).
+            TransactionError: if a transaction is already open on the
+                connection. Note this is reachable from a method that reads as a
+                pure query - the self-healing path takes a write lock.
         """
         self._validate_fingerprint(fingerprint)
         rows = self._conn.execute(
@@ -155,8 +157,9 @@ class ArtifactStore:
                 for a blob whose file is present but whose ``cas_objects`` row
                 is not - the orphan state the eviction sweep exists to reclaim.
             sqlite3.OperationalError: if the write lock cannot be acquired
-                within ``busy_timeout`` (legitimate contention), or if a
-                transaction is already open on the connection.
+                within ``busy_timeout`` (legitimate contention).
+            TransactionError: if a transaction is already open on the
+                connection.
             sqlite3.IntegrityError: if an INSERT violates a constraint other
                 than the primary-key collision described above - today
                 unreachable, since the primary key is this table's only
@@ -239,10 +242,11 @@ class ArtifactStore:
                 ``forget`` can rely on "bad input, nothing happened".
             sqlite3.OperationalError: if the row delete, or a ``release``'s own
                 transaction, cannot acquire the write lock within
-                ``busy_timeout`` (legitimate contention), or if a transaction is
-                already open on the connection. Unlike ValidationError above,
+                ``busy_timeout`` (legitimate contention). Unlike ValidationError above,
                 this one can arrive from the release loop *after* the rows are
                 committed, leaving the blobs partly released.
+            TransactionError: if a transaction is already open on the
+                connection.
         """
         self._validate_fingerprint(fingerprint)
         existing = self.lookup(fingerprint)

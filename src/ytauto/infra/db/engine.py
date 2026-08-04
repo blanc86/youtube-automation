@@ -12,6 +12,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from ytauto.core.errors import TransactionError
+
 _PRAGMAS = (
     "PRAGMA journal_mode=WAL",
     "PRAGMA foreign_keys=ON",
@@ -48,16 +50,26 @@ def transaction(
     *immediately* without invoking the busy handler - so ``busy_timeout`` does
     not apply and the caller sees a spurious failure under concurrency.
 
-    Nesting two transactions on one connection raises OperationalError; keep
-    transactions at the outermost call site.
+    Nesting two transactions on one connection raises TransactionError; keep
+    transactions at the outermost call site. That check happens before ``BEGIN``
+    is issued, so an outer transaction is left fully intact - letting the nested
+    ``BEGIN`` fail instead would trip the rollback handler below and silently
+    discard the caller's work.
 
     Raises:
-        sqlite3.OperationalError: if a transaction is already open on ``conn``
-            (a programming error), or if the write lock could not be acquired
-            within ``busy_timeout`` (legitimate contention - callers competing
-            for a job or a lease must expect and handle this).
+        TransactionError: if a transaction is already open on ``conn``. Always a
+            programming error, never retryable.
+        sqlite3.OperationalError: if the write lock could not be acquired within
+            ``busy_timeout`` - legitimate contention, which callers competing for
+            a job or a lease must expect and handle. Distinguishing these two is
+            why the nesting case has its own type.
         BaseException: anything raised inside the block, after rolling back.
     """
+    if conn.in_transaction:
+        raise TransactionError(
+            "a transaction is already open on this connection; transaction() is "
+            "not re-entrant - move the transaction to the outermost call site"
+        )
     conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
         yield conn
