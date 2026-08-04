@@ -965,4 +965,790 @@ git commit -m "feat: add ready_stages and upstream_of for the scheduler"
 
 ---
 
-*Tasks 8–14 (CasStore split, worker protocol, queue, governor, runner, dispatcher, exit criteria) follow in the next section of this document.*
+## Task 8: Split `CasStore` for the single-writer model
+
+**Files:**
+- Modify: `src/ytauto/infra/cas/store.py`
+- Test: `tests/unit/infra/test_cas_store.py`
+
+**Interfaces:**
+- Produces: `stage_file(data: bytes, *, kind: str) -> ContentHash` (worker side, filesystem only, no SQLite); `record_blob(digest: ContentHash, *, kind: str, size_bytes: int) -> None` (parent side, row only, composable inside a caller's transaction).
+
+Only the main process writes to SQLite. Workers write blob *files* and report digests over the pipe; the dispatcher owns every row. `put_bytes` did both, so it cannot be called from a worker.
+
+The existing per-process staging paths (`{hash}.{pid}.tmp`) were built for exactly this and stay. `put_bytes` remains, now implemented as `stage_file` followed by `record_blob`, so existing callers and tests are untouched.
+
+`record_blob` must **not** open its own transaction when one is already open — Task 1 makes that safe automatically, which is what lets the dispatcher do `record_blob` + `retain` + `ArtifactStore.record` + the `job_stages` update in one atomic step.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+def test_stage_file_writes_the_blob_without_touching_the_database(
+    store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """A worker must be able to produce a blob with no SQLite write at all."""
+    digest = store.stage_file(b"payload", kind="blob")
+    assert store.path_for(digest).is_file()
+    assert db_conn.execute("SELECT count(*) FROM cas_objects").fetchone()[0] == 0
+
+
+def test_record_blob_creates_the_row_for_an_already_staged_file(store: CasStore) -> None:
+    digest = store.stage_file(b"payload", kind="blob")
+    store.record_blob(digest, kind="blob", size_bytes=len(b"payload"))
+    assert store.refcount(digest) == 0
+    assert store.size_of(digest) == len(b"payload")
+
+
+def test_record_blob_is_idempotent(store: CasStore) -> None:
+    """Cross-project dedup means the same digest is recorded more than once."""
+    digest = store.stage_file(b"payload", kind="blob")
+    store.record_blob(digest, kind="blob", size_bytes=7)
+    store.record_blob(digest, kind="blob", size_bytes=7)
+    assert store.refcount(digest) == 0
+
+
+def test_record_blob_rejects_a_digest_with_no_file(store: CasStore) -> None:
+    """The row must never outlive the file - a row without a file makes
+    total_size() overcount and read_bytes() fail for a digest size_of answers."""
+    with pytest.raises(ValidationError, match="no staged file"):
+        store.record_blob(ContentHash("d" * 64), kind="blob", size_bytes=1)
+
+
+def test_record_blob_joins_an_open_transaction(
+    store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """The dispatcher records blobs, retains them, records artifacts and updates
+    job_stages in ONE transaction. If record_blob could not join, that
+    composition would be impossible."""
+    digest = store.stage_file(b"payload", kind="blob")
+    with pytest.raises(ValueError):
+        with transaction(db_conn, immediate=True):
+            store.record_blob(digest, kind="blob", size_bytes=7)
+            raise ValueError("caller aborted")
+    assert db_conn.execute("SELECT count(*) FROM cas_objects").fetchone()[0] == 0
+
+
+def test_put_bytes_still_works_and_is_stage_plus_record(store: CasStore) -> None:
+    digest = store.put_bytes(b"payload", kind="blob")
+    assert store.exists(digest)
+    assert store.size_of(digest) == 7
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `AttributeError: 'CasStore' object has no attribute 'stage_file'`.
+
+- [ ] **Step 3: Implement**
+
+Extract the file-writing half of `put_bytes` into `stage_file` and the row-writing half into `record_blob`, then reimplement `put_bytes` in terms of both. `record_blob` uses the existing `ON CONFLICT DO UPDATE SET last_accessed_at = ...` for idempotence, and checks `self.path_for(digest).is_file()` first so a row can never outlive its file.
+
+Give all three the project's `Raises:` sections. `stage_file` raises `OSError`; `record_blob` raises `ValidationError` for a malformed digest or a missing file, `sqlite3.OperationalError` under contention, and `TransactionError` only for a nested `immediate=True` — which it does not request, so it should say nothing about that.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Prove the file-first ordering guard is load-bearing**
+
+Delete the `is_file()` check in `record_blob`. Expected: `test_record_blob_rejects_a_digest_with_no_file` FAILS with `DID NOT RAISE ValidationError`, and a row now exists for a digest with no file. Restore.
+
+- [ ] **Step 6: Gate and commit**
+
+```bash
+git add src/ytauto/infra/cas/store.py tests/unit/infra/test_cas_store.py
+git commit -m "feat: split CasStore into worker-side staging and parent-side recording"
+```
+
+---
+
+## Task 9: The worker protocol
+
+**Files:**
+- Create: `src/ytauto/app/scheduler/__init__.py`, `src/ytauto/app/scheduler/worker_protocol.py`
+- Test: `tests/unit/app/test_worker_protocol.py`
+
+**Interfaces:**
+- Produces: `PROTOCOL_VERSION: int = 1`; frozen dataclasses `Progress`, `Staged`, `Result`, `Error`, `LogLine`; `encode(msg: Message) -> str`; `decode(line: str) -> Message | None`.
+
+One JSON object per line on the worker's stdout. Every message carries `v`, `type`, `job_id`, `stage_id` and `correlation_id`.
+
+`correlation_id` is an **explicit field**, not read from a `ContextVar`. Phase 0's carry-forward §1.3 established that a relayed log line otherwise gets stamped with the *parent's* ID, quietly destroying the per-job trail that is the whole point of the mechanism.
+
+`decode` returns `None` for an unknown `type` or an unknown `v` rather than raising, so a newer worker cannot wedge an older parent. It raises only for a line that is not JSON at all — that means the pipe is corrupt, which is not survivable.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+def test_a_result_round_trips() -> None:
+    msg = Result(
+        job_id="j1", stage_id="tts", correlation_id="c1",
+        artifacts=(ArtifactLine(name="narration", kind="blob", digest="a" * 64),),
+        meta={"duration_s": 12.5},
+    )
+    assert decode(encode(msg)) == msg
+
+
+def test_every_message_carries_its_correlation_id() -> None:
+    """Read from a ContextVar instead and a relayed line gets the PARENT's id,
+    destroying the per-job trail - carry-forward 1.3."""
+    line = encode(Progress(job_id="j1", stage_id="tts", correlation_id="c1",
+                           fraction=0.5, note="synthesising"))
+    assert json.loads(line)["correlation_id"] == "c1"
+
+
+def test_encode_emits_exactly_one_line() -> None:
+    """The transport is line-delimited; an embedded newline would split one
+    message into two unparseable halves."""
+    line = encode(LogLine(job_id="j1", stage_id="tts", correlation_id="c1",
+                          level="ERROR", message="boom\nsecond line", exc=None))
+    assert line.count("\n") == 0
+    assert decode(line).message == "boom\nsecond line"
+
+
+def test_an_unknown_message_type_decodes_to_none() -> None:
+    """A newer worker must not be able to wedge an older parent."""
+    assert decode(json.dumps({"v": 1, "type": "telemetry", "job_id": "j1",
+                              "stage_id": "s", "correlation_id": "c"})) is None
+
+
+def test_an_unknown_protocol_version_decodes_to_none() -> None:
+    assert decode(json.dumps({"v": 99, "type": "progress", "job_id": "j1",
+                              "stage_id": "s", "correlation_id": "c",
+                              "fraction": 0.1, "note": ""})) is None
+
+
+def test_a_non_json_line_is_fatal() -> None:
+    """A corrupt pipe is not survivable and must not be silently skipped."""
+    with pytest.raises(ValidationError, match="not valid JSON"):
+        decode("this is not json")
+
+
+def test_an_error_carries_its_kind_and_retry_hint() -> None:
+    msg = Error(job_id="j1", stage_id="tts", correlation_id="c1",
+                message="429 from provider", kind=ErrorKind.RATE_LIMITED,
+                retry_after_s=30.0)
+    assert decode(encode(msg)) == msg
+    assert decode(encode(msg)).kind is ErrorKind.RATE_LIMITED
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `ModuleNotFoundError: No module named 'ytauto.app.scheduler.worker_protocol'`.
+
+- [ ] **Step 3: Implement**
+
+Frozen dataclasses for each message, a `Message` union alias, `encode` using `json.dumps(..., separators=(",", ":"))` (which escapes embedded newlines, satisfying the one-line requirement), and `decode` dispatching on `type` after checking `v`.
+
+`ErrorKind` serialises by value — it is a `StrEnum`, so `kind.value` round-trips through `ErrorKind(raw)`.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Prove the version guard is load-bearing**
+
+Delete the `v` check in `decode`. Expected: `test_an_unknown_protocol_version_decodes_to_none` FAILS — a v99 `progress` decodes into a v1 `Progress` rather than being ignored. Restore.
+
+- [ ] **Step 6: Gate and commit**
+
+```bash
+git add src/ytauto/app/scheduler/__init__.py src/ytauto/app/scheduler/worker_protocol.py tests/unit/app/test_worker_protocol.py
+git commit -m "feat: add the versioned JSON-lines worker protocol"
+```
+
+---
+
+## Task 10: The job queue
+
+**Files:**
+- Create: `src/ytauto/app/scheduler/queue.py`
+- Test: `tests/unit/app/test_queue.py`
+
+**Interfaces:**
+- Produces: `JobQueue(conn)` with `enqueue(job_id, project_id, pipeline_id, *, priority=0) -> None`, `claim(owner, *, lease_s) -> ClaimedJob | None`, `renew(job_id, owner, *, lease_s) -> bool`, `requeue(job_id, *, available_in_s=0.0, error=None) -> None`, `complete(job_id) -> None`, `fail(job_id, error) -> None`, `reap_expired(*, now=None) -> tuple[str, ...]`.
+
+`claim` is the read-then-write that `immediate=True` exists for. In WAL mode a deferred transaction that reads and then writes gets `SQLITE_BUSY_SNAPSHOT` returned immediately, without the busy handler running, so `busy_timeout` does not apply — a flaky, load-dependent queue bug that only shows under concurrency.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+def test_claim_returns_none_on_an_empty_queue(queue: JobQueue) -> None:
+    assert queue.claim("w1", lease_s=60) is None
+
+
+def test_enqueue_then_claim_round_trips(queue: JobQueue) -> None:
+    queue.enqueue("j1", "p1", "pipe")
+    claimed = queue.claim("w1", lease_s=60)
+    assert claimed is not None
+    assert claimed.job_id == "j1"
+    assert claimed.attempts == 1
+
+
+def test_only_one_of_two_claimers_wins(queue: JobQueue) -> None:
+    """Two workers racing for one job. The loser must get None, not the same job."""
+    queue.enqueue("j1", "p1", "pipe")
+    first = queue.claim("w1", lease_s=60)
+    second = queue.claim("w2", lease_s=60)
+    assert first is not None and second is None
+
+
+def test_higher_priority_is_claimed_first(queue: JobQueue) -> None:
+    queue.enqueue("low", "p1", "pipe", priority=0)
+    queue.enqueue("high", "p1", "pipe", priority=10)
+    assert queue.claim("w1", lease_s=60).job_id == "high"
+
+
+def test_a_job_deferred_by_available_at_is_not_claimable(queue: JobQueue) -> None:
+    """This is what makes ErrorKind.RATE_LIMITED and retry_after_s real."""
+    queue.enqueue("j1", "p1", "pipe")
+    queue.requeue("j1", available_in_s=3600)
+    assert queue.claim("w1", lease_s=60) is None
+
+
+def test_a_deferred_job_becomes_claimable_once_its_time_passes(queue: JobQueue) -> None:
+    queue.enqueue("j1", "p1", "pipe")
+    queue.requeue("j1", available_in_s=-1)  # already due
+    assert queue.claim("w1", lease_s=60) is not None
+
+
+def test_an_expired_lease_is_reaped_and_the_job_returns_to_the_queue(
+    queue: JobQueue
+) -> None:
+    queue.enqueue("j1", "p1", "pipe")
+    queue.claim("w1", lease_s=-1)  # already expired
+    assert queue.reap_expired() == ("j1",)
+    assert queue.claim("w2", lease_s=60) is not None
+
+
+def test_a_live_lease_is_not_reaped(queue: JobQueue) -> None:
+    queue.enqueue("j1", "p1", "pipe")
+    queue.claim("w1", lease_s=3600)
+    assert queue.reap_expired() == ()
+
+
+def test_renew_extends_only_the_owner_s_lease(queue: JobQueue) -> None:
+    """A worker that lost its job to the reaper must not be able to renew it."""
+    queue.enqueue("j1", "p1", "pipe")
+    queue.claim("w1", lease_s=60)
+    assert queue.renew("j1", "w1", lease_s=120) is True
+    assert queue.renew("j1", "impostor", lease_s=120) is False
+
+
+def test_attempts_increments_on_every_claim(queue: JobQueue) -> None:
+    queue.enqueue("j1", "p1", "pipe")
+    queue.claim("w1", lease_s=-1)
+    queue.reap_expired()
+    assert queue.claim("w2", lease_s=60).attempts == 2
+
+
+def test_complete_and_fail_are_terminal(queue: JobQueue) -> None:
+    queue.enqueue("j1", "p1", "pipe")
+    queue.claim("w1", lease_s=60)
+    queue.complete("j1")
+    assert queue.claim("w2", lease_s=60) is None
+```
+
+Provide a `queue` fixture built on the existing `db_conn`.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `ModuleNotFoundError: No module named 'ytauto.app.scheduler.queue'`.
+
+- [ ] **Step 3: Implement**
+
+`claim` in one `transaction(conn, immediate=True)`: `SELECT id, attempts FROM jobs WHERE state='queued' AND available_at <= ? ORDER BY priority DESC, created_at LIMIT 1`, then `UPDATE ... SET state='running', lease_owner=?, lease_expires_at=?, attempts=attempts+1, updated_at=?`. Return a frozen `ClaimedJob(job_id, project_id, pipeline_id, attempts)`.
+
+`reap_expired` selects `WHERE state='running' AND lease_expires_at < ?` and returns them to `queued`, clearing the lease. `renew` updates only `WHERE id=? AND lease_owner=?` and returns `cursor.rowcount == 1`.
+
+All timestamps via `utc_now_iso()`. Never `datetime('now')`.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Prove `immediate=True` and the owner check are load-bearing**
+
+Two proofs:
+
+(a) Change `claim`'s `immediate=True` to `False`. State honestly what happens: with a single connection this likely still passes, because the race needs two connections contending. If it does not fail, **say so** and add a second-connection test that does fail — do not report a proof that did not happen.
+
+(b) Delete `AND lease_owner = ?` from `renew`. Expected: `test_renew_extends_only_the_owner_s_lease` FAILS — the impostor renews. Restore.
+
+- [ ] **Step 6: Gate and commit**
+
+```bash
+git add src/ytauto/app/scheduler/queue.py tests/unit/app/test_queue.py
+git commit -m "feat: add the persistent job queue with claim-with-lease"
+```
+
+---
+
+## Task 11: The resource governor
+
+**Files:**
+- Create: `src/ytauto/app/scheduler/governor.py`
+- Test: `tests/unit/app/test_governor.py`
+
+**Interfaces:**
+- Produces: `GPU_COMPUTE_CAPACITY: int = 1`; `Governor()` with `lease(pool: str, owner: str) -> ContextManager[bool]`, `release_all(owner: str) -> int`, `available(pool: str) -> int`.
+
+In-memory and single-process: the dispatcher owns it and workers request through it, so it needs no persistence. It is rebuilt on restart, which is correct — no leases survive a crash.
+
+**`gpu_compute` capacity is the integer constant 1.** Never derived from `vram_mb`. `infra/gpu.detect()` reports 4096 MiB on the target machine, and deriving capacity from it invites a "4096 MiB, so 2 slots" mistake producing exactly the nondeterministic VRAM exhaustion this exists to prevent.
+
+Only `gpu_compute` is populated. The pool abstraction takes the other three when the work that needs them exists.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+def test_gpu_compute_capacity_is_one() -> None:
+    """A hard constant. Deriving it from vram_mb invites '4096 MiB, so 2 slots',
+    which is exactly the VRAM exhaustion the governor exists to prevent."""
+    assert GPU_COMPUTE_CAPACITY == 1
+    assert Governor().available("gpu_compute") == 1
+
+
+def test_a_lease_is_granted_and_released_by_scope(governor: Governor) -> None:
+    with governor.lease("gpu_compute", "w1") as granted:
+        assert granted is True
+        assert governor.available("gpu_compute") == 0
+    assert governor.available("gpu_compute") == 1
+
+
+def test_a_second_simultaneous_gpu_lease_is_refused(governor: Governor) -> None:
+    with governor.lease("gpu_compute", "w1") as first:
+        assert first is True
+        with governor.lease("gpu_compute", "w2") as second:
+            assert second is False
+    assert governor.available("gpu_compute") == 1
+
+
+def test_a_refused_lease_does_not_consume_capacity(governor: Governor) -> None:
+    """The refused caller must not decrement anything on the way out, or
+    capacity leaks one slot per refusal."""
+    with governor.lease("gpu_compute", "w1"):
+        with governor.lease("gpu_compute", "w2") as second:
+            assert second is False
+    assert governor.available("gpu_compute") == 1
+
+
+def test_a_lease_is_released_even_when_the_body_raises(governor: Governor) -> None:
+    with pytest.raises(ValueError):
+        with governor.lease("gpu_compute", "w1"):
+            raise ValueError("stage exploded")
+    assert governor.available("gpu_compute") == 1
+
+
+def test_release_all_frees_a_dead_worker_s_leases(governor: Governor) -> None:
+    """The reaper's hook: a worker died holding a lease and cannot release it."""
+    governor.lease("gpu_compute", "w1").__enter__()
+    assert governor.available("gpu_compute") == 0
+    assert governor.release_all("w1") == 1
+    assert governor.available("gpu_compute") == 1
+
+
+def test_an_unknown_pool_is_rejected(governor: Governor) -> None:
+    with pytest.raises(ValidationError, match="unknown pool"):
+        with governor.lease("nonexistent", "w1"):
+            pass
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `ModuleNotFoundError: No module named 'ytauto.app.scheduler.governor'`.
+
+- [ ] **Step 3: Implement**
+
+A dict of pool name to capacity, a dict of pool name to a list of holder ids, and a `@contextmanager` `lease` that appends and yields `True` when there is room, or yields `False` without appending when there is not. `release_all` removes every entry for an owner across all pools and returns the count.
+
+Yielding `False` rather than raising is deliberate: a refused lease is a normal scheduling outcome, and the dispatcher's response is to try a different stage, not to handle an exception.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Prove the refusal path does not leak capacity**
+
+Make the `finally` release unconditional (releasing even when the lease was refused). Expected: `test_a_refused_lease_does_not_consume_capacity` FAILS with `available == 2`, above the pool's own capacity. Restore.
+
+- [ ] **Step 6: Gate and commit**
+
+```bash
+git add src/ytauto/app/scheduler/governor.py tests/unit/app/test_governor.py
+git commit -m "feat: add the resource governor with gpu_compute capacity 1"
+```
+
+---
+
+## Task 12: The stage runner
+
+**Files:**
+- Create: `src/ytauto/app/scheduler/runner.py`
+- Test: `tests/unit/app/test_runner.py`
+
+**Interfaces:**
+- Produces: `gather_inputs(pipeline, stage_id, stage_fingerprints, artifact_store) -> Mapping[str, tuple[ArtifactRef, ...]]`; `build_spec(stage, provider_id, provider_version, inputs, settings) -> FingerprintSpec`; `run_stage(stage, ctx, cas) -> Result | Error`.
+
+**Database-pure.** It reads no rows and writes none — inputs arrive as arguments, outputs leave as protocol messages. That is what makes it testable without a database and what keeps every write in the dispatcher.
+
+`build_spec` flattens `inputs` into `input_digests` in **`(stage_id, artifact_name)` order**. Stating the rule here is the point: the plan previously gave none, which is how two stage authors would have picked two orders.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+def test_gather_inputs_collects_every_upstream_stage(
+    artifacts: ArtifactStore, store: CasStore
+) -> None:
+    """upstream_of is transitive, so a stage sees its grandparents' artifacts
+    too, not only its direct parents'."""
+    pipeline = _chain()  # fetch -> tts -> render
+    fetch_ref = _put(store, "story", b"text")
+    tts_ref = _put(store, "narration", b"audio")
+    artifacts.record("a" * 64, "fetch", [fetch_ref])
+    artifacts.record("b" * 64, "tts", [tts_ref])
+
+    inputs = gather_inputs(
+        pipeline, "render", {"fetch": "a" * 64, "tts": "b" * 64}, artifacts
+    )
+
+    assert set(inputs) == {"fetch", "tts"}
+    assert [a.name for a in inputs["fetch"]] == ["story"]
+
+
+def test_gather_inputs_skips_a_stage_with_no_recorded_fingerprint(
+    artifacts: ArtifactStore, store: CasStore
+) -> None:
+    """On a resume, an upstream stage that has not run yet contributes nothing
+    rather than raising - the runner is asked for what exists."""
+    pipeline = _chain()
+    assert gather_inputs(pipeline, "render", {}, artifacts) == {}
+
+
+def test_build_spec_orders_inputs_by_stage_then_artifact_name() -> None:
+    """The flattening rule, stated once. Without it two stage authors pick two
+    orders and the same stage fingerprints differently in each."""
+    inputs = {
+        "tts": (_ref("timings"), _ref("narration")),
+        "fetch": (_ref("story"),),
+    }
+    spec = build_spec(_stage("render"), "ffmpeg", "7.1", inputs, {})
+    assert [name for name, _ in spec.input_digests] == ["story", "narration", "timings"]
+
+
+def test_build_spec_is_stable_across_dict_iteration_order() -> None:
+    """Fingerprints must not depend on mapping order - a plain dict would make
+    the same inputs fingerprint differently between processes."""
+    a = build_spec(_stage("r"), "p", "1", {"x": (_ref("n"),), "y": (_ref("m"),)}, {})
+    b = build_spec(_stage("r"), "p", "1", {"y": (_ref("m"),), "x": (_ref("n"),)}, {})
+    assert compute_fingerprint(a) == compute_fingerprint(b)
+
+
+def test_run_stage_returns_a_result_carrying_the_stage_s_artifacts(
+    store: CasStore
+) -> None:
+    stage = _fake_stage("tts", produces=[("narration", b"audio")])
+    message = run_stage(stage, _ctx(job_id="j1", correlation_id="c1"), store)
+
+    assert isinstance(message, Result)
+    assert [a.name for a in message.artifacts] == ["narration"]
+    assert message.job_id == "j1" and message.stage_id == "tts"
+
+
+def test_a_stage_raising_ProviderError_becomes_an_Error_message_with_its_kind(
+    store: CasStore
+) -> None:
+    """The dispatcher maps kind to FATAL vs RETRYABLE; losing it here would make
+    every failure look the same and a rate limit would burn the job's attempts."""
+    stage = _fake_stage("tts", raises=ProviderError(
+        "429", provider_id="elevenlabs", kind=ErrorKind.RATE_LIMITED, retry_after_s=30.0
+    ))
+    message = run_stage(stage, _ctx(job_id="j1", correlation_id="c1"), store)
+
+    assert isinstance(message, Error)
+    assert message.kind is ErrorKind.RATE_LIMITED
+    assert message.retry_after_s == 30.0
+
+
+def test_a_stage_raising_an_unexpected_exception_becomes_a_FATAL_Error(
+    store: CasStore
+) -> None:
+    """An unplanned exception is not retryable - retrying a bug just burns
+    attempts and delays the failure the operator needs to see."""
+    stage = _fake_stage("tts", raises=ZeroDivisionError("bug"))
+    message = run_stage(stage, _ctx(job_id="j1", correlation_id="c1"), store)
+
+    assert isinstance(message, Error)
+    assert message.kind is ErrorKind.FATAL
+    assert "ZeroDivisionError" in message.message
+
+
+def test_run_stage_writes_no_database_rows(
+    store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """The runner is database-pure: that is what lets a worker call it with no
+    connection, and what keeps every write in the dispatcher."""
+    before = db_conn.execute("SELECT count(*) FROM cas_objects").fetchone()[0]
+    run_stage(_fake_stage("tts", produces=[("narration", b"audio")]),
+              _ctx(job_id="j1", correlation_id="c1"), store)
+    assert db_conn.execute("SELECT count(*) FROM cas_objects").fetchone()[0] == before
+```
+
+Write `_chain()`, `_fake_stage(stage_id, *, produces=(), raises=None)` and `_ctx(...)` as module-level helpers. `_fake_stage` must increment a per-instance execution counter so later tasks can assert a stage did **not** re-run.
+
+- [ ] **Step 2: Run to verify they fail**
+
+- [ ] **Step 3: Implement**
+
+`gather_inputs` walks `pipeline.upstream_of(stage_id)`, looks each stage's fingerprint up in `stage_fingerprints`, and calls `artifact_store.lookup`. A stage with no recorded fingerprint contributes nothing.
+
+`build_spec` sorts by `(stage_id, artifact.name)` and flattens to `(name, digest)` pairs.
+
+`run_stage` wraps the call in `try/except ProviderError` and a second `except Exception`, mapping the first to its own `kind` and the second to `ErrorKind.FATAL`. No bare `except`.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Prove the ordering rule is load-bearing**
+
+Remove the sort in `build_spec`. Expected: `test_build_spec_is_stable_across_dict_iteration_order` FAILS with two different fingerprints. Restore. This is the same class of defect as Task 5 and deserves the same proof.
+
+- [ ] **Step 6: Gate and commit**
+
+```bash
+git add src/ytauto/app/scheduler/runner.py tests/unit/app/test_runner.py
+git commit -m "feat: add the database-pure stage runner"
+```
+
+---
+
+## Task 13: The dispatcher and the worker entry point
+
+**Files:**
+- Create: `src/ytauto/app/scheduler/dispatcher.py`, `src/ytauto/app/worker.py`
+- Test: `tests/unit/app/test_dispatcher.py`
+
+**Interfaces:**
+- Produces: `Dispatcher(conn, cas, artifacts, governor, queue)` with `tick() -> TickReport` and `run_until_idle(*, max_ticks) -> TickReport`.
+
+The dispatcher is the **only** component that writes job state. `tick()` does one unit of work so tests can drive it deterministically instead of racing a background loop.
+
+**The commit is one transaction**, which Task 1 makes possible:
+
+```python
+with transaction(self._conn, immediate=True):
+    for staged in staged_messages:
+        self._cas.record_blob(staged.digest, kind=staged.kind, size_bytes=staged.size_bytes)
+        self._cas.retain(staged.digest)          # the JOB's pin, not the cache's
+    self._artifacts.record(fingerprint, stage_id, artifacts)
+    self._conn.execute(
+        "UPDATE job_stages SET status = 'succeeded', fingerprint = ?, finished_at = ? "
+        "WHERE job_id = ? AND stage_id = ?",
+        (fingerprint, utc_now_iso(), job_id, stage_id),
+    )
+```
+
+`retain` here is the job's in-flight pin, released when the job completes or is reaped. `ArtifactStore.record` no longer retains (Task 3), so these two are not duplicates.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+def test_a_cache_hit_marks_the_stage_skipped_without_spawning_a_worker(
+    dispatcher: Dispatcher, spawn_spy: SpawnSpy
+) -> None:
+    """The single probe that delivers crash-resume, cheap iteration and
+    cross-project dedup."""
+    _prerecord_stage_output(dispatcher, job_id="j1", stage_id="fetch")
+
+    report = dispatcher.tick()
+
+    assert report.skipped == ("fetch",)
+    assert spawn_spy.calls == 0, "a cache hit must not spawn a worker"
+
+
+def test_a_stage_commit_is_atomic(
+    dispatcher: Dispatcher, db_conn: sqlite3.Connection, store: CasStore
+) -> None:
+    """Blob rows, retains, the artifact record and the job_stages update land
+    together or not at all."""
+    digest = store.stage_file(b"audio", kind="blob")
+    _fail_the_job_stages_update(dispatcher)  # monkeypatched to raise
+
+    with pytest.raises(sqlite3.OperationalError):
+        dispatcher.commit_stage("j1", "tts", "f" * 64, [_staged(digest)])
+
+    assert db_conn.execute("SELECT count(*) FROM cas_objects").fetchone()[0] == 0
+    assert db_conn.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
+    assert db_conn.execute(
+        "SELECT status FROM job_stages WHERE job_id='j1' AND stage_id='tts'"
+    ).fetchone()["status"] != "succeeded"
+
+
+def test_a_dead_worker_releases_its_governor_leases(
+    dispatcher: Dispatcher, governor: Governor
+) -> None:
+    """A worker cannot release what it held when it died; the reaper must."""
+    governor.lease("gpu_compute", "j1:tts").__enter__()
+    assert governor.available("gpu_compute") == 0
+
+    dispatcher.reap()
+
+    assert governor.available("gpu_compute") == 1
+
+
+def test_a_dead_worker_s_job_returns_to_the_queue_at_its_last_completed_stage(
+    dispatcher: Dispatcher, queue: JobQueue, db_conn: sqlite3.Connection
+) -> None:
+    _mark_stage(db_conn, "j1", "fetch", "succeeded")
+    _mark_stage(db_conn, "j1", "tts", "running")
+
+    dispatcher.reap()
+
+    assert queue.claim("w2", lease_s=60) is not None, "the job must be claimable again"
+    assert _status(db_conn, "j1", "fetch") == "succeeded", "completed work must survive"
+    assert _status(db_conn, "j1", "tts") != "running", "the killed stage must be reset"
+
+
+def test_a_RATE_LIMITED_error_defers_the_job_by_retry_after_s(
+    dispatcher: Dispatcher, db_conn: sqlite3.Connection
+) -> None:
+    """Without available_at this could not be honoured at all - the claim query
+    had no way to exclude a job that must not run until T."""
+    dispatcher.handle_error(_error("j1", "tts", ErrorKind.RATE_LIMITED, retry_after_s=3600))
+
+    row = db_conn.execute("SELECT state, available_at FROM jobs WHERE id='j1'").fetchone()
+    assert row["state"] == "queued"
+    assert row["available_at"] > utc_now_iso()
+
+
+def test_a_FATAL_error_fails_the_job_without_requeueing(
+    dispatcher: Dispatcher, db_conn: sqlite3.Connection
+) -> None:
+    dispatcher.handle_error(_error("j1", "tts", ErrorKind.FATAL, retry_after_s=None))
+
+    row = db_conn.execute("SELECT state, last_error FROM jobs WHERE id='j1'").fetchone()
+    assert row["state"] == "failed"
+    assert row["last_error"]
+
+
+def test_job_completion_releases_every_job_level_retain(
+    dispatcher: Dispatcher, store: CasStore
+) -> None:
+    """After completion the outputs become LRU-evictable, which is the intended
+    end state - the cache does not pin them (Task 3)."""
+    digest = _complete_a_one_stage_job(dispatcher, store)
+    assert store.refcount(digest) == 0
+    assert digest in [d for d, _ in store.iter_evictable()]
+
+
+def test_a_worker_that_staged_then_died_leaves_only_reclaimable_orphans(
+    dispatcher: Dispatcher, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """The staged/result split's new failure surface, named in the design's
+    risks. A blob file with no row is exactly what sweep_orphans reclaims, and
+    the single-transaction commit means no partial rows are ever written."""
+    digest = store.stage_file(b"half a stage", kind="blob")
+    dispatcher.reap()  # worker died before emitting result
+
+    assert db_conn.execute("SELECT count(*) FROM cas_objects").fetchone()[0] == 0
+    assert store.path_for(digest).is_file(), "the file is an orphan, not yet reclaimed"
+
+    report = Evictor(store, EvictionPolicy(max_bytes=1)).sweep_orphans(min_age_s=0)
+    assert report.orphan_blobs == 1
+    assert not store.path_for(digest).is_file()
+```
+
+Write `SpawnSpy`, `_prerecord_stage_output`, `_fail_the_job_stages_update`, `_mark_stage`, `_status`, `_error`, `_staged` and `_complete_a_one_stage_job` as module-level helpers. `SpawnSpy` replaces `subprocess.Popen` so no real process is spawned in the unit tests — the real spawn is exercised in Task 14.
+
+- [ ] **Step 2: Run to verify they fail**
+
+- [ ] **Step 3: Implement**
+
+`app/worker.py` reads a job/stage assignment on stdin, runs `run_stage`, writes protocol lines to stdout, exits non-zero on `Error`. It must not import Qt and must not touch SQLite — pass it the CAS root path, not a connection.
+
+The dispatcher spawns with `subprocess.Popen`, reads stdout line by line through `decode`, ignores `None` (unknown type or version), and collects `staged` until `result` or `error`.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Prove the commit is atomic**
+
+Remove the `with transaction(...)` wrapper so the four writes run in autocommit. Expected: `test_a_stage_commit_is_atomic` FAILS — `cas_objects` rows survive a failure at the `job_stages` update. Restore. Paste both.
+
+- [ ] **Step 6: Add the import-linter contract for workers**
+
+Add a `forbidden` contract proving `ytauto.app.worker` imports neither `PySide6` nor `ytauto.ui`. Then **prove the gate works**: add `import PySide6` to `worker.py` temporarily and confirm `lint-imports` fails. Phase 0's §2.3 rule — any new gate must be demonstrated failing before it is trusted — applies here.
+
+- [ ] **Step 7: Gate and commit**
+
+```bash
+git add src/ytauto/app/scheduler/dispatcher.py src/ytauto/app/worker.py tests/unit/app/test_dispatcher.py pyproject.toml
+git commit -m "feat: add the dispatcher and worker subprocess entry point"
+```
+
+---
+
+## Task 14: The two exit criteria
+
+**Files:**
+- Test: `tests/integration/test_resume.py`
+
+**Interfaces:**
+- Consumes: everything above.
+
+Two criteria, not one. The second exists because the whole-branch review proved the first alone is insufficient.
+
+- [ ] **Step 1: Write the resume test**
+
+A synthetic three-stage pipeline `fetch → tts → render`, each stage writing one small blob. Run it under the dispatcher, kill the worker subprocess **for real** (`Popen.kill()`) during stage 2, restart the dispatcher, and assert:
+
+- stage 1 is not re-executed (assert on an execution counter the fake stage increments, not on timing)
+- stage 2 completes on the resume
+- the final job state is `succeeded`
+- every blob the job produced is present
+
+- [ ] **Step 2: Write the caching test — the one criterion 1 cannot cover**
+
+```python
+def test_running_the_same_job_twice_hits_the_cache_on_every_stage() -> None:
+    """Criterion 1 cannot catch artifact-order drift: killed in stage 2 and
+    resuming at stage 2, stage 3 was never cached, so the drift is invisible.
+    Run the whole job twice and every stage must be a cache hit, with no
+    downstream stage re-running."""
+```
+
+Assert every stage in the second run is `SKIPPED` and each fake stage's execution counter is still 1.
+
+- [ ] **Step 3: Run both**
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/integration/test_resume.py -v -m integration
+```
+
+- [ ] **Step 4: Prove criterion 2 catches what criterion 1 misses**
+
+Revert Task 5's sort in `StageResult`. Expected: **the resume test still PASSES** while the twice-run test FAILS with stage 3 re-executing. That contrast is the whole justification for having two criteria — paste both outputs. Restore.
+
+If the resume test *also* fails, say so: it would mean the drift is observable from a resume after all, and this plan's reasoning is wrong.
+
+- [ ] **Step 5: Full gate, doctor, commit**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/check.ps1
+.\.venv\Scripts\ytauto.exe doctor; $LASTEXITCODE
+```
+
+Expected: `ALL CHECKS PASSED`; nine `[ OK ]` rows with `database  schema v3 (head v3)`; exit 0.
+
+```bash
+git add tests/integration/test_resume.py
+git commit -m "test: add the Phase 1b resume and caching exit criteria"
+```
+
+---
+
+## Phase 1b Exit Checklist
+
+- [ ] `scripts/check.ps1` passes: ruff, ruff format, mypy, import-linter, pytest (unit + integration)
+- [ ] `ytauto doctor` green, reporting `schema v3 (head v3)`
+- [ ] `import-linter` proves `core/` imports nothing internal, no layer below `ui/` imports Qt, and `app.worker` imports neither Qt nor `ui` — the last contract demonstrated failing before being trusted
+- [ ] A three-stage job runs, is killed mid-flight by genuinely terminating the worker process, and resumes from its last completed stage
+- [ ] The same job run twice hits the cache on every stage, with no downstream stage re-running
+- [ ] `gpu_compute` never issues two simultaneous leases
+- [ ] A cached artifact is evictable and the disk ceiling is enforced — the regression test for carry-forward §1.1
+- [ ] `transaction(immediate=True)` inside a deferred transaction raises `TransactionError`; an inner failure rolls back only to its savepoint
+- [ ] Every guard-pinning test has been demonstrated failing with its guard deleted, **and the expected failure message stated in advance**
+- [ ] Every new public function carries a `Raises:` docstring section
+- [ ] No `TODO` or `FIXME` on the shipped path
+
+**Next:** Phase 2 — the first watchable video. Providers behind the Phase 1a ports, the render pipeline, and the `net_api` token bucket the governor is already shaped to take.
+
