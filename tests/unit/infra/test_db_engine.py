@@ -1,3 +1,4 @@
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -204,4 +205,22 @@ def test_savepoints_nest_more_than_one_deep(tmp_path: Path) -> None:
             conn.execute("INSERT INTO t VALUES ('sibling')")
 
     assert [r["a"] for r in conn.execute("SELECT a FROM t ORDER BY a")] == ["deep", "sibling"]
+    conn.close()
+
+
+def test_a_rolled_back_savepoint_is_released_not_left_on_the_stack(tmp_path: Path) -> None:
+    """ROLLBACK TO does not pop the savepoint. Without the RELEASE that follows
+    it, every failed inner block leaks a frame, and the stack grows without
+    bound inside one long-lived outer transaction - quadratic cost for a
+    dispatcher that retries stages inside a single claim."""
+    conn = connect(tmp_path / "t.db")
+    conn.execute("CREATE TABLE t (a TEXT)")
+
+    with transaction(conn):
+        for _ in range(3):
+            with contextlib.suppress(ValueError), transaction(conn):
+                raise ValueError("inner failed")
+        with pytest.raises(sqlite3.OperationalError, match="no such savepoint"):
+            conn.execute("RELEASE _sp_0")
+
     conn.close()

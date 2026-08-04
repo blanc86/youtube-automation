@@ -3,6 +3,21 @@
 WAL mode is required, not optional: the dispatcher writes job state while the
 GUI reads it, and in rollback-journal mode those readers would block writers
 and visibly stall the interface during batch runs.
+
+A connection must not be shared across threads once transactions are in
+play. ``connect()`` sets ``check_same_thread=False`` so a connection can be
+*handed off* between threads (opened on one, used later on another) - it does
+not make concurrent use from multiple threads safe. Savepoints are a
+per-connection LIFO stack; two threads each calling ``transaction()`` on the
+same connection at the same time can interleave their SAVEPOINT/RELEASE
+calls, so one thread's frame lands on top of another's and a RELEASE or
+ROLLBACK TO issued by either can destroy the other's savepoint out from under
+it. ``transaction()`` has no way to detect this - the savepoint-depth lock
+only serialises name allocation, and no lock over that bookkeeping can
+reconstruct which thread's block a given stack frame belongs to. Each thread
+that opens transactions needs its own connection; treat single-connection,
+single-thread transaction use as a caller contract, not something this module
+enforces.
 """
 
 from __future__ import annotations
