@@ -65,6 +65,13 @@ class Evictor:
     def run(self) -> EvictionReport:
         """Evict least-recently-used unreferenced objects until under the ceiling.
 
+        The candidate list is a snapshot taken outside any transaction, so a
+        blob can be retained between being listed and being deleted. Each delete
+        re-tests ``refcount = 0`` atomically and skips a blob that has since
+        been pinned, rather than destroying an asset a running job depends on.
+        A skipped blob frees nothing and is not counted as evicted, so the store
+        can legitimately finish above the ceiling when everything is pinned.
+
         Raises:
             OSError: an object's file cannot be removed.
             sqlite3.Error: the store cannot be queried, or a row cannot be
@@ -79,7 +86,8 @@ class Evictor:
         for digest, size in self._store.iter_evictable():
             if total - freed <= self._policy.max_bytes:
                 break
-            self._store.forget(digest)
+            if not self._store.forget_if_unreferenced(digest):
+                continue
             freed += size
             evicted += 1
 

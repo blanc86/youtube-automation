@@ -302,6 +302,33 @@ class CasStore:
                 self._conn.execute("DELETE FROM cas_objects WHERE hash = ?", (digest,))
         return len(stale)
 
+    def forget_if_unreferenced(self, digest: ContentHash) -> bool:
+        """Delete the object only if nothing holds it. Returns whether it did.
+
+        The evictor reads ``iter_evictable()`` outside any transaction and acts
+        on the result later, so a ``retain()`` can land in between. Checking the
+        refcount and deleting in two statements would only narrow that window;
+        the predicate lives in the DELETE so the two are one atomic step.
+
+        A refused delete leaves the file untouched - the blob is pinned and a
+        running job depends on it. Row before file, for the same reason
+        ``forget`` explains.
+
+        Raises:
+            ValidationError: if ``digest`` is not a valid sha256 hex digest.
+            OSError: if the file exists but cannot be removed.
+            sqlite3.Error: if the delete fails.
+        """
+        validate_digest(digest)
+        with transaction(self._conn, immediate=True):
+            cursor = self._conn.execute(
+                "DELETE FROM cas_objects WHERE hash = ? AND refcount = 0", (digest,)
+            )
+            deleted = cursor.rowcount == 1
+        if deleted:
+            self.path_for(digest).unlink(missing_ok=True)
+        return deleted
+
     def forget(self, digest: ContentHash) -> None:
         """Delete the object's row and then its file. Idempotent.
 

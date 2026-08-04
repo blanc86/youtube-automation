@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from ytauto.core.errors import ValidationError
+from ytauto.core.models.content_hash import ContentHash
 from ytauto.infra.cas.eviction import MAX_CEILING_BYTES, EvictionPolicy, Evictor, SweepReport
 from ytauto.infra.cas.store import CasStore
 
@@ -236,3 +237,41 @@ def test_healthy_store_sweeps_to_all_zeros(store: CasStore) -> None:
         stale_staging_bytes=0,
         phantom_rows=0,
     )
+
+
+def test_a_blob_pinned_after_the_snapshot_survives_eviction(
+    store: CasStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evictor reads iter_evictable() outside any transaction and acts on it
+    later, so a retain() can land in between. Deleting anyway destroys an asset a
+    running job depends on - the exact loss retain() exists to prevent. Patching
+    iter_evictable to pin on its way out reproduces that interleaving without
+    threads."""
+    digest = store.put_bytes(b"z" * 5000, kind="blob")
+    real = store.iter_evictable
+
+    def pin_after_listing() -> list[tuple[ContentHash, int]]:
+        listed = real()
+        store.retain(digest)
+        return listed
+
+    monkeypatch.setattr(store, "iter_evictable", pin_after_listing)
+    report = Evictor(store, EvictionPolicy(max_bytes=1)).run()
+
+    assert store.exists(digest), "a pinned blob's file must survive"
+    assert store.refcount(digest) == 1, "and so must its row"
+    assert report.evicted == 0
+    assert report.bytes_freed == 0
+
+
+def test_forget_if_unreferenced_reports_what_it_did(store: CasStore) -> None:
+    unheld = store.put_bytes(b"free", kind="blob")
+    held = store.put_bytes(b"pinned", kind="blob")
+    store.retain(held)
+
+    assert store.forget_if_unreferenced(unheld) is True
+    assert not store.exists(unheld)
+
+    assert store.forget_if_unreferenced(held) is False
+    assert store.exists(held), "a refused delete must not touch the file"
+    assert store.refcount(held) == 1
