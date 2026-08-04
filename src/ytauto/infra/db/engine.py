@@ -8,6 +8,7 @@ and visibly stall the interface during batch runs.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,11 +39,27 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+_SAVEPOINT_DEPTH: dict[int, int] = {}
+
+# Guards read-modify-write access to _SAVEPOINT_DEPTH. connect() sets
+# check_same_thread=False, so a connection can be handed to more than one
+# thread (the dispatcher runs on its own thread); the dict itself must not be
+# corrupted by concurrent mutation. The lock is held only around the get+set
+# of the depth counter, never around a conn.execute() call, so SQLite's own
+# (potentially slow, lock-contending) I/O never happens while this lock is
+# held.
+_SAVEPOINT_DEPTH_LOCK = threading.Lock()
+
+
 @contextmanager
 def transaction(
     conn: sqlite3.Connection, *, immediate: bool = False
 ) -> Iterator[sqlite3.Connection]:
     """Run a block in one transaction: commit on success, roll back on any error.
+
+    Re-entrant. An outermost call issues BEGIN/COMMIT; a nested call issues a
+    SAVEPOINT instead, so composing two modules that each open a transaction is
+    safe and the whole composition still lands atomically.
 
     Pass ``immediate=True`` for read-then-write work such as claiming a queued
     job or acquiring a resource lease. A deferred ``BEGIN`` upgrades to a write
@@ -50,30 +67,56 @@ def transaction(
     *immediately* without invoking the busy handler - so ``busy_timeout`` does
     not apply and the caller sees a spurious failure under concurrency.
 
-    Nesting two transactions on one connection raises TransactionError; keep
-    transactions at the outermost call site. That check happens before ``BEGIN``
-    is issued, so an outer transaction is left fully intact - letting the nested
-    ``BEGIN`` fail instead would trip the rollback handler below and silently
-    discard the caller's work.
+    ``immediate=True`` is refused inside an existing transaction: the write-lock
+    timing was already decided by the outer BEGIN, so honouring the flag is
+    impossible and silently downgrading it would reintroduce the very failure it
+    exists to prevent.
 
     Raises:
-        TransactionError: if a transaction is already open on ``conn``. Always a
-            programming error, never retryable.
+        TransactionError: if ``immediate=True`` is requested while a transaction
+            is already open on ``conn``. Always a programming error, never
+            retryable.
         sqlite3.OperationalError: if the write lock could not be acquired within
             ``busy_timeout`` - legitimate contention, which callers competing for
-            a job or a lease must expect and handle. Distinguishing these two is
-            why the nesting case has its own type.
+            a job or a lease must expect and handle.
         BaseException: anything raised inside the block, after rolling back.
     """
+    key = id(conn)
     if conn.in_transaction:
-        raise TransactionError(
-            "a transaction is already open on this connection; transaction() is "
-            "not re-entrant - move the transaction to the outermost call site"
-        )
+        if immediate:
+            raise TransactionError(
+                "immediate=True cannot be honoured inside an open transaction; "
+                "the write lock was already taken by the outer BEGIN - move the "
+                "immediate transaction to the outermost call site"
+            )
+        with _SAVEPOINT_DEPTH_LOCK:
+            depth = _SAVEPOINT_DEPTH.get(key, 0)
+            _SAVEPOINT_DEPTH[key] = depth + 1
+        name = f"_sp_{depth}"
+        conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield conn
+        except BaseException:
+            # ROLLBACK TO does not pop the savepoint; RELEASE must follow or the
+            # stack leaks a frame per failure.
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+            with _SAVEPOINT_DEPTH_LOCK:
+                _SAVEPOINT_DEPTH[key] = depth
+            raise
+        conn.execute(f"RELEASE {name}")
+        with _SAVEPOINT_DEPTH_LOCK:
+            _SAVEPOINT_DEPTH[key] = depth
+        return
+
     conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
         yield conn
     except BaseException:
         conn.execute("ROLLBACK")
+        with _SAVEPOINT_DEPTH_LOCK:
+            _SAVEPOINT_DEPTH.pop(key, None)
         raise
     conn.execute("COMMIT")
+    with _SAVEPOINT_DEPTH_LOCK:
+        _SAVEPOINT_DEPTH.pop(key, None)

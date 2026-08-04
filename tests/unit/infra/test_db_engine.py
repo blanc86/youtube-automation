@@ -106,14 +106,16 @@ def test_immediate_still_commits_and_rolls_back(tmp_path: Path) -> None:
 
 
 def test_nesting_a_transaction_raises_a_distinct_type(tmp_path: Path) -> None:
-    """Nesting is a programming error and contention is a normal race, but both
-    used to surface as sqlite3.OperationalError. A claim loop that must retry one
-    and crash on the other cannot tell them apart from the message alone."""
+    """Nesting immediate=True is a programming error and contention is a normal
+    race, but both used to surface as sqlite3.OperationalError. A claim loop
+    that must retry one and crash on the other cannot tell them apart from the
+    message alone. Plain nesting (immediate=False) no longer raises at all -
+    it savepoints - so only the immediate=True case can exercise this."""
     conn = connect(tmp_path / "t.db")
     conn.execute("CREATE TABLE t (a TEXT)")
     conn.execute("BEGIN")  # raw, so the precondition under test is unambiguous
 
-    with pytest.raises(TransactionError), transaction(conn):
+    with pytest.raises(TransactionError), transaction(conn, immediate=True):
         pass
 
     conn.execute("ROLLBACK")
@@ -121,17 +123,85 @@ def test_nesting_a_transaction_raises_a_distinct_type(tmp_path: Path) -> None:
 
 
 def test_a_refused_nested_transaction_leaves_the_outer_one_intact(tmp_path: Path) -> None:
-    """The guard runs before BEGIN is issued. Letting the nested BEGIN fail
-    instead would trip transaction()'s own rollback handler and silently discard
-    the caller's committed-to-be work - a scheduler would lose its job claim."""
+    """The guard runs before BEGIN IMMEDIATE is issued. Letting the nested BEGIN
+    fail instead would trip transaction()'s own rollback handler and silently
+    discard the caller's committed-to-be work - a scheduler would lose its job
+    claim. Plain nesting (immediate=False) is no longer refused at all - it
+    savepoints - so only immediate=True can be refused here."""
     conn = connect(tmp_path / "t.db")
     conn.execute("CREATE TABLE t (a TEXT)")
 
     with transaction(conn):
         conn.execute("INSERT INTO t VALUES ('claimed')")
-        with pytest.raises(TransactionError), transaction(conn):
+        with (
+            pytest.raises(TransactionError, match="immediate"),
+            transaction(conn, immediate=True),
+        ):
             pass
         assert conn.in_transaction, "the outer transaction must survive the refusal"
 
     assert [row["a"] for row in conn.execute("SELECT a FROM t")] == ["claimed"]
+    conn.close()
+
+
+def test_a_nested_transaction_commits_through_a_savepoint(tmp_path: Path) -> None:
+    """Re-entrancy is what lets 'claim a job and pin its inputs' be atomic."""
+    conn = connect(tmp_path / "t.db")
+    conn.execute("CREATE TABLE t (a TEXT)")
+
+    with transaction(conn):
+        conn.execute("INSERT INTO t VALUES ('outer')")
+        with transaction(conn):
+            conn.execute("INSERT INTO t VALUES ('inner')")
+
+    assert [r["a"] for r in conn.execute("SELECT a FROM t ORDER BY a")] == ["inner", "outer"]
+    conn.close()
+
+
+def test_an_inner_failure_rolls_back_only_to_the_savepoint(tmp_path: Path) -> None:
+    """The outer transaction must survive an inner failure and still commit.
+    Without ROLLBACK TO, the inner failure would discard the outer work too."""
+    conn = connect(tmp_path / "t.db")
+    conn.execute("CREATE TABLE t (a TEXT)")
+
+    with transaction(conn):
+        conn.execute("INSERT INTO t VALUES ('outer')")
+        with pytest.raises(ValueError), transaction(conn):
+            conn.execute("INSERT INTO t VALUES ('inner')")
+            raise ValueError("stage failed")
+
+    assert [r["a"] for r in conn.execute("SELECT a FROM t")] == ["outer"]
+    conn.close()
+
+
+def test_nesting_immediate_inside_a_deferred_transaction_is_refused(tmp_path: Path) -> None:
+    """A nested immediate=True cannot deliver immediate semantics - the write
+    lock timing was already decided by the outer BEGIN. Downgrading it silently
+    would reintroduce the SQLITE_BUSY_SNAPSHOT failure immediate= prevents."""
+    conn = connect(tmp_path / "t.db")
+    conn.execute("CREATE TABLE t (a TEXT)")
+
+    with (
+        transaction(conn),
+        pytest.raises(TransactionError, match="immediate"),
+        transaction(conn, immediate=True),
+    ):
+        pass
+    conn.close()
+
+
+def test_savepoints_nest_more_than_one_deep(tmp_path: Path) -> None:
+    """Names come from a depth counter, so siblings and nested savepoints must
+    not collide - a single reused name would make the inner RELEASE pop the
+    wrong frame."""
+    conn = connect(tmp_path / "t.db")
+    conn.execute("CREATE TABLE t (a TEXT)")
+
+    with transaction(conn):
+        with transaction(conn), transaction(conn):
+            conn.execute("INSERT INTO t VALUES ('deep')")
+        with transaction(conn):
+            conn.execute("INSERT INTO t VALUES ('sibling')")
+
+    assert [r["a"] for r in conn.execute("SELECT a FROM t ORDER BY a")] == ["deep", "sibling"]
     conn.close()
