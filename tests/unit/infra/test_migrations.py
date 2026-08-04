@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from ytauto.infra.clock import utc_now_iso
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import (
     HEAD_VERSION,
@@ -97,13 +98,6 @@ def test_failed_migration_rolls_back_schema_and_version_together(
     conn.close()
 
 
-def test_head_is_version_two(tmp_path: Path) -> None:
-    conn = connect(tmp_path / "t.db")
-    assert apply_migrations(conn) == 2
-    assert HEAD_VERSION == 2
-    conn.close()
-
-
 def test_phase_one_tables_exist(tmp_path: Path) -> None:
     conn = connect(tmp_path / "t.db")
     apply_migrations(conn)
@@ -154,6 +148,95 @@ def test_migration_002_is_applied_on_top_of_an_existing_001(tmp_path: Path) -> N
         assert apply_migrations(conn) == 1
     assert "jobs" not in _tables(conn)
 
-    assert apply_migrations(conn) == 2
+    with patch("ytauto.infra.db.migrations.MIGRATIONS", MIGRATIONS[:2]):
+        assert apply_migrations(conn) == 2
     assert {"cas_objects", "jobs"} <= _tables(conn)
+    conn.close()
+
+
+def test_migration_003_adds_available_at(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert "available_at" in cols
+    assert cols["available_at"]["notnull"] == 1
+    conn.close()
+
+
+def test_migration_003_adds_per_stage_attempts(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_stages)")}
+    assert "attempts" in cols
+    conn.close()
+
+
+def test_the_claim_index_leads_with_state_then_available_at(tmp_path: Path) -> None:
+    """The claim query filters on state AND available_at before ordering. An
+    index that does not lead with both cannot serve it as a covering scan."""
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    cols = [r["name"] for r in conn.execute("PRAGMA index_info(idx_jobs_claimable)")]
+    assert cols[:2] == ["state", "available_at"]
+    conn.close()
+
+
+def test_head_version_is_three(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 3
+    assert HEAD_VERSION == 3
+    conn.close()
+
+
+def test_existing_jobs_are_immediately_claimable_after_upgrade(tmp_path: Path) -> None:
+    """The '' default must sort before every ISO-8601 timestamp, so rows written
+    under v2 need no backfill to remain claimable."""
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    now = utc_now_iso()
+    conn.execute(
+        "INSERT INTO jobs (id, project_id, pipeline_id, state, created_at, updated_at) "
+        "VALUES ('j1', 'p1', 'pipe', 'queued', ?, ?)",
+        (now, now),
+    )
+    row = conn.execute(
+        "SELECT id FROM jobs WHERE state = 'queued' AND available_at <= ?", (now,)
+    ).fetchone()
+    assert row["id"] == "j1"
+    conn.close()
+
+
+def test_migration_003_is_applied_on_top_of_an_existing_002(tmp_path: Path) -> None:
+    """Upgrade path from a v2 database, not just a fresh create."""
+    db = tmp_path / "t.db"
+    conn = connect(db)
+    monkeyed = MIGRATIONS[:2]
+    with patch("ytauto.infra.db.migrations.MIGRATIONS", monkeyed):
+        assert apply_migrations(conn) == 2
+    now = utc_now_iso()
+    conn.execute(
+        "INSERT INTO jobs (id, project_id, pipeline_id, state, created_at, updated_at) "
+        "VALUES ('j1', 'p1', 'pipe', 'queued', ?, ?)",
+        (now, now),
+    )
+    conn.execute(
+        "INSERT INTO job_stages (job_id, stage_id, status) VALUES ('j1', 'rewrite', 'pending')"
+    )
+    assert "available_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+
+    assert apply_migrations(conn) == 3
+    job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+    stage_cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_stages)")}
+    assert "available_at" in job_cols
+    assert "attempts" in stage_cols
+
+    row = conn.execute("SELECT id, available_at FROM jobs WHERE id = 'j1'").fetchone()
+    assert row["id"] == "j1", "the pre-existing row must survive the upgrade"
+    assert row["available_at"] == "", "existing rows get the '' default, not a backfilled value"
+
+    stage_row = conn.execute(
+        "SELECT attempts FROM job_stages WHERE job_id = 'j1' AND stage_id = 'rewrite'"
+    ).fetchone()
+    assert stage_row["attempts"] == 0
     conn.close()

@@ -93,7 +93,18 @@ _M002 = Migration(
     ),
 )
 
-MIGRATIONS: tuple[Migration, ...] = (_M001, _M002)
+_M003 = Migration(
+    version=3,
+    name="retry_scheduling",
+    statements=(
+        "ALTER TABLE jobs ADD COLUMN available_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE job_stages ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+        "DROP INDEX idx_jobs_claimable",
+        "CREATE INDEX idx_jobs_claimable ON jobs (state, available_at, priority DESC, created_at)",
+    ),
+)
+
+MIGRATIONS: tuple[Migration, ...] = (_M001, _M002, _M003)
 HEAD_VERSION: int = MIGRATIONS[-1].version
 
 
