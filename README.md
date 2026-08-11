@@ -119,6 +119,8 @@ layering `ui → app → core` holds. Breaking one fails CI.
 - `docs/superpowers/phase-1a-carry-forward.md` — what the last phase learned,
   including the traps the current phase has to avoid. Short and worth it.
 - `CONTRIBUTING.md` — how work actually gets done here.
+- `docs/EXTENDING.md` — how to add a feature without colliding with anyone.
+- `docs/CONTRIBUTOR-TASKS.md` — work that is ready to pick up, each self-contained.
 
 ---
 
