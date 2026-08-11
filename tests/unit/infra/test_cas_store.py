@@ -1,9 +1,11 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from ytauto.core.errors import ValidationError
-from ytauto.infra.cas.store import CasStore, hash_bytes, hash_file
+from ytauto.infra.cas.store import CasStore, ContentHash, hash_bytes, hash_file
+from ytauto.infra.db.engine import transaction
 
 
 def test_store_re_exports_the_hashing_primitives() -> None:
@@ -165,3 +167,55 @@ def test_forget_is_idempotent(store: CasStore) -> None:
     store.forget(digest)
     store.forget(digest)
     assert not store.exists(digest)
+
+
+def test_stage_file_writes_the_blob_without_touching_the_database(
+    store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """A worker must be able to produce a blob with no SQLite write at all."""
+    digest = store.stage_file(b"payload", kind="blob")
+    assert store.path_for(digest).is_file()
+    assert db_conn.execute("SELECT count(*) FROM cas_objects").fetchone()[0] == 0
+
+
+def test_record_blob_creates_the_row_for_an_already_staged_file(store: CasStore) -> None:
+    digest = store.stage_file(b"payload", kind="blob")
+    store.record_blob(digest, kind="blob", size_bytes=len(b"payload"))
+    assert store.refcount(digest) == 0
+    assert store.size_of(digest) == len(b"payload")
+
+
+def test_record_blob_is_idempotent(store: CasStore) -> None:
+    """Cross-project dedup means the same digest is recorded more than once."""
+    digest = store.stage_file(b"payload", kind="blob")
+    store.record_blob(digest, kind="blob", size_bytes=7)
+    store.record_blob(digest, kind="blob", size_bytes=7)
+    assert store.refcount(digest) == 0
+
+
+def test_record_blob_rejects_a_digest_with_no_file(store: CasStore) -> None:
+    """The row must never outlive the file - a row without a file makes
+    total_size() overcount and read_bytes() fail for a digest size_of answers.
+    """
+    with pytest.raises(ValidationError, match="no staged file"):
+        store.record_blob(ContentHash("d" * 64), kind="blob", size_bytes=1)
+
+
+def test_record_blob_joins_an_open_transaction(
+    store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """The dispatcher records blobs, retains them, records artifacts and updates
+    job_stages in ONE transaction. If record_blob could not join, that
+    composition would be impossible.
+    """
+    digest = store.stage_file(b"payload", kind="blob")
+    with pytest.raises(ValueError), transaction(db_conn, immediate=True):
+        store.record_blob(digest, kind="blob", size_bytes=7)
+        raise ValueError("caller aborted")
+    assert db_conn.execute("SELECT count(*) FROM cas_objects").fetchone()[0] == 0
+
+
+def test_put_bytes_still_works_and_is_stage_plus_record(store: CasStore) -> None:
+    digest = store.put_bytes(b"payload", kind="blob")
+    assert store.exists(digest)
+    assert store.size_of(digest) == 7

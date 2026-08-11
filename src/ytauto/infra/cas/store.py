@@ -71,13 +71,18 @@ class CasStore:
         """
         return target.with_name(f"{target.name}.{os.getpid()}.tmp")
 
-    def put_bytes(self, data: bytes, *, kind: str) -> ContentHash:
-        """Store an in-memory buffer, deduplicating on content. Idempotent.
+    def stage_file(self, data: bytes, *, kind: str) -> ContentHash:
+        """Write ``data`` into the content-addressed store. Filesystem only.
+
+        No SQLite write happens here - a worker subprocess calls this to
+        produce a blob file and reports the digest back to the parent over
+        the pipe. Only the parent process may add the row; see
+        ``record_blob``. ``kind`` is accepted for symmetry with
+        ``record_blob`` and carries no meaning at the filesystem layer.
 
         Raises:
             OSError: the staging file cannot be written, or the atomic replace
                 into place fails.
-            sqlite3.Error: the refcount row cannot be recorded.
         """
         digest = hash_bytes(data)
         target = self.path_for(digest)
@@ -86,7 +91,60 @@ class CasStore:
             tmp = self._staging_path(target)
             tmp.write_bytes(data)
             tmp.replace(target)
-        self._record(digest, kind=kind, size=len(data))
+        return digest
+
+    def record_blob(self, digest: ContentHash, *, kind: str, size_bytes: int) -> None:
+        """Record the row for an already-staged file. Idempotent.
+
+        Parent-side only: this is the single place ``cas_objects`` rows are
+        written, which is what lets the dispatcher compose ``record_blob`` +
+        ``retain`` + ``ArtifactStore.record`` + a ``job_stages`` update into
+        one atomic step (``transaction()`` is re-entrant via savepoints, so
+        this call joins whatever transaction the caller already has open
+        rather than starting its own).
+
+        Checks that the file exists before writing the row, never after - a
+        row must never outlive its file. The reverse ordering is what
+        ``forget()``'s docstring warns about: it would make ``total_size()``
+        overcount and ``read_bytes()`` fail for a digest ``size_of()`` still
+        answers.
+
+        Raises:
+            ValidationError: ``digest`` is not a valid sha256 hex digest, or
+                no staged file exists for it.
+            sqlite3.OperationalError: the write lock could not be acquired
+                within ``busy_timeout`` - only possible when this call is
+                itself the outermost transaction and the database is under
+                contention.
+        """
+        valid = validate_digest(digest)
+        if not self.path_for(valid).is_file():
+            raise ValidationError(f"no staged file for digest: {valid}")
+        with transaction(self._conn):
+            self._conn.execute(
+                """
+                INSERT INTO cas_objects (hash, kind, size_bytes, created_at, last_accessed_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(hash) DO UPDATE SET last_accessed_at = excluded.last_accessed_at
+                """,
+                (valid, kind, size_bytes, utc_now_iso(), utc_now_iso()),
+            )
+
+    def put_bytes(self, data: bytes, *, kind: str) -> ContentHash:
+        """Store an in-memory buffer, deduplicating on content. Idempotent.
+
+        Implemented as ``stage_file`` followed by ``record_blob`` - kept as a
+        single call for the many callers that are not workers and have no
+        reason to split staging from recording.
+
+        Raises:
+            OSError: the staging file cannot be written, or the atomic replace
+                into place fails.
+            sqlite3.OperationalError: the write lock could not be acquired
+                within ``busy_timeout``.
+        """
+        digest = self.stage_file(data, kind=kind)
+        self.record_blob(digest, kind=kind, size_bytes=len(data))
         return digest
 
     def put_file(self, src: Path, *, kind: str, move: bool = False) -> ContentHash:
@@ -95,7 +153,8 @@ class CasStore:
         Raises:
             ValidationError: ``src`` does not exist or is not a regular file.
             OSError: ``src`` cannot be read, or the copy/move/replace fails.
-            sqlite3.Error: the refcount row cannot be recorded.
+            sqlite3.OperationalError: the write lock could not be acquired
+                within ``busy_timeout``.
         """
         if not src.is_file():
             raise ValidationError(f"source file does not exist: {src}")
@@ -113,7 +172,7 @@ class CasStore:
             else:
                 shutil.copyfile(src, tmp)
             tmp.replace(target)
-        self._record(digest, kind=kind, size=size)
+        self.record_blob(digest, kind=kind, size_bytes=size)
         return digest
 
     def read_bytes(self, digest: ContentHash) -> bytes:
@@ -128,17 +187,6 @@ class CasStore:
         if not path.is_file():
             raise ValidationError(f"no such object in store: {digest}")
         return path.read_bytes()
-
-    def _record(self, digest: ContentHash, *, kind: str, size: int) -> None:
-        with transaction(self._conn):
-            self._conn.execute(
-                """
-                INSERT INTO cas_objects (hash, kind, size_bytes, created_at, last_accessed_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(hash) DO UPDATE SET last_accessed_at = excluded.last_accessed_at
-                """,
-                (digest, kind, size, utc_now_iso(), utc_now_iso()),
-            )
 
     def touch(self, digest: ContentHash) -> None:
         """Mark the object as accessed now, deferring the eviction that follows.
