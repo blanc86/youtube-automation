@@ -1,23 +1,12 @@
 import sqlite3
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from ytauto.infra.cas.store import CasStore
-from ytauto.infra.db.engine import connect
-from ytauto.infra.db.migrations import apply_migrations
 
-
-@pytest.fixture()
-def db_conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
-    """A migrated database. Closed on teardown so Windows can delete tmp_path."""
-    conn = connect(tmp_path / "t.db")
-    apply_migrations(conn)
-    try:
-        yield conn
-    finally:
-        conn.close()
+# db_conn is defined in tests/unit/conftest.py - shared with tests/unit/app,
+# which also needs a real migrated connection (the job queue).
 
 
 @pytest.fixture()
