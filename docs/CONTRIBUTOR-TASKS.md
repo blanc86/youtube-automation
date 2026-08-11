@@ -192,7 +192,126 @@ interface in the issue before writing much code.
 
 ---
 
-## 11. Write the packaging story
+## 11. Auto-clipping: turn a long video or stream into short clips
+
+**Difficulty:** large · **Files:** new — a port in `src/ytauto/core/ports/`, a provider under `src/ytauto/providers/`, stages under `src/ytauto/core/pipeline/`
+
+**This is a self-contained feature with a clear owner. Nothing else in the
+project touches these files.** Read `docs/EXTENDING.md` before starting.
+
+### What it is
+
+Take a long source — a VOD, a stream recording, a podcast, an uploaded file —
+find the segments worth watching, and cut them into short vertical clips with
+subtitles burned in. The same output the main pipeline produces, from a
+completely different input.
+
+### Why it fits here rather than being a separate project
+
+Most of the machinery already exists and you inherit it for free:
+
+| You need | Already built |
+|---|---|
+| Word-level timings from speech | The `Transcriber` port — same one the main pipeline uses |
+| Deduplicated storage for big media | The content-addressed store, with LRU eviction |
+| "Don't redo work I already did" | Fingerprint caching, keyed on inputs + settings + stage version |
+| Survive a crash mid-render | Job queue with resume from the last completed stage |
+| Cut and encode without quality loss | The render strategy (§3.6 of the design spec) |
+
+What is genuinely missing is **one port and two stages.**
+
+### The seam to design
+
+The new port is a highlight detector. Roughly:
+
+```python
+@runtime_checkable
+class HighlightDetector(Protocol):
+    """Finds segments worth clipping in a transcribed media file."""
+
+    @property
+    def capabilities(self) -> CapabilityDescriptor: ...
+
+    def detect(
+        self, transcript: tuple[tuple[str, float, float], ...], *, target_s: float
+    ) -> tuple[tuple[float, float, float], ...]:
+        """Return (start_s, end_s, score) candidates, best first.
+
+        Raises:
+            ...
+        """
+```
+
+Take that as a starting point, not a specification — **propose the signature in
+the issue and discuss it before writing much code.** Two questions worth settling
+first: does the detector see only the transcript, or also the audio waveform (for
+laughter, volume spikes, silence)? And does it return ranges, or ranges plus a
+suggested title?
+
+The pipeline then becomes: ingest → extract audio → `Transcriber` → 
+`HighlightDetector` → cut segments → subtitle → render. Only the middle two are
+new; the rest is the existing path.
+
+### A first implementation that needs no ML
+
+Do not start with a model. A transcript-driven heuristic detector gets
+surprisingly far and is testable offline:
+
+- Prefer segments that start on a sentence boundary and end on one.
+- Score on speech density, question marks, and gaps that suggest a punchline.
+- Reject segments that cut a word in half — you have word-level timings, so this
+  is exact rather than approximate.
+
+That is a real, useful deliverable on its own. A smarter detector is then a
+second provider behind the same port, swappable without touching the pipeline.
+
+### Scope boundary — read this before you plan
+
+The **render half is not built yet.** Phase 2 delivers the cut-and-encode
+pipeline. You can build and fully test the port, the detector, and the stages
+that produce clip *ranges* right now — that half is independent and valuable.
+Producing actual MP4 files depends on Phase 2 landing.
+
+Say in the issue which half you are taking. Taking only the detection half is a
+completely reasonable first PR and will not leave you blocked.
+
+### Done when
+
+- The port is in `core/ports/`, `@runtime_checkable`, stdlib-only, with a
+  `Raises:` section on every method.
+- At least one detector implements it, declares an accurate
+  `CapabilityDescriptor`, and passes `isinstance` against the protocol.
+- Tests run offline against a fixture transcript — no network, no model download,
+  no real video file in the repo.
+- A test proves a segment never splits a word.
+- `python scripts/check.py` passes.
+
+---
+
+## 12. Build the provider registry so features are pluggable
+
+**Difficulty:** medium · **Files:** new `src/ytauto/app/registry.py`, plus `pyproject.toml`
+
+`app/registry.py` is specified in the design (§5.4) and does not exist. It is the
+one missing piece between "you can add a provider" and "someone else can add a
+provider without editing this repo."
+
+It should resolve providers from a built-in table **plus** Python entry-point
+discovery, validate each one's capability descriptor at load time, and construct
+instances with injected config. Entry points are what let a separate package
+ship a provider that this application picks up automatically.
+
+Validating at load matters: a provider declaring `requires_gpu` with no
+`vram_mb` cannot be scheduled safely, and the failure should happen at startup
+with a clear message rather than mid-render.
+
+**Done when:** a provider declared via an entry point in a separate installable
+package is discovered and instantiated, an invalid capability descriptor is
+rejected at load with a useful error, and both are tested.
+
+---
+
+## 13. Write the packaging story
 
 **Difficulty:** medium · **Files:** new, plus `pyproject.toml`
 
