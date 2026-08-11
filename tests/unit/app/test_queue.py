@@ -1,9 +1,11 @@
 import sqlite3
 from collections.abc import Iterator
+from contextlib import AbstractContextManager
 from pathlib import Path
 
 import pytest
 
+import ytauto.app.scheduler.queue as queue_module
 from ytauto.app.scheduler.queue import JobQueue
 from ytauto.infra.db.engine import connect, transaction
 from ytauto.infra.db.migrations import apply_migrations
@@ -168,3 +170,39 @@ def test_an_immediate_read_then_write_survives_the_same_concurrent_writer(
 
     row = conn_a.execute("SELECT state FROM jobs WHERE id = 'j1'").fetchone()
     assert row["state"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# Carried over from Task 10's review. The two tests above prove the SQLite
+# mechanism immediate=True protects against is real - but neither one calls
+# claim() itself, so an accidental revert of claim()'s immediate=True back to
+# False would slip past both of them silently. This test pins the call site
+# directly: it spies on the transaction name claim() actually calls (the one
+# bound into ytauto.app.scheduler.queue's own namespace by its `from ... import
+# transaction`, which is the name a revert would touch) and asserts claim()
+# invokes it with immediate=True. The spy forwards every call to the real
+# transaction() rather than replacing it, so claim() still actually runs and
+# returns the job - this stays a real exercise of claim(), not a mock of it.
+# ---------------------------------------------------------------------------
+
+
+def test_claim_opens_its_transaction_with_immediate_true(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_transaction = queue_module.transaction
+    calls: list[bool] = []
+
+    def spy(
+        conn: sqlite3.Connection, *, immediate: bool = False
+    ) -> AbstractContextManager[sqlite3.Connection]:
+        calls.append(immediate)
+        return real_transaction(conn, immediate=immediate)
+
+    monkeypatch.setattr(queue_module, "transaction", spy)
+
+    queue.enqueue("j1", "p1", "pipe")
+    calls.clear()  # only the call(s) made by claim() itself are of interest
+    claimed = queue.claim("w1", lease_s=60)
+
+    assert claimed is not None
+    assert calls == [True]
