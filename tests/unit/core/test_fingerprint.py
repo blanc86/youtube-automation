@@ -26,7 +26,7 @@ def _spec(**overrides: object) -> FingerprintSpec:
         "stage_version": 1,
         "provider_id": "gemini-flash",
         "provider_version": "2026-05",
-        "input_digests": (DIGEST_A,),
+        "input_digests": (("input", DIGEST_A),),
         "settings": {"tone": "dramatic", "max_words": 900},
     }
     base.update(overrides)
@@ -66,9 +66,57 @@ def test_sets_encode_in_sorted_order() -> None:
 
 def test_input_digest_order_does_matter() -> None:
     """Concatenation order changes the output, so it must change the key."""
-    a = _spec(input_digests=(DIGEST_A, DIGEST_B))
-    b = _spec(input_digests=(DIGEST_B, DIGEST_A))
+    a = _spec(input_digests=(("p", DIGEST_A), ("q", DIGEST_B)))
+    b = _spec(input_digests=(("q", DIGEST_B), ("p", DIGEST_A)))
     assert compute_fingerprint(a) != compute_fingerprint(b)
+
+
+def test_swapping_two_artifact_names_changes_the_fingerprint() -> None:
+    """A false HIT is the most damaging bug this module can have: the pipeline
+    skips a stage and serves a different arrangement of inputs as its output."""
+    a, b = ContentHash("a" * 64), ContentHash("b" * 64)
+    one = _spec(input_digests=(("narration", a), ("timings", b)))
+    two = _spec(input_digests=(("narration", b), ("timings", a)))
+    assert compute_fingerprint(one) != compute_fingerprint(two)
+
+
+def test_swapping_names_with_the_same_digest_sequence_changes_the_fingerprint() -> None:
+    """Isolates the false HIT the module docstring describes, which the test
+    above does not: here the *bare digest sequence* - position 0 carries digest
+    ``a``, position 1 carries digest ``b`` - is identical between ``one`` and
+    ``two``. Only which name is attached to which position differs. Without
+    names in the payload these two are indistinguishable (see the guard-pinning
+    proof in the task report, which reverts the payload construction to strip
+    names and shows this exact pair of specs collide)."""
+    a, b = ContentHash("a" * 64), ContentHash("b" * 64)
+    one = _spec(input_digests=(("narration", a), ("timings", b)))
+    two = _spec(input_digests=(("timings", a), ("narration", b)))
+    assert [d for _n, d in one.input_digests] == [d for _n, d in two.input_digests], (
+        "test setup bug: this test only proves anything if the bare-digest "
+        "sequences are identical between one and two"
+    )
+    assert compute_fingerprint(one) != compute_fingerprint(two)
+
+
+def test_the_same_names_and_digests_fingerprint_identically() -> None:
+    a, b = ContentHash("a" * 64), ContentHash("b" * 64)
+    assert compute_fingerprint(_spec(input_digests=(("n", a), ("t", b)))) == compute_fingerprint(
+        _spec(input_digests=(("n", a), ("t", b)))
+    )
+
+
+def test_input_order_still_changes_the_fingerprint() -> None:
+    """Order stays load-bearing - concatenating two clips the other way round
+    produces a different video."""
+    a, b = ContentHash("a" * 64), ContentHash("b" * 64)
+    assert compute_fingerprint(_spec(input_digests=(("x", a), ("y", b)))) != compute_fingerprint(
+        _spec(input_digests=(("y", b), ("x", a)))
+    )
+
+
+def test_schema_version_is_two_and_typed() -> None:
+    assert FINGERPRINT_SCHEMA_VERSION == 2
+    assert isinstance(FINGERPRINT_SCHEMA_VERSION, int)
 
 
 @pytest.mark.parametrize(
@@ -173,7 +221,7 @@ def test_is_stable_across_interpreter_restarts() -> None:
         "from ytauto.core.models.content_hash import ContentHash\n"
         "print(compute_fingerprint(FingerprintSpec(\n"
         "    stage_id='rewrite', stage_version=1, provider_id='gemini-flash',\n"
-        "    provider_version='2026-05', input_digests=(ContentHash('a'*64),),\n"
+        "    provider_version='2026-05', input_digests=(('input', ContentHash('a'*64)),),\n"
         "    settings={'tone': 'dramatic', 'max_words': 900, 'langs': {'en','fr','de'}},\n"
         ")))\n"
     )

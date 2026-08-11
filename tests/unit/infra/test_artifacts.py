@@ -125,7 +125,7 @@ def test_declaration_order_and_cached_order_produce_one_fingerprint(
                 stage_version=1,
                 provider_id="ffmpeg",
                 provider_version="7.1",
-                input_digests=tuple(a.digest for a in arts),
+                input_digests=tuple((a.name, a.digest) for a in arts),
                 settings={},
             )
         )
