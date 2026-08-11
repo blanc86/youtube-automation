@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from ytauto.core.errors import ValidationError
 from ytauto.core.models.artifact import ArtifactRef
 from ytauto.core.models.content_hash import ContentHash, validate_digest
+from ytauto.core.models.names import assert_unique_names
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.clock import utc_now_iso
 from ytauto.infra.db.engine import transaction
@@ -185,13 +186,11 @@ class ArtifactStore:
         # collision below) reporting False for it would silently swallow a
         # caller bug. It has to be caught here, before any write, so the
         # IntegrityError handler never sees it.
-        seen: set[str] = set()
-        for artifact in artifacts:
-            if artifact.name in seen:
-                raise ValidationError(
-                    f"duplicate artifact name in one batch for {fingerprint}: {artifact.name!r}"
-                )
-            seen.add(artifact.name)
+        assert_unique_names(
+            (artifact.name for artifact in artifacts),
+            what="artifact",
+            context=f"one batch for {fingerprint}",
+        )
 
         for artifact in artifacts:
             if not self._cas.exists(artifact.digest):

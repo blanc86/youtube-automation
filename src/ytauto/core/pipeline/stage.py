@@ -9,6 +9,7 @@ from typing import Protocol, runtime_checkable
 
 from ytauto.core.errors import ValidationError
 from ytauto.core.models.artifact import ArtifactRef
+from ytauto.core.models.names import assert_unique_names
 
 ProgressFn = Callable[[float, str], None]
 """Report progress as (fraction 0.0-1.0, human-readable message)."""
@@ -62,9 +63,7 @@ class StageResult:
 
     def __post_init__(self) -> None:
         names = [a.name for a in self.artifacts]
-        if len(names) != len(set(names)):
-            duplicates = sorted({n for n in names if names.count(n) > 1})
-            raise ValidationError(f"duplicate artifact names: {duplicates}")
+        assert_unique_names(names, what="artifact", context="a stage result")
 
     def artifact(self, name: str) -> ArtifactRef:
         """Fetch one artifact by name.

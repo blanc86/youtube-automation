@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ytauto.core.errors import ValidationError
+from ytauto.core.models.names import assert_unique_names
 from ytauto.core.pipeline.stage import Stage
 
 
@@ -29,9 +30,7 @@ class Pipeline:
             raise ValidationError(f"pipeline {self.id!r} is empty")
 
         ids = [stage.id for stage in self.stages]
-        if len(ids) != len(set(ids)):
-            duplicates = sorted({i for i in ids if ids.count(i) > 1})
-            raise ValidationError(f"duplicate stage ids: {duplicates}")
+        assert_unique_names(ids, what="stage", context=f"pipeline {self.id!r}")
 
         known = set(ids)
         for stage in self.stages:
