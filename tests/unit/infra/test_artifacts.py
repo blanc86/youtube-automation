@@ -4,6 +4,8 @@ import pytest
 
 from ytauto.core.errors import ValidationError
 from ytauto.core.models.artifact import ArtifactRef
+from ytauto.core.pipeline.fingerprint import FingerprintSpec, compute_fingerprint
+from ytauto.core.pipeline.stage import StageResult
 from ytauto.infra.artifacts import ArtifactStore
 from ytauto.infra.cas.eviction import EvictionPolicy, Evictor
 from ytauto.infra.cas.store import CasStore
@@ -102,6 +104,33 @@ def test_lookup_returns_several_artifacts_in_name_order(
     narration = _put(store, "narration", b"audio")
     artifacts.record(FP, "tts", [timings, narration])
     assert [a.name for a in artifacts.lookup(FP) or ()] == ["narration", "timings"]
+
+
+def test_declaration_order_and_cached_order_produce_one_fingerprint(
+    artifacts: ArtifactStore, store: CasStore
+) -> None:
+    """The regression the whole-branch review found: a downstream stage must
+    fingerprint identically whether its inputs came fresh from StageResult or
+    back from the cache."""
+    timings = _put(store, "timings", b"json")
+    narration = _put(store, "narration", b"audio")
+    fresh = StageResult(artifacts=(timings, narration), meta={}).artifacts
+    artifacts.record(FP, "tts", list(fresh))
+    cached = artifacts.lookup(FP) or ()
+
+    def downstream(arts: tuple[ArtifactRef, ...]) -> str:
+        return compute_fingerprint(
+            FingerprintSpec(
+                stage_id="render",
+                stage_version=1,
+                provider_id="ffmpeg",
+                provider_version="7.1",
+                input_digests=tuple(a.digest for a in arts),
+                settings={},
+            )
+        )
+
+    assert downstream(fresh) == downstream(cached)
 
 
 def test_recording_does_not_pin_the_blob(artifacts: ArtifactStore, store: CasStore) -> None:

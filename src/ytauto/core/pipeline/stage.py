@@ -54,6 +54,16 @@ class JobContext:
 class StageResult:
     """What a stage hands back: named artifacts plus optional metadata.
 
+    ``artifacts`` is always sorted by name, regardless of the order it was
+    constructed with. ``ArtifactStore.lookup()`` returns rows ``ORDER BY name
+    ASC``, so without this sort a stage's fresh output and its cached output
+    would disagree on order - and that order feeds directly into downstream
+    fingerprints, which are order-sensitive by design (concatenating clips the
+    other way round is a different video). Sorting here is what keeps the two
+    paths from diverging. A stage that needs a specific concatenation order
+    encodes it in the names themselves (``seg_000``, ``seg_001``), which sorts
+    correctly and is self-documenting.
+
     Raises:
         ValidationError: if two artifacts share a name.
     """
@@ -64,6 +74,7 @@ class StageResult:
     def __post_init__(self) -> None:
         names = [a.name for a in self.artifacts]
         assert_unique_names(names, what="artifact", context="a stage result")
+        object.__setattr__(self, "artifacts", tuple(sorted(self.artifacts, key=lambda a: a.name)))
 
     def artifact(self, name: str) -> ArtifactRef:
         """Fetch one artifact by name.
