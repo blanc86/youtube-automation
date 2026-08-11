@@ -13,11 +13,15 @@ rather than the job's, quietly destroying the per-job trail the mechanism
 exists to provide.
 
 ``decode`` returns ``None`` for an unknown ``type`` or an unknown ``v``
-rather than raising: a newer worker must never be able to wedge an older
-parent by emitting a message shape the parent does not recognise. A line
-that is not JSON at all is different - that means the pipe itself is
-corrupt, which is not survivable, so ``decode`` raises for that case instead
-of silently skipping it.
+rather than raising: that is version skew between two builds, neither one
+wrong, and a newer worker must never be able to wedge an older parent by
+emitting a message shape the parent does not recognise. Everything else is
+fatal: a line that is not JSON at all means the pipe itself is corrupt, and a
+recognised ``type`` at the *matching* version with a missing or malformed
+field is a same-version bug or corruption, not skew - swallowing that would
+let a buggy worker of the identical protocol version wedge the parent just
+as effectively, only silently. Neither is survivable, so ``decode`` raises
+for both instead of skipping them.
 """
 
 from __future__ import annotations
@@ -165,15 +169,24 @@ def encode(msg: Message) -> str:
 def decode(line: str) -> Message | None:
     """Parse one line of the wire protocol.
 
-    Returns ``None`` for a ``type`` or ``v`` this parent does not recognise,
-    and for a recognised ``type`` whose payload is missing a field it
-    requires - the same forward-compatibility reasoning covers both: a
-    message this parent cannot fully make sense of is skipped, not fatal.
+    Returns ``None`` only for version skew: an unrecognised ``type`` or an
+    unrecognised protocol ``v``. Those are the one case where silence is
+    correct - two different builds, neither one wrong, and the parent
+    genuinely cannot understand the message. A recognised ``type`` at the
+    *matching* protocol version that is missing a required field, or has one
+    that does not parse, is not skew - it is a same-version bug or a
+    corrupted line, and is fatal rather than swallowed. The dispatcher
+    expects exactly one terminal message per stage; silently dropping a
+    malformed ``result`` or ``error`` would leave that stage waiting forever
+    for a message that will never come, having discarded the one line that
+    explained why.
 
     Raises:
-        ValidationError: ``line`` is not valid JSON. That means the pipe
-            itself is corrupt, which is not survivable and must not be
-            silently skipped.
+        ValidationError: ``line`` is not valid JSON, or is a recognised
+            message ``type`` at the matching protocol version but is missing
+            a required field, or has one that does not parse (e.g. an
+            ``error`` message whose ``kind`` is not a valid ``ErrorKind``
+            value).
     """
     try:
         raw = json.loads(line)
@@ -187,8 +200,8 @@ def decode(line: str) -> Message | None:
 
     try:
         return _decode_payload(raw)
-    except (KeyError, TypeError, ValueError):
-        return None
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidationError(f"malformed {raw.get('type')!r} message ({exc}): {line!r}") from exc
 
 
 def _decode_payload(raw: dict[str, Any]) -> Message | None:

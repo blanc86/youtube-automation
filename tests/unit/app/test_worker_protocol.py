@@ -107,3 +107,34 @@ def test_an_error_carries_its_kind_and_retry_hint() -> None:
     )
     assert decode(encode(msg)) == msg
     assert decode(encode(msg)).kind is ErrorKind.RATE_LIMITED
+
+
+def test_a_known_type_missing_a_required_field_is_fatal() -> None:
+    """Same protocol version, malformed payload: a same-version bug or
+    corruption, not skew. Swallowing it would let a buggy worker of the
+    identical version silently wedge the parent - the dispatcher expects
+    exactly one terminal message per stage, and a dropped `result` leaves
+    that stage waiting forever."""
+    with pytest.raises(ValidationError, match="progress"):
+        decode(
+            json.dumps(
+                {"v": 1, "type": "progress", "job_id": "j1", "stage_id": "s", "correlation_id": "c"}
+            )
+        )
+
+
+def test_a_known_type_with_a_malformed_kind_is_fatal() -> None:
+    with pytest.raises(ValidationError, match="error"):
+        decode(
+            json.dumps(
+                {
+                    "v": 1,
+                    "type": "error",
+                    "job_id": "j1",
+                    "stage_id": "s",
+                    "correlation_id": "c",
+                    "message": "boom",
+                    "kind": "not_a_real_kind",
+                }
+            )
+        )

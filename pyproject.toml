@@ -84,3 +84,9 @@ forbidden_modules = ["PySide6"]
 name = "layered architecture"
 type = "layers"
 layers = ["ytauto.ui", "ytauto.app", "ytauto.core"]
+
+[[tool.importlinter.contracts]]
+name = "app depends only on core and infra"
+type = "forbidden"
+source_modules = ["ytauto.app"]
+forbidden_modules = ["ytauto.providers", "ytauto.ui", "ytauto.cli"]
