@@ -777,6 +777,15 @@ class Dispatcher:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                # Explicit, never the host locale. text=True alone decodes
+                # with the locale codec - cp1252 on a typical Windows box,
+                # utf-8 on macOS - so the same worker byte would mean
+                # different things on different machines, and a byte the
+                # locale codec has no mapping for raises UnicodeDecodeError
+                # out of the read loop below. The worker pins the same
+                # encoding on its end of the pipe: app/worker.py's
+                # _use_utf8_stdout.
+                encoding="utf-8",
             )
             self._running[owner] = proc
             _send_assignment(proc, payload)

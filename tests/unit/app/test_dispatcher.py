@@ -112,10 +112,12 @@ class SpawnSpy:
     def __init__(self) -> None:
         self.calls = 0
         self.argv: list[tuple[str, ...]] = []
+        self.kwargs: list[dict[str, object]] = []
 
     def __call__(self, argv: Sequence[str], **kwargs: object) -> _FakeProcess:
         self.calls += 1
         self.argv.append(tuple(argv))
+        self.kwargs.append(dict(kwargs))
         return _FakeProcess()
 
 
@@ -337,6 +339,24 @@ def test_a_refused_lease_is_not_reported_as_a_spawn(
     assert report.spawned == (), "a refused lease is not a spawn"
     assert report.idle
     assert _job_state(db_conn, "j1") == "queued"
+
+
+def test_the_worker_pipe_is_opened_with_an_explicit_encoding(
+    dispatcher: Dispatcher, spawn_spy: SpawnSpy, queue: JobQueue
+) -> None:
+    """``text=True`` alone decodes with the host's locale codec - cp1252 on a
+    typical Windows box, utf-8 on macOS - so a worker line would mean
+    different things on different machines, and a byte cp1252 has no mapping
+    for (0x81, 0x8d, 0x8f, 0x90, 0x9d - all of them ordinary continuation
+    bytes in UTF-8) raises UnicodeDecodeError straight out of the pump's read
+    loop. The worker pins the same encoding on its end; this pins the
+    parent's, which no end-to-end test can reach today because every protocol
+    line is pure ASCII (``json.dumps`` escapes non-ASCII by default)."""
+    queue.requeue("j1", available_in_s=-1)
+
+    dispatcher.tick()
+
+    assert spawn_spy.kwargs[0]["encoding"] == "utf-8"
 
 
 def test_a_worker_that_died_before_reading_its_assignment_does_not_strand_the_lease(

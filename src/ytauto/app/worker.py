@@ -32,6 +32,7 @@ what makes ``kind`` (off the ``ArtifactLine``) and ``size_bytes`` (a
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import sqlite3
 import sys
@@ -87,6 +88,30 @@ def _build_context(assignment: dict[str, Any]) -> JobContext:
     )
 
 
+def _use_utf8_stdout() -> None:
+    """Pin this worker's stdout to UTF-8, whatever the host's locale says.
+
+    ``print`` here and ``Popen(..., text=True)`` in the parent both default
+    to the locale codec - cp1252 on a typical Windows box, utf-8 on macOS -
+    so the same worker line means different things on different machines.
+    Every protocol line survives that by luck rather than design:
+    ``worker_protocol.encode`` goes through ``json.dumps``, whose
+    ``ensure_ascii`` default escapes non-ASCII to ``\\uXXXX``. Nothing else
+    the process writes is so lucky. One character outside cp1252 printed by a
+    stage, or by a library a stage calls, raises ``UnicodeEncodeError`` at
+    the write - which becomes a FATAL stage error at best, and at worst kills
+    the worker before it emits anything, with the traceback on a stderr the
+    parent never reads.
+
+    ``sys.stdout`` is a ``TextIOWrapper`` whenever this module is run the way
+    it is meant to be (``python -m ytauto.app.worker`` with a pipe); the
+    isinstance check is there so an embedded caller that replaced it with
+    something else is left alone rather than crashed.
+    """
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+
 def _emit(message: Message) -> None:
     print(encode(message), flush=True)
 
@@ -104,6 +129,7 @@ def main() -> int:
         that case, so the process crashes with a traceback on stderr and a
         nonzero exit instead of emitting a message that could be wrong.
     """
+    _use_utf8_stdout()
     assignment: dict[str, Any] = json.loads(sys.stdin.read())
     job_id = assignment["job_id"]
     stage_id = assignment["stage_id"]
