@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from ytauto.infra.ffmpeg.locator import FfmpegNotFound, locate, parse_version
+from ytauto.infra.ffmpeg.locator import _EXE, FfmpegNotFound, locate, parse_version
 
 BANNER = (
     "ffmpeg version 7.1.1-essentials_build-www.gyan.dev Copyright (c) 2000-2025 the FFmpeg "
@@ -24,9 +24,18 @@ def test_parse_version_returns_unknown_when_unparseable() -> None:
 
 
 def _fake_pair(directory: Path) -> None:
+    """Create a stub ffmpeg/ffprobe pair named the way THIS platform names them.
+
+    The suffix comes from the locator's own ``_EXE`` rather than being hardcoded.
+    Spelling it ".exe" here made every one of these tests silently Windows-only:
+    on POSIX the locator looks for an extensionless ``ffmpeg``, found nothing,
+    and each test collapsed into the generic not-found error - including the two
+    that assert on a *specific* message, which then passed their raises() check
+    for entirely the wrong reason.
+    """
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "ffmpeg.exe").write_text("stub")
-    (directory / "ffprobe.exe").write_text("stub")
+    (directory / f"ffmpeg{_EXE}").write_text("stub")
+    (directory / f"ffprobe{_EXE}").write_text("stub")
 
 
 def test_configured_directory_is_preferred(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -50,7 +59,7 @@ def test_missing_ffprobe_beside_ffmpeg_is_rejected(
 ) -> None:
     lonely = tmp_path / "lonely"
     lonely.mkdir()
-    (lonely / "ffmpeg.exe").write_text("stub")
+    (lonely / f"ffmpeg{_EXE}").write_text("stub")
     monkeypatch.delenv("YTAUTO_FFMPEG_DIR", raising=False)
     monkeypatch.setattr("shutil.which", lambda *_a, **_k: None)
     # Match a phrase unique to the mismatched-pair message. Matching on
