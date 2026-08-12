@@ -117,6 +117,22 @@ class SpawnSpy:
         return _FakeProcess()
 
 
+class _ClosedPipe(io.StringIO):
+    """The stdin of a worker that exited before the parent could write to it."""
+
+    def write(self, s: str, /) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+class DeadOnArrivalSpawnSpy(SpawnSpy):
+    """A spawn whose process is already gone by the time stdin is written."""
+
+    def __call__(self, argv: Sequence[str], **kwargs: object) -> _FakeProcess:
+        proc = super().__call__(argv, **kwargs)
+        proc.stdin = _ClosedPipe()
+        return proc
+
+
 @pytest.fixture()
 def store(tmp_path: Path, db_conn: sqlite3.Connection) -> CasStore:
     """A CasStore sharing the migrated connection from ``db_conn``."""
@@ -319,6 +335,32 @@ def test_a_refused_lease_is_not_reported_as_a_spawn(
     assert report.spawned == (), "a refused lease is not a spawn"
     assert report.idle
     assert _job_state(db_conn, "j1") == "queued"
+
+
+def test_a_worker_that_died_before_reading_its_assignment_does_not_strand_the_lease(
+    dispatcher: Dispatcher,
+    governor: Governor,
+    queue: JobQueue,
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_spawn``'s ``finally`` released the lease only ``if not started``,
+    and ``started`` was set *before* the writes to ``proc.stdin``. A worker
+    that had already exited made ``write`` raise ``BrokenPipeError`` out of
+    ``tick()`` past that handler, leaving ``gpu_compute`` at 0 for the life
+    of the process - one bad venv and the dispatcher never runs anything
+    again."""
+    spy = DeadOnArrivalSpawnSpy()
+    monkeypatch.setattr(dispatcher_module, "Popen", spy)
+    queue.requeue("j1", available_in_s=-1)
+
+    report = dispatcher.tick()
+
+    assert spy.calls == 1
+    assert governor.available("gpu_compute") == 1, "the lease must not outlive the failed spawn"
+    assert report.spawned == ("fetch",), "a worker was started; it just died immediately"
+    assert _job_state(db_conn, "j1") == "queued"
+    assert _stage_attempts(db_conn, "j1", "fetch") == 1, "a dead-on-arrival worker costs an attempt"
 
 
 def test_a_stage_commit_is_atomic(

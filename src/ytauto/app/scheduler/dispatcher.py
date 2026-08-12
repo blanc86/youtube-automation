@@ -188,6 +188,36 @@ def _resolve_staged_artifacts(result: Result, staged: Sequence[Staged]) -> list[
     return resolved
 
 
+def _send_assignment(proc: Popen[str], payload: str) -> None:
+    """Hand a spawned worker its assignment. A closed pipe is its death, not ours.
+
+    A worker that has already exited - an import error, a bad venv, an
+    instant crash - makes ``write`` or ``close`` raise ``BrokenPipeError``
+    (or another ``OSError``; Windows reports the same condition as
+    ``EINVAL``). That is not a dispatcher failure and must not escape
+    ``_spawn`` holding the lease: it is a worker that produced no terminal
+    message, which is precisely what ``_pump``'s death branch already handles
+    - release the lease, charge the attempt, back off, requeue. So the error
+    is swallowed here and the pump is left to observe the empty stdout.
+
+    Raises:
+        Nothing. Every failure mode of writing to a dead pipe is an
+        ``OSError``, and all of them mean the same thing.
+    """
+    stdin = proc.stdin
+    if stdin is None:
+        return
+    try:
+        stdin.write(payload)
+    except OSError:
+        pass
+    finally:
+        try:
+            stdin.close()
+        except OSError:
+            pass
+
+
 class Dispatcher:
     """Claims jobs, plans stages, spawns workers, reaps the dead, commits results.
 
@@ -727,6 +757,12 @@ class Dispatcher:
                 )
 
             assignment = _build_assignment(claimed, stage, ctx, fingerprint, str(self._cas.root))
+            # Serialised before the spawn on purpose: json.dumps is the last
+            # thing here that can fail for a reason of its own (an
+            # unserialisable settings value, once Phase 2 puts real ones
+            # there), and doing it after Popen would leave a live worker
+            # blocked forever on a stdin that is never written.
+            payload = json.dumps(assignment)
             proc = Popen(
                 [sys.executable, "-m", "ytauto.app.worker"],
                 stdin=subprocess.PIPE,
@@ -735,18 +771,18 @@ class Dispatcher:
                 text=True,
             )
             self._running[owner] = proc
+            _send_assignment(proc, payload)
             started = True
         finally:
-            # A failure between acquiring the lease and successfully tracking
-            # the process (mkdir, the DB write, or Popen itself) must not
-            # leak the lease - nothing else would ever release it, since
-            # _running never got an entry for reap() to find later.
+            # Any failure after the lease is acquired must release it -
+            # nothing else ever would. `started` deliberately flips only once
+            # the worker is spawned AND holds its assignment: it used to flip
+            # before the stdin writes, so a worker that had already exited
+            # raised BrokenPipeError straight past this handler and stranded
+            # gpu_compute at 0 for the life of the process.
             if not started:
+                self._running.pop(owner, None)
                 self._governor.release_all(owner)
-
-        if proc.stdin is not None:
-            proc.stdin.write(json.dumps(assignment))
-            proc.stdin.close()
 
         self._pump(claimed.job_id, stage.id, fingerprint, proc, owner)
         return True
