@@ -60,6 +60,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import Popen
@@ -207,15 +208,10 @@ def _send_assignment(proc: Popen[str], payload: str) -> None:
     stdin = proc.stdin
     if stdin is None:
         return
-    try:
+    with suppress(OSError):
         stdin.write(payload)
-    except OSError:
-        pass
-    finally:
-        try:
-            stdin.close()
-        except OSError:
-            pass
+    with suppress(OSError):
+        stdin.close()
 
 
 class Dispatcher:
