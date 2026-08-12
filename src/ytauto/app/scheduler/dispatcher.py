@@ -14,14 +14,16 @@ savepoint re-entrancy is what makes possible:
 
 1. ``CasStore.record_blob`` for each staged digest - the row for a file a
    worker already wrote.
-2. ``CasStore.retain`` each one - the **job's** in-flight pin, not the
-   cache's. ``ArtifactStore.record`` stopped retaining in Task 3, so this is
-   not a duplicate: the cache says "this fingerprint produced these bytes",
-   the job says "I am using these bytes right now, do not evict them".
-3. ``ArtifactStore.record`` - index the fingerprint. Composes inside this
-   transaction because of a fix this task made to ``infra/artifacts.py``: see
+2. ``ArtifactStore.record`` - index the fingerprint. Composes inside this
+   transaction because of a fix Task 13 made to ``infra/artifacts.py``: see
    that module's ``record()`` docstring for why its ``immediate=True`` had to
    become conditional on whether a transaction is already open.
+3. ``CasStore.retain`` every artifact the fingerprint now resolves to - the
+   **job's** in-flight pin, not the cache's. ``ArtifactStore.record`` stopped
+   retaining in Task 3, so this is not a duplicate: the cache says "this
+   fingerprint produced these bytes", the job says "I am using these bytes
+   right now, do not evict them". It runs *after* ``record`` on purpose; see
+   ``commit_stage`` for why pinning the staged digests instead is wrong.
 4. The ``job_stages`` row flips to ``succeeded``.
 
 Steps 2 and 3 are not duplicates, and the job's retain (step 2) is released
@@ -378,11 +380,21 @@ class Dispatcher:
     ) -> None:
         """Record a stage's output as one atomic transaction.
 
-        ``record_blob``, ``retain``, ``ArtifactStore.record`` and the
+        ``record_blob``, ``ArtifactStore.record``, ``retain`` and the
         ``job_stages`` update land together or not at all - see the module
         docstring for the full rationale and Step 5 of the task report for
         the guard-pinning proof (remove the ``transaction()`` wrapper and
         watch ``cas_objects`` rows survive a failure at the last step).
+
+        The job pins what the *fingerprint resolves to*, not what this worker
+        staged, and the ordering is what makes that possible: ``record``
+        returns False when the fingerprint already has rows, so on a re-run of
+        a non-deterministic stage the bytes this worker wrote and the bytes
+        the ``artifacts`` table names are two different sets. The downstream
+        stage will consume the recorded ones (``gather_inputs`` ->
+        ``lookup``), so those are the ones that must survive eviction - and
+        they are also the ones ``_release_job_pins`` releases, which is what
+        keeps the retain and the release naming the same digests.
 
         Raises:
             ValidationError: a digest is malformed, a staged file is missing
@@ -402,13 +414,23 @@ class Dispatcher:
         with transaction(self._conn, immediate=True):
             for item in staged:
                 self._cas.record_blob(item.digest, kind=item.kind, size_bytes=item.size_bytes)
-                self._cas.retain(item.digest)
             if staged:
                 artifact_refs = [
                     ArtifactRef(name=item.name, kind=item.kind, digest=item.digest)
                     for item in staged
                 ]
                 self._artifacts.record(fingerprint, stage_id, artifact_refs)
+            # C3: the job's pin. Retaining `staged` here instead - what this
+            # worker wrote - is what made the retain and the release name
+            # different digests, because record() returns False for an
+            # already-recorded fingerprint. Not reachable in Phase 1b (the
+            # Evictor has no production caller and there is one dispatcher),
+            # but the moment the evictor is wired, a re-run of a
+            # non-deterministic stage after a mid-pipeline eviction would run
+            # its downstream stage on empty inputs AND leak a permanently
+            # unevictable blob. _release_job_pins releases exactly this set.
+            for artifact in self._artifacts.lookup(fingerprint) or ():
+                self._cas.retain(artifact.digest)
             self._mark_stage_succeeded(job_id, stage_id, fingerprint)
 
         owner = f"{job_id}:{stage_id}"
@@ -494,8 +516,12 @@ class Dispatcher:
             if status is None or not status.is_done:
                 continue
             # C3: this must name the same digests commit_stage/_mark_skipped
-            # retained - hence lookup(fingerprint), the source of truth both
-            # of those retain from too. See the retain in commit_stage.
+            # retained - hence lookup(fingerprint), the one source of truth
+            # all three read from. Releasing what the artifacts table says
+            # while pinning what a worker staged is the asymmetry that leaks
+            # a permanently unevictable blob; harmless only while the Evictor
+            # has no production caller, and live the moment it is wired. See
+            # the retain in commit_stage.
             artifacts = self._artifacts.lookup(fingerprint)
             if artifacts is None:
                 continue

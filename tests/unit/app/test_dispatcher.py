@@ -374,6 +374,48 @@ def test_a_terminally_failed_job_releases_every_pin_its_completed_stages_took(
     assert digest in [d for d, _ in store.iter_evictable()]
 
 
+def test_a_stage_pins_what_its_fingerprint_resolves_to_not_what_it_staged(
+    dispatcher: Dispatcher,
+    store: CasStore,
+    artifacts: ArtifactStore,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """C3: the retain and the release must name the same digests.
+
+    ``ArtifactStore.record`` returns False when the fingerprint already has
+    rows, so a re-run of a non-deterministic stage produces bytes that are
+    NOT what the ``artifacts`` table names. Pinning the staged digests while
+    releasing the recorded ones leaves the recorded blob - the one
+    ``gather_inputs`` will hand the downstream stage - unpinned and
+    evictable, and leaves the staged blob pinned forever.
+
+    Only reachable once the ``Evictor`` has a production caller (it has none
+    in Phase 1b, and there is one dispatcher), which is why this pins the
+    symmetry rather than the eviction scenario itself.
+    """
+    _mark_stage(db_conn, "j1", "fetch", "running")
+    recorded = store.put_bytes(b"a previous run's fetch output", kind="blob")
+    artifacts.record(
+        _FETCH_FINGERPRINT, "fetch", [ArtifactRef(name="out", kind="blob", digest=recorded)]
+    )
+    data = b"this run's fetch output, byte-for-byte different"
+    restaged = store.stage_file(data, kind="blob")
+
+    dispatcher.commit_stage(
+        "j1", "fetch", _FETCH_FINGERPRINT, [_staged(restaged, size_bytes=len(data))]
+    )
+
+    assert store.refcount(recorded) == 1, (
+        "the job must pin what its downstream stage will actually be given"
+    )
+    assert store.refcount(restaged) == 0, "a re-staged blob nothing references must not be pinned"
+
+    dispatcher.handle_error(_error("j1", "tts", ErrorKind.FATAL, retry_after_s=None))
+
+    assert store.refcount(recorded) == 0, "the release must name the digests the retain took"
+    assert store.refcount(restaged) == 0
+
+
 def test_a_worker_that_staged_then_died_leaves_only_reclaimable_orphans(
     dispatcher: Dispatcher, store: CasStore, db_conn: sqlite3.Connection
 ) -> None:
