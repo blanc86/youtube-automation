@@ -267,6 +267,17 @@ class Dispatcher:
         until it reports a terminal message (see the module docstring for why
         this is deliberately synchronous rather than threaded).
 
+        A claim that turns out to have nothing to advance - every remaining
+        stage running or blocked - is *returned to the queue*, not abandoned.
+        A claimed job is invisible to every other dispatcher for the full
+        lease (300 s by default), and nothing else would put it back: this
+        method is the only thing that claims, and it only ever claims
+        ``state = 'queued'``. Reporting ``idle`` while silently parking a
+        live job for five minutes is exactly the shape of bug that looks like
+        "the queue stalled for no reason" in production. The same applies to
+        a refused ``gpu_compute`` lease, which additionally must not be
+        reported as a spawn that never happened.
+
         Raises:
             ValidationError: the claimed job's ``pipeline_id`` names no
                 registered pipeline, or an upstream fingerprint recorded in
@@ -291,6 +302,7 @@ class Dispatcher:
             if statuses.get(stage.id) is not StageStatus.RUNNING
         ]
         if not ready:
+            self._queue.requeue(claimed.job_id, available_in_s=0.0)
             return TickReport(idle=True)
 
         stage = ready[0]
@@ -308,7 +320,8 @@ class Dispatcher:
             self._mark_skipped(claimed.job_id, stage.id, fingerprint, cached)
             return TickReport(skipped=(stage.id,))
 
-        self._spawn(claimed, stage, ctx, fingerprint)
+        if not self._spawn(claimed, stage, ctx, fingerprint):
+            return TickReport(idle=True)
         return TickReport(spawned=(stage.id,))
 
     def run_until_idle(self, *, max_ticks: int) -> TickReport:
@@ -672,9 +685,9 @@ class Dispatcher:
 
     # -- spawning and pumping a worker --------------------------------------
 
-    def _spawn(self, claimed: ClaimedJob, stage: Stage, ctx: JobContext, fingerprint: str) -> None:
+    def _spawn(self, claimed: ClaimedJob, stage: Stage, ctx: JobContext, fingerprint: str) -> bool:
         """Acquire a ``gpu_compute`` lease, spawn a worker, and block until it
-        reports a terminal message.
+        reports a terminal message. Returns whether a worker was started.
 
         Only ``gpu_compute`` exists to lease against in this phase (§3.5 of
         the design defers ``gpu_encode``/``cpu_heavy``/``net_api`` until
@@ -682,8 +695,12 @@ class Dispatcher:
         stage that does not actually need the GPU, but correct: nothing in
         the current ``Stage`` protocol carries a capability descriptor to
         decide otherwise, and a real ``requires_gpu`` gate is Phase 2's job
-        once providers exist. A refused lease defers to a later tick rather
-        than blocking.
+        once providers exist.
+
+        A refused lease defers to a later tick rather than blocking - but the
+        job has to go back on the queue for that later tick to exist at all,
+        and the caller has to be told no worker started, or ``tick`` reports
+        a spawn that never happened.
 
         Raises:
             OSError: the worker subprocess cannot be started.
@@ -693,7 +710,8 @@ class Dispatcher:
         granted = lease.__enter__()
         if not granted:
             lease.__exit__(None, None, None)
-            return
+            self._queue.requeue(claimed.job_id, available_in_s=0.0)
+            return False
 
         started = False
         try:
@@ -731,6 +749,7 @@ class Dispatcher:
             proc.stdin.close()
 
         self._pump(claimed.job_id, stage.id, fingerprint, proc, owner)
+        return True
 
     def _pump(
         self, job_id: str, stage_id: str, fingerprint: str, proc: Popen[str], owner: str

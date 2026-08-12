@@ -281,6 +281,46 @@ def test_a_cache_hit_marks_the_stage_skipped_without_spawning_a_worker(
     assert spawn_spy.calls == 0, "a cache hit must not spawn a worker"
 
 
+def test_a_claimed_job_with_nothing_ready_goes_back_to_the_queue(
+    dispatcher: Dispatcher, queue: JobQueue, db_conn: sqlite3.Connection, spawn_spy: SpawnSpy
+) -> None:
+    """Claiming and then abandoning a job parks it for the whole lease.
+
+    ``tick()`` is the only thing that claims, and it only ever claims
+    ``state = 'queued'``, so a job left ``running`` with nothing ready is
+    invisible to every dispatcher for the full 300 s lease - while the report
+    says ``idle``, i.e. "nothing to do", rather than "I just hid a job".
+    """
+    _mark_stage(db_conn, "j1", "fetch", "running")  # the only ready stage, already in flight
+    queue.requeue("j1", available_in_s=-1)
+
+    report = dispatcher.tick()
+
+    assert report.idle
+    assert spawn_spy.calls == 0
+    assert _job_state(db_conn, "j1") == "queued", "an unadvanceable claim must be released"
+
+
+def test_a_refused_lease_is_not_reported_as_a_spawn(
+    dispatcher: Dispatcher,
+    governor: Governor,
+    queue: JobQueue,
+    db_conn: sqlite3.Connection,
+    spawn_spy: SpawnSpy,
+) -> None:
+    """The refused-lease path claimed a spawn that never happened - and left
+    the job claimed, so the "later tick" it defers to could never see it."""
+    queue.requeue("j1", available_in_s=-1)
+    governor.lease("gpu_compute", "somebody-else").__enter__()  # pool now full
+
+    report = dispatcher.tick()
+
+    assert spawn_spy.calls == 0, "no worker can start while the pool is full"
+    assert report.spawned == (), "a refused lease is not a spawn"
+    assert report.idle
+    assert _job_state(db_conn, "j1") == "queued"
+
+
 def test_a_stage_commit_is_atomic(
     dispatcher: Dispatcher, db_conn: sqlite3.Connection, store: CasStore
 ) -> None:
