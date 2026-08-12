@@ -25,9 +25,12 @@ savepoint re-entrancy is what makes possible:
 4. The ``job_stages`` row flips to ``succeeded``.
 
 Steps 2 and 3 are not duplicates, and the job's retain (step 2) is released
-only when the job completes (every stage done) or is reaped (the job's
-worker died) - never by the cache, which is what keeps a cached artifact
-LRU-evictable once nothing is actively using it.
+when the job reaches a terminal state - succeeded (every stage done) *or*
+terminally failed - never by the cache, which is what keeps a cached
+artifact LRU-evictable once nothing is actively using it. Both terminal
+paths go through ``_release_job_pins``; failure has to release too, because
+``queue.fail`` is terminal and ``claim()`` matches only ``state =
+'queued'``, so nothing can ever revisit a failed job to tidy up after it.
 
 **Governor lease ownership.** Every ``gpu_compute`` lease this module
 acquires is owned by the string ``f"{job_id}:{stage_id}"`` - one stage
@@ -446,7 +449,7 @@ class Dispatcher:
         if row is None:
             return
         pipeline = self._pipeline_for(row["pipeline_id"])
-        statuses, fingerprints = self._stage_state(job_id)
+        statuses, _ = self._stage_state(job_id)
         all_ids = {stage.id for stage in pipeline.stages}
         done_ids = {sid for sid, status in statuses.items() if status.is_done}
         if done_ids != all_ids:
@@ -454,13 +457,65 @@ class Dispatcher:
             return
 
         with transaction(self._conn):
-            for fingerprint in fingerprints.values():
-                artifacts = self._artifacts.lookup(fingerprint)
-                if artifacts is None:
-                    continue
-                for artifact in artifacts:
-                    self._cas.release(artifact.digest)
+            self._release_job_pins(job_id)
             self._queue.complete(job_id)
+
+    def _release_job_pins(self, job_id: str) -> None:
+        """Drop every CAS pin this job's done stages took. Not transactional itself.
+
+        Both terminal outcomes must run this, which is the whole point of it
+        being a separate method. A job that succeeded no longer needs its
+        artifacts pinned; a job that *failed* will never run another stage, so
+        pins taken by the stages that did complete would otherwise be held by
+        nobody, forever - ``queue.fail`` is terminal and ``claim()`` matches
+        only ``state = 'queued'``, so no later tick can ever reach
+        ``_maybe_complete_job`` for that job again. Leaving them is Phase 1a's
+        "the 40 GiB ceiling is decorative" defect re-entering through the
+        job-pin door, and for a provider pipeline a failed job is the normal
+        case, not the exceptional one.
+
+        Only stages that are actually done are released: those are exactly the
+        ones ``commit_stage``/``_mark_skipped`` retained for. A stage that is
+        pending or running has no fingerprint recorded and so pinned nothing.
+
+        Callers must already hold a transaction: the release and the terminal
+        state change have to land together, or a crash between them strands
+        the pins just as badly.
+
+        Raises:
+            sqlite3.Error: a query or update fails.
+            ValidationError: a pinned digest has no row in ``cas_objects``
+                (from ``CasStore.release``) - it was recorded and then
+                force-forgotten out from under a running job.
+        """
+        statuses, fingerprints = self._stage_state(job_id)
+        for stage_id, fingerprint in fingerprints.items():
+            status = statuses.get(stage_id)
+            if status is None or not status.is_done:
+                continue
+            # C3: this must name the same digests commit_stage/_mark_skipped
+            # retained - hence lookup(fingerprint), the source of truth both
+            # of those retain from too. See the retain in commit_stage.
+            artifacts = self._artifacts.lookup(fingerprint)
+            if artifacts is None:
+                continue
+            for artifact in artifacts:
+                self._cas.release(artifact.digest)
+
+    def _fail_job(self, job_id: str, error: str) -> None:
+        """Fail a job terminally, releasing every pin its done stages took.
+
+        The single fail path: ``handle_error``'s fatal branches and the
+        attempt-cap branches all route here rather than calling
+        ``queue.fail`` directly, so that no future caller can add a fifth way
+        to fail a job that forgets the release.
+
+        Raises:
+            sqlite3.Error: a query or update fails.
+        """
+        with transaction(self._conn):
+            self._release_job_pins(job_id)
+            self._queue.fail(job_id, error)
 
     # -- reaping the dead --------------------------------------------------
 
@@ -528,7 +583,10 @@ class Dispatcher:
         one poison stage cannot spin forever. ``FATAL`` and
         ``QUOTA_EXCEEDED`` fail the job immediately - retrying either only
         delays a failure an operator needs to see, and retrying spent quota
-        cannot succeed.
+        cannot succeed. Every failing path goes through ``_fail_job``, which
+        releases the pins the job's completed stages took: ``queue.fail`` is
+        terminal, so this is the last moment anything will ever look at that
+        job.
 
         Raises:
             sqlite3.Error: a query or update fails.
@@ -548,12 +606,12 @@ class Dispatcher:
         elif error.kind is ErrorKind.RETRYABLE:
             attempts = self._bump_stage_attempts(job_id, stage_id)
             if attempts > _MAX_STAGE_ATTEMPTS:
-                self._queue.fail(job_id, error.message)
+                self._fail_job(job_id, error.message)
             else:
                 delay = min(_MAX_BACKOFF_S, _BASE_BACKOFF_S * (2 ** max(0, attempts - 1)))
                 self._queue.requeue(job_id, available_in_s=delay, error=error.message)
         else:  # FATAL, QUOTA_EXCEEDED
-            self._queue.fail(job_id, error.message)
+            self._fail_job(job_id, error.message)
 
     # -- spawning and pumping a worker --------------------------------------
 

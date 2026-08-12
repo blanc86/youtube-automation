@@ -347,6 +347,33 @@ def test_job_completion_releases_every_job_level_retain(
     assert digest in [d for d, _ in store.iter_evictable()]
 
 
+def test_a_terminally_failed_job_releases_every_pin_its_completed_stages_took(
+    dispatcher: Dispatcher, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """The mirror of the test above, and the case that actually happens.
+
+    ``queue.fail`` is terminal and ``claim()`` matches only ``state =
+    'queued'``, so a job that fails at stage 2 can never reach
+    ``_maybe_complete_job`` again - stage 1's pin would be held by nothing,
+    forever, with no repair path anywhere in the system. That is Phase 1a's
+    "the 40 GiB ceiling is decorative" defect arriving through the job-pin
+    door, and for a provider pipeline a failed job is the normal case.
+    """
+    _mark_stage(db_conn, "j1", "fetch", "running")
+    data = b"fetch output the failed job will never use"
+    digest = store.stage_file(data, kind="blob")
+    dispatcher.commit_stage(
+        "j1", "fetch", _FETCH_FINGERPRINT, [_staged(digest, size_bytes=len(data))]
+    )
+    assert store.refcount(digest) == 1, "a committed stage takes the job's in-flight pin"
+
+    dispatcher.handle_error(_error("j1", "tts", ErrorKind.FATAL, retry_after_s=None))
+
+    assert db_conn.execute("SELECT state FROM jobs WHERE id='j1'").fetchone()["state"] == "failed"
+    assert store.refcount(digest) == 0, "a terminally failed job must not strand its pins"
+    assert digest in [d for d, _ in store.iter_evictable()]
+
+
 def test_a_worker_that_staged_then_died_leaves_only_reclaimable_orphans(
     dispatcher: Dispatcher, store: CasStore, db_conn: sqlite3.Connection
 ) -> None:
