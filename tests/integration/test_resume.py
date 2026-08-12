@@ -69,6 +69,7 @@ from ytauto.core.pipeline.graph import Pipeline
 from ytauto.core.pipeline.stage import JobContext, ProgressFn, Stage, StageResult
 from ytauto.infra.artifacts import ArtifactStore
 from ytauto.infra.cas.store import CasStore
+from ytauto.infra.clock import utc_now_iso
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
 
@@ -294,6 +295,20 @@ def _job_state(conn: sqlite3.Connection, job_id: str) -> str:
     return str(row["state"])
 
 
+def _available_at(conn: sqlite3.Connection, job_id: str) -> str:
+    row = conn.execute("SELECT available_at FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    assert row is not None
+    return str(row["available_at"])
+
+
+def _stage_attempts(conn: sqlite3.Connection, job_id: str, stage_id: str) -> int:
+    row = conn.execute(
+        "SELECT attempts FROM job_stages WHERE job_id = ? AND stage_id = ?", (job_id, stage_id)
+    ).fetchone()
+    assert row is not None
+    return int(row["attempts"])
+
+
 def _run_count(counters: Path, stage_id: str) -> int:
     path = counters / f"{stage_id}.count"
     if not path.is_file():
@@ -365,6 +380,18 @@ def test_a_killed_worker_resumes_from_its_last_completed_stage(
     assert _stage_status(db_conn, job_id, "tts") != StageStatus.SUCCEEDED.value
     assert _stage_status(db_conn, job_id, "fetch") == StageStatus.SUCCEEDED.value
     assert _run_count(env, "tts") == 1, "the killed attempt should have run exactly once so far"
+
+    # The killed attempt is charged against the stage and backed off before it
+    # can be retried: a worker that dies without reporting anything usually
+    # dies the same way again, and requeueing at zero is an unbounded fork
+    # loop (dispatcher._retry_stage). A real dispatch loop simply waits;
+    # fast-forwarding here is what keeps the test from sleeping through the
+    # backoff, and asserting it first is what keeps that from hiding a
+    # regression to available_in_s=0.
+    assert _job_state(db_conn, job_id) == JobState.QUEUED.value
+    assert _stage_attempts(db_conn, job_id, "tts") == 1
+    assert _available_at(db_conn, job_id) > utc_now_iso(), "the killed stage must back off"
+    queue.requeue(job_id, available_in_s=-1)
 
     # "Restart": a brand-new Dispatcher and Governor, holding none of the
     # original's in-flight bookkeeping (no _running entry, no lease), driven

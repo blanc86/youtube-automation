@@ -598,15 +598,51 @@ class Dispatcher:
             ).fetchone()
         return int(row["attempts"]) if row is not None else 1
 
+    def _retry_stage(
+        self, job_id: str, stage_id: str, message: str, *, not_before_s: float = 0.0
+    ) -> None:
+        """Charge one attempt against a failed stage, then back off or give up.
+
+        **Every** requeue that follows a stage failure goes through here, and
+        that is the point. Two paths used to requeue without charging an
+        attempt at all: ``_pump``'s "the worker died without saying anything"
+        branch, and ``RATE_LIMITED``. Neither could ever exceed
+        ``_MAX_STAGE_ATTEMPTS``, because nothing was counting - measured with
+        a worker that ``os._exit(9)``s inside ``run()``: six spawns, the job
+        still ``queued``, ``job_stages.attempts`` still 0. A crashing worker
+        (broken provider, OOM kill, segfault in a native lib, a bad venv)
+        turned the dispatcher into a hot loop forking subprocesses at 100% CPU
+        indefinitely, and the job never failed. A provider stuck at 429 did
+        the same thing more slowly.
+
+        ``not_before_s`` is a floor, not the delay: a provider's
+        ``retry_after_s`` is an instruction to wait at least that long, so the
+        stage's own exponential backoff is applied on top and the longer of
+        the two wins. That also stops a ``retry_after_s`` of 0 - or a worker
+        that dies instantly - from requeueing at zero and spinning.
+
+        Raises:
+            sqlite3.Error: a query or update fails.
+        """
+        attempts = self._bump_stage_attempts(job_id, stage_id)
+        if attempts > _MAX_STAGE_ATTEMPTS:
+            self._fail_job(job_id, message)
+            return
+        backoff = min(_MAX_BACKOFF_S, _BASE_BACKOFF_S * (2 ** max(0, attempts - 1)))
+        self._queue.requeue(job_id, available_in_s=max(not_before_s, backoff), error=message)
+
     def handle_error(self, error: Error) -> None:
         """Route a worker's ``error`` message to the right job-level outcome.
 
-        ``RATE_LIMITED`` defers the job by exactly ``error.retry_after_s`` -
+        ``RATE_LIMITED`` defers the job by at least ``error.retry_after_s`` -
         the reason ``jobs.available_at`` exists at all (Migration 003):
-        without it, a rate limit could not be honoured, only ignored.
-        ``RETRYABLE`` backs off exponentially on the stage's own attempt
-        count and fails the job once ``_MAX_STAGE_ATTEMPTS`` is exceeded, so
-        one poison stage cannot spin forever. ``FATAL`` and
+        without it, a rate limit could not be honoured, only ignored. "At
+        least", not "exactly", because it goes through the same
+        ``_retry_stage`` accounting as everything else: a provider that never
+        stops answering 429 must eventually fail the job rather than defer it
+        forever. ``RETRYABLE`` backs off exponentially on the stage's own
+        attempt count and fails the job once ``_MAX_STAGE_ATTEMPTS`` is
+        exceeded, so one poison stage cannot spin forever. ``FATAL`` and
         ``QUOTA_EXCEEDED`` fail the job immediately - retrying either only
         delays a failure an operator needs to see, and retrying spent quota
         cannot succeed. Every failing path goes through ``_fail_job``, which
@@ -628,14 +664,9 @@ class Dispatcher:
             delay = (
                 error.retry_after_s if error.retry_after_s is not None else _DEFAULT_RETRY_AFTER_S
             )
-            self._queue.requeue(job_id, available_in_s=delay, error=error.message)
+            self._retry_stage(job_id, stage_id, error.message, not_before_s=delay)
         elif error.kind is ErrorKind.RETRYABLE:
-            attempts = self._bump_stage_attempts(job_id, stage_id)
-            if attempts > _MAX_STAGE_ATTEMPTS:
-                self._fail_job(job_id, error.message)
-            else:
-                delay = min(_MAX_BACKOFF_S, _BASE_BACKOFF_S * (2 ** max(0, attempts - 1)))
-                self._queue.requeue(job_id, available_in_s=delay, error=error.message)
+            self._retry_stage(job_id, stage_id, error.message)
         else:  # FATAL, QUOTA_EXCEEDED
             self._fail_job(job_id, error.message)
 
@@ -786,7 +817,15 @@ class Dispatcher:
         else:
             # stdout closed with no terminal message: the worker died without
             # reporting anything. Reset now rather than waiting for the job
-            # lease to expire and reap() to notice.
+            # lease to expire and reap() to notice - but charge the attempt,
+            # because a worker that dies this way dies again on the next
+            # spawn, and requeueing at zero without counting is an unbounded
+            # fork loop (see _retry_stage).
             with transaction(self._conn):
                 self._reset_stage(job_id, stage_id)
-            self._queue.requeue(job_id)
+            self._retry_stage(
+                job_id,
+                stage_id,
+                f"worker for stage {stage_id!r} exited without a terminal message "
+                f"(exit code {proc.returncode})",
+            )

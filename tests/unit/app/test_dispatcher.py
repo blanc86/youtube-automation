@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import ytauto.app.scheduler.dispatcher as dispatcher_module
-from ytauto.app.scheduler.dispatcher import Dispatcher, StagedArtifact
+from ytauto.app.scheduler.dispatcher import _MAX_STAGE_ATTEMPTS, Dispatcher, StagedArtifact
 from ytauto.app.scheduler.governor import Governor
 from ytauto.app.scheduler.queue import JobQueue
 from ytauto.app.scheduler.worker_protocol import Error
@@ -195,6 +195,18 @@ def _status(conn: sqlite3.Connection, job_id: str, stage_id: str) -> str | None:
     return str(row["status"]) if row is not None else None
 
 
+def _job_state(conn: sqlite3.Connection, job_id: str) -> str:
+    row = conn.execute("SELECT state FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return str(row["state"])
+
+
+def _stage_attempts(conn: sqlite3.Connection, job_id: str, stage_id: str) -> int:
+    row = conn.execute(
+        "SELECT attempts FROM job_stages WHERE job_id = ? AND stage_id = ?", (job_id, stage_id)
+    ).fetchone()
+    return int(row["attempts"])
+
+
 def _prerecord_stage_output(dispatcher: Dispatcher, *, job_id: str, stage_id: str) -> None:
     """Make ``stage_id`` a cache hit before ``tick()`` runs.
 
@@ -325,6 +337,64 @@ def test_a_RATE_LIMITED_error_defers_the_job_by_retry_after_s(
     row = db_conn.execute("SELECT state, available_at FROM jobs WHERE id='j1'").fetchone()
     assert row["state"] == "queued"
     assert row["available_at"] > utc_now_iso()
+
+
+def test_a_rate_limited_stage_backs_off_and_eventually_fails_the_job(
+    dispatcher: Dispatcher, db_conn: sqlite3.Connection
+) -> None:
+    """A provider stuck at 429 must not defer the same job forever.
+
+    RATE_LIMITED used to requeue without touching ``job_stages.attempts`` at
+    all, so ``_MAX_STAGE_ATTEMPTS`` could never be reached down this path -
+    and a ``retry_after_s`` of 0 requeued the job as immediately claimable,
+    which is a spin, not a retry.
+    """
+    for attempt in range(1, _MAX_STAGE_ATTEMPTS + 1):
+        dispatcher.handle_error(_error("j1", "tts", ErrorKind.RATE_LIMITED, retry_after_s=0.0))
+        row = db_conn.execute("SELECT state, available_at FROM jobs WHERE id='j1'").fetchone()
+        assert row["state"] == "queued"
+        assert row["available_at"] > utc_now_iso(), "a retry must back off, never requeue at zero"
+        assert _stage_attempts(db_conn, "j1", "tts") == attempt
+
+    dispatcher.handle_error(_error("j1", "tts", ErrorKind.RATE_LIMITED, retry_after_s=0.0))
+
+    assert _job_state(db_conn, "j1") == "failed"
+
+
+def test_a_worker_that_dies_without_a_terminal_message_is_not_respawned_forever(
+    dispatcher: Dispatcher,
+    spawn_spy: SpawnSpy,
+    queue: JobQueue,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """The hot loop: a worker that crashes before saying anything.
+
+    ``_pump``'s "no terminal message" branch reset the stage and requeued at
+    ``available_in_s=0`` without ever charging an attempt, and
+    ``_MAX_STAGE_ATTEMPTS`` was checked only in ``handle_error``'s RETRYABLE
+    branch. Measured against a worker that ``os._exit(9)``s inside ``run()``:
+    six spawns, the job still ``queued``, ``job_stages.attempts`` still 0 -
+    an unbounded fork loop at 100% CPU for any broken provider, OOM kill,
+    native segfault or bad venv.
+
+    ``SpawnSpy`` hands back a process that has already exited with empty
+    stdout, which is exactly what the pump sees in that case. The backoff is
+    fast-forwarded between ticks so the test does not have to sleep through
+    it; the assertion is that the spawns are *bounded*, not that they are
+    fast.
+    """
+    queue.requeue("j1", available_in_s=-1)  # undo the fixture's baseline claim
+    _mark_stage(db_conn, "j1", "tts", "pending")
+
+    for _ in range(_MAX_STAGE_ATTEMPTS + 3):
+        dispatcher.tick()
+        if _job_state(db_conn, "j1") == "queued":
+            queue.requeue("j1", available_in_s=-1)
+
+    assert spawn_spy.calls == _MAX_STAGE_ATTEMPTS + 1, "the respawn loop must be bounded"
+    assert _job_state(db_conn, "j1") == "failed"
+    assert _stage_attempts(db_conn, "j1", "fetch") == _MAX_STAGE_ATTEMPTS + 1
+    assert db_conn.execute("SELECT last_error FROM jobs WHERE id='j1'").fetchone()["last_error"]
 
 
 def test_a_FATAL_error_fails_the_job_without_requeueing(
