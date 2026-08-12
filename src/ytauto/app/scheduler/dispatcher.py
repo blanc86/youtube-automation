@@ -415,13 +415,32 @@ class Dispatcher:
 
     def _maybe_complete_job(self, job_id: str) -> None:
         """Mark the job succeeded and release every job-level retain once
-        every one of its stages is done.
+        every one of its stages is done; otherwise return it to the queue so
+        the *next* ready stage can be claimed.
+
+        Task 14 found this the hard way: ``claim()`` only ever matches
+        ``state = 'queued'`` (see ``queue.py``'s module docstring on why a
+        deferred read-then-write there would be unsafe), and nothing before
+        this fix ever put a job back into that state between one stage's
+        commit and the next. A job claimed once therefore stayed ``running``
+        forever after its first stage - a second ``tick()`` call found
+        nothing to claim and reported ``idle`` despite a ready "tts" stage
+        sitting right there in ``job_stages``. Requeuing with
+        ``available_in_s=0`` (immediately claimable) on every non-terminal
+        stage commit is what makes a multi-stage job actually finish; it also
+        means any dispatcher, not necessarily this one, may claim the next
+        stage, which is the correct behaviour for a horizontally-scaled
+        deployment and no different in spirit from a fresh worker picking up
+        a stage after a crash.
 
         Reads the job's own pipeline to know the full stage set - a job with
         a subset of its stages done is not finished, and a done-set that
         somehow contained an id outside the pipeline (should never happen)
         must not be mistaken for completion either, hence exact equality
         rather than a subset check.
+
+        Raises:
+            sqlite3.Error: a query or write fails.
         """
         row = self._conn.execute("SELECT pipeline_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if row is None:
@@ -431,6 +450,7 @@ class Dispatcher:
         all_ids = {stage.id for stage in pipeline.stages}
         done_ids = {sid for sid, status in statuses.items() if status.is_done}
         if done_ids != all_ids:
+            self._queue.requeue(job_id, available_in_s=0.0)
             return
 
         with transaction(self._conn):
