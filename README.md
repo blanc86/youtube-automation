@@ -7,6 +7,12 @@ Shorts and landscape formats — without supervision. Built for batch operation:
 Windows desktop app, Python 3.12 + PySide6. The engine core is Qt-free and runs
 headless; the GUI is a client of it, not the other way round.
 
+**Windows is the primary target; macOS and Linux work for development.** The
+engine, the tests and the quality gate are all cross-platform, and CI runs on
+Windows and macOS. The parts that are genuinely Windows-first are the GPU
+encoder path (`h264_nvenc`, with `h264_qsv` and `libx264` fallbacks that work
+everywhere) and eventual packaging.
+
 **Status:** Phase 1a complete (domain models, pipeline DAG, content-addressed
 store, fingerprint cache). Phase 1b in progress (job queue, resource governor,
 worker subprocesses, dispatcher). No video comes out the far end yet — that's
@@ -23,13 +29,20 @@ you about.
 git clone https://github.com/blanc86/youtube-automation.git
 cd youtube-automation
 python -m venv .venv
-.venv\Scripts\pip install -e ".[dev]"
 ```
 
-Then ask the app what's missing:
+Then, on **Windows**:
 
 ```bash
+.venv\Scripts\pip install -e ".[dev]"
 .venv\Scripts\ytauto doctor
+```
+
+On **macOS or Linux**:
+
+```bash
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/ytauto doctor
 ```
 
 `doctor` is the onboarding path — it checks nine things (Python, data
@@ -40,8 +53,10 @@ environment without crashing on one.
 
 ### What `doctor` will probably ask you for
 
-**ffmpeg** (with `ffprobe` beside it) — not bundled. Put it on `PATH`, or point
-`YTAUTO_FFMPEG_DIR` at the directory containing the binaries:
+**ffmpeg** (with `ffprobe` beside it) — not bundled. On macOS, `brew install
+ffmpeg`; on Debian/Ubuntu, `apt install ffmpeg`; on Windows, download a build and
+either put it on `PATH` or point `YTAUTO_FFMPEG_DIR` at the directory holding the
+binaries:
 
 ```bash
 set YTAUTO_FFMPEG_DIR=C:\ffmpeg\bin
@@ -57,11 +72,15 @@ You do **not** need any API keys yet. Providers land in Phase 2.
 
 ## Running the checks
 
-One command runs everything CI runs:
+One command runs everything CI runs, on any platform:
 
 ```bash
-powershell -ExecutionPolicy Bypass -File scripts/check.ps1
+python scripts/check.py
 ```
+
+There are `scripts/check.ps1` and `scripts/check.sh` wrappers if you prefer, but
+they only delegate to that one file — deliberately, so Windows and macOS cannot
+drift apart.
 
 That's ruff (lint), ruff format, mypy `--strict`, import-linter, then pytest —
 unit and integration as separate steps. It prints `ALL CHECKS PASSED` or fails.
@@ -100,6 +119,8 @@ layering `ui → app → core` holds. Breaking one fails CI.
 - `docs/superpowers/phase-1a-carry-forward.md` — what the last phase learned,
   including the traps the current phase has to avoid. Short and worth it.
 - `CONTRIBUTING.md` — how work actually gets done here.
+- `docs/EXTENDING.md` — how to add a feature without colliding with anyone.
+- `docs/CONTRIBUTOR-TASKS.md` — work that is ready to pick up, each self-contained.
 
 ---
 

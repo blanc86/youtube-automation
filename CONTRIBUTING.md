@@ -12,7 +12,7 @@ git checkout master
 git pull
 git checkout -b <phase-or-feature-name>
 # work, commit as you go
-powershell -ExecutionPolicy Bypass -File scripts/check.ps1   # must pass
+python scripts/check.py          # must pass, on any platform
 git push -u origin <your-branch>
 ```
 
@@ -25,16 +25,37 @@ obvious from the diff. Several commits here are worth reading as examples.
 
 ## The quality gate
 
-`scripts/check.ps1` runs, in order: ruff, ruff format, mypy `--strict`,
-import-linter, pytest unit, pytest integration. All of it must pass.
+`python scripts/check.py` runs, in order: ruff, ruff format, mypy `--strict`,
+import-linter, pytest unit, pytest integration. All of it must pass. It is one
+file, shared by Windows, macOS, Linux and CI — `check.ps1` and `check.sh` are
+three-line wrappers around it, and CI calls it directly.
 
-Run `.venv\Scripts\python -m ruff format src tests` before the gate — formatting
-is checked, not applied.
+That is deliberate. CI used to list the steps itself and drifted from the local
+script, losing `ruff format --check` — so unformatted code could reach `master`.
+One copy, no drift.
 
-A note on that script: for eight tasks in Phase 0 it printed `ALL CHECKS PASSED`
-while only actually running import-linter, because `$ErrorActionPreference` does
-not apply to native executable exit codes in PowerShell 5.1. If you add a step
-to it, **demonstrate the new step failing before you trust it.**
+Run `python -m ruff format src tests` before the gate — formatting is checked,
+not applied.
+
+Two things encoded in that script are worth knowing before you touch it. For
+eight tasks in Phase 0 the gate printed `ALL CHECKS PASSED` while running only
+import-linter, because `$ErrorActionPreference` does not apply to native exit
+codes in PowerShell 5.1. The fix attempt then used `python -m importlinter.cli`,
+which exits 0 printing nothing because that module has no `__main__` guard — a
+second silently-passing gate, caught only because someone tried to make it fail.
+
+**If you add a step, demonstrate it failing before you trust it.**
+
+## Working on macOS or Linux
+
+Everything except the eventual GPU encode path is cross-platform, and CI runs
+Windows and macOS on every push. Use `.venv/bin/...` where the docs say
+`.venv\Scripts\...`, and `python scripts/check.py` for the gate.
+
+`ytauto doctor` will report `libx264` rather than `h264_nvenc` for the encoder
+and no NVIDIA GPU. That is expected and not an error — the render pipeline is
+designed with that fallback. If `doctor` is otherwise green you have a working
+development environment.
 
 ## Architecture rules the build enforces
 

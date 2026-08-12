@@ -2,17 +2,44 @@ name: CI
 on: [push, pull_request]
 
 jobs:
-  check:
-    runs-on: windows-latest
+  gate:
+    # Both platforms run the SAME gate script. Windows is the primary target;
+    # macOS is here because a contributor works there, and an untested platform
+    # is an unsupported one no matter what the README claims.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      # One step, invoking the same script developers run locally. Listing the
-      # gates here separately let CI drift from scripts/check.ps1 - it was
-      # missing `ruff format --check`, so unformatted code could reach main.
+      # One step, invoking the same gate developers run locally. Listing the
+      # gates here separately let CI drift from the script - it was missing
+      # `ruff format --check`, so unformatted code could reach master. The gate
+      # lives in scripts/check.py precisely so there is exactly one copy of it,
+      # shared by every platform and by CI.
       - name: gate
-        shell: pwsh
-        run: ./scripts/check.ps1
+        run: python scripts/check.py
+
+  # Aggregator. Branch protection requires a status check named `check`, and a
+  # matrix job reports as `gate (windows-latest)` / `gate (macos-latest)` - names
+  # that would never match, leaving every PR blocked forever on a check that does
+  # not exist. This job keeps the stable name and turns red if any leg fails.
+  # `if: always()` is required: without it the job is skipped when a leg fails,
+  # and a skipped required check blocks the PR instead of failing it.
+  check:
+    needs: gate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify every platform passed
+        run: |
+          if [ "${{ needs.gate.result }}" != "success" ]; then
+            echo "gate failed on at least one platform: ${{ needs.gate.result }}"
+            exit 1
+          fi
+          echo "all platforms passed"
