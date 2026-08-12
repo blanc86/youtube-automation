@@ -1,6 +1,7 @@
 import io
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,8 @@ from ytauto.infra.artifacts import ArtifactStore
 from ytauto.infra.cas.eviction import EvictionPolicy, Evictor
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.clock import utc_now_iso
-from ytauto.infra.db.engine import transaction
+from ytauto.infra.db.engine import connect, transaction
+from ytauto.infra.db.migrations import apply_migrations
 
 # db_conn is defined in tests/unit/conftest.py.
 
@@ -583,3 +585,105 @@ def test_a_worker_that_staged_then_died_leaves_only_reclaimable_orphans(
     report = Evictor(store, EvictionPolicy(max_bytes=1)).sweep_orphans(min_age_s=0)
     assert report.orphan_blobs == 1
     assert not store.path_for(digest).is_file()
+
+
+# ---------------------------------------------------------------------------
+# The job-completion release is a read-then-write (_stage_state and lookup
+# SELECT, then release UPDATEs), so it needs the same immediate=True the
+# queue's claim() needed and for the same reason - see queue.py's module
+# docstring, and tests/unit/app/test_queue.py for the two-connection prior
+# art this fixture copies. Every other test in this file uses one connection
+# and so cannot exercise the race at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def two_connections(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, sqlite3.Connection]]:
+    """Two live connections to the same migrated database file.
+
+    The contender's busy_timeout=0 makes it fail fast rather than mask the
+    result by waiting.
+    """
+    db = tmp_path / "two.db"
+    conn_a = connect(db)
+    apply_migrations(conn_a)
+    conn_b = connect(db)
+    conn_b.execute("PRAGMA busy_timeout=0")
+    try:
+        yield conn_a, conn_b
+    finally:
+        conn_b.close()
+        conn_a.close()
+
+
+def _record_succeeded_stage(
+    conn: sqlite3.Connection, job_id: str, stage_id: str, fingerprint: str
+) -> None:
+    now = utc_now_iso()
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO job_stages "
+            "(job_id, stage_id, status, fingerprint, started_at, finished_at) "
+            "VALUES (?, ?, 'succeeded', ?, ?, ?)",
+            (job_id, stage_id, fingerprint, now, now),
+        )
+
+
+def test_completing_a_job_survives_a_writer_committing_mid_release(
+    two_connections: tuple[sqlite3.Connection, sqlite3.Connection], tmp_path: Path
+) -> None:
+    """A deferred transaction takes its read snapshot at the first SELECT.
+
+    If another connection commits before the release's UPDATE runs, SQLite
+    refuses to upgrade that stale snapshot to a writer -
+    SQLITE_BUSY_SNAPSHOT, returned immediately without the busy handler ever
+    running, so busy_timeout does not help and the caller sees "database is
+    locked". immediate=True takes the write lock at BEGIN, before any read,
+    so there is no snapshot to invalidate and the contender simply loses.
+
+    The interleave is forced rather than raced: the contender fires from
+    inside the first ``lookup`` the release performs, which is after
+    ``_stage_state``'s SELECT and before ``release``'s UPDATE.
+    """
+    conn_a, conn_b = two_connections
+    cas = CasStore(root=tmp_path / "cas-two", conn=conn_a)
+    artifacts = ArtifactStore(cas, conn_a)
+    queue = JobQueue(conn_a)
+    dispatcher = Dispatcher(
+        conn_a,
+        cas,
+        artifacts,
+        Governor(),
+        queue,
+        pipelines={_SOLO_PIPELINE_ID: _solo_pipeline()},
+    )
+
+    queue.enqueue("solo", "p1", _SOLO_PIPELINE_ID)
+    queue.claim("owner", lease_s=60)
+    digest = cas.put_bytes(b"solo output", kind="blob")
+    artifacts.record(
+        _SOLO_FINGERPRINT, "only", [ArtifactRef(name="out", kind="blob", digest=digest)]
+    )
+    cas.retain(digest)  # the job's in-flight pin, as commit_stage would have taken it
+    _record_succeeded_stage(conn_a, "solo", "only", _SOLO_FINGERPRINT)
+
+    real_lookup = artifacts.lookup
+    fired: list[str] = []
+
+    def racing_lookup(fingerprint: str) -> tuple[ArtifactRef, ...] | None:
+        found = real_lookup(fingerprint)
+        if not fired:
+            fired.append(fingerprint)
+            with suppress(sqlite3.OperationalError):
+                conn_b.execute("BEGIN IMMEDIATE")
+                conn_b.execute("UPDATE jobs SET priority = priority + 1 WHERE id = 'solo'")
+                conn_b.execute("COMMIT")
+        return found
+
+    artifacts.lookup = racing_lookup  # type: ignore[method-assign]
+
+    dispatcher._maybe_complete_job("solo")
+
+    assert fired, "the contender never ran; the interleave did not happen"
+    assert _job_state(conn_a, "solo") == "succeeded"
+    assert cas.refcount(digest) == 0

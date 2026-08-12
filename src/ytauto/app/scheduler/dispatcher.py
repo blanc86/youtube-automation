@@ -521,7 +521,13 @@ class Dispatcher:
             self._queue.requeue(job_id, available_in_s=0.0)
             return
 
-        with transaction(self._conn):
+        # immediate=True: _release_job_pins SELECTs (_stage_state, lookup)
+        # before it UPDATEs (release), which is the read-then-write shape a
+        # deferred BEGIN cannot survive. In WAL, upgrading a stale read
+        # snapshot to a writer returns SQLITE_BUSY_SNAPSHOT immediately,
+        # without the busy handler ever running, so busy_timeout does not
+        # apply - reproduced here as "database is locked".
+        with transaction(self._conn, immediate=True):
             self._release_job_pins(job_id)
             self._queue.complete(job_id)
 
@@ -582,7 +588,9 @@ class Dispatcher:
         Raises:
             sqlite3.Error: a query or update fails.
         """
-        with transaction(self._conn):
+        # immediate=True for the same reason as _maybe_complete_job's: this
+        # is the identical read-then-write over the same rows.
+        with transaction(self._conn, immediate=True):
             self._release_job_pins(job_id)
             self._queue.fail(job_id, error)
 
