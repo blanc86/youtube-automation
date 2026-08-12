@@ -1716,9 +1716,13 @@ Assert every stage in the second run is `SKIPPED` and each fake stage's executio
 
 - [ ] **Step 4: Prove criterion 2 catches what criterion 1 misses**
 
-Revert Task 5's sort in `StageResult`. Expected: **the resume test still PASSES** while the twice-run test FAILS with stage 3 re-executing. That contrast is the whole justification for having two criteria — paste both outputs. Restore.
+> **Corrected after execution.** This step originally said to revert Task 5's `StageResult` sort and expect the twice-run test to fail while resume passed. That does not reproduce, and the reason is architectural rather than a missing guard: `dispatcher.py` always sources a stage's inputs through `gather_inputs` → `ArtifactStore.lookup` → `ORDER BY name ASC`, so no path exists where a stage receives inputs from an in-memory `StageResult`. The fresh and cached paths are the same code path, and the ordering drift the Phase 1a review found is structurally impossible here — reverting *both* ordering sorts leaves every integration test green. Task 5's sort and Task 12's `build_spec` sort are defence in depth, worth keeping against a future dispatcher that short-circuits the re-read for performance, but neither is what criterion 2 exercises.
 
-If the resume test *also* fails, say so: it would mean the drift is observable from a resume after all, and this plan's reasoning is wrong.
+Disable **only** the dispatcher's cache probe — in `dispatcher.py`, replace `cached = self._artifacts.lookup(fingerprint)` with `cached = None`, leaving `gather_inputs` untouched. Expected: **the resume test still PASSES** while the twice-run test FAILS with all three stages re-executed instead of `SKIPPED`. Paste both outputs. Restore.
+
+That contrast is the real justification for having two criteria. Criterion 1 skips a completed stage because `job_stages.status` already says SUCCEEDED — resume via job state, which never consults the cache at all. Criterion 2 runs a **second job** with its own empty `job_stages`, so every stage must skip on a fingerprint match alone. That is the mechanism behind cheap iteration and cross-project dedup, and criterion 1 cannot reach it.
+
+Do **not** try to prove this by disabling `ArtifactStore.lookup` outright: that also breaks input gathering, so both tests fail for an unrelated reason and the contrast is destroyed.
 
 - [ ] **Step 5: Full gate, doctor, commit**
 

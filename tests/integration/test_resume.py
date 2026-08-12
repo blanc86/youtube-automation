@@ -409,10 +409,32 @@ def test_running_the_same_job_twice_hits_the_cache_on_every_stage(
     queue: JobQueue,
     env: Path,
 ) -> None:
-    """Criterion 1 cannot catch artifact-order drift: killed in stage 2 and
-    resuming at stage 2, stage 3 was never cached, so the drift is invisible.
-    Run the whole job twice and every stage must be a cache hit, with no
-    downstream stage re-running."""
+    """The fingerprint cache delivers hits across a *different* job.
+
+    This is the half criterion 1 cannot reach. There, one job is killed and
+    restarted, and its completed stage is skipped because ``job_stages.status``
+    already says SUCCEEDED - resume via job state, which never consults the
+    cache at all. Here a second job with its own empty ``job_stages`` must skip
+    every stage purely on a fingerprint match, which is the mechanism behind
+    cheap iteration and cross-project dedup.
+
+    Note the assertion is on SKIPPED rather than SUCCEEDED: SKIPPED means the
+    cache answered, SUCCEEDED means the stage ran.
+
+    Proven distinct by disabling only the dispatcher's cache probe
+    (``dispatcher.py``'s ``cached = self._artifacts.lookup(fingerprint)``,
+    leaving ``gather_inputs`` intact): criterion 1 still passes, this test fails
+    with all three stages re-executed. Disabling ``lookup`` outright is NOT a
+    valid proof - it also breaks input gathering, so both tests fail for an
+    unrelated reason.
+
+    An earlier version of this docstring claimed the test guards against
+    artifact-order drift between the fresh and cached paths. That was wrong:
+    the dispatcher always sources inputs through ``gather_inputs`` ->
+    ``lookup`` -> ORDER BY name ASC, so both paths are the same code path and
+    that drift cannot occur here. Reverting both ordering sorts leaves every
+    integration test green.
+    """
     pipeline = _pipeline()
     dispatcher = Dispatcher(
         db_conn, cas, artifacts, Governor(), queue, pipelines={_PIPELINE_ID: pipeline}
