@@ -6,7 +6,7 @@ import pytest
 
 from ytauto.app.scheduler.runner import RunnerContext, build_spec, gather_inputs, run_stage
 from ytauto.app.scheduler.worker_protocol import Error, Result
-from ytauto.core.errors import ErrorKind, ProviderError
+from ytauto.core.errors import ErrorKind, ProviderError, ValidationError
 from ytauto.core.models.artifact import ArtifactRef
 from ytauto.core.models.content_hash import hash_bytes
 from ytauto.core.pipeline.fingerprint import compute_fingerprint
@@ -136,6 +136,28 @@ def _ctx(**overrides: object) -> RunnerContext:
         job_id=job_id,
         correlation_id=correlation_id,
     )
+
+
+def test_a_RunnerContext_whose_two_job_ids_disagree_is_refused() -> None:
+    """``job_id`` is duplicated on purpose (a protocol message needs it
+    without reaching through the domain object), and two sources of truth for
+    one value is a footgun - so the two are checked to agree rather than
+    trusted to. Every protocol message a worker sends is addressed with
+    ``RunnerContext.job_id``, so a mismatch would file a stage's result and
+    its errors under a job that never ran it."""
+    job = JobContext(job_id="j1", project_id="p1", settings={}, inputs={}, workdir=Path("/tmp/j1"))
+
+    with pytest.raises(ValidationError, match="does not match"):
+        RunnerContext(job=job, job_id="j2", correlation_id="c1")
+
+
+def test_a_RunnerContext_whose_job_ids_agree_is_accepted() -> None:
+    """The contrast that keeps the guard above from passing vacuously."""
+    job = JobContext(job_id="j1", project_id="p1", settings={}, inputs={}, workdir=Path("/tmp/j1"))
+
+    ctx = RunnerContext(job=job, job_id="j1", correlation_id="c1")
+
+    assert ctx.job_id == ctx.job.job_id == "j1"
 
 
 def test_gather_inputs_collects_every_upstream_stage(
