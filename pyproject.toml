@@ -33,6 +33,22 @@ testpaths = ["tests"]
 # scripts/check.ps1 runs them as a separate, explicitly gated step.
 addopts = "-q --strict-markers -m 'not integration'"
 markers = ["integration: requires real external binaries"]
+# A leaked pipe or file handle is a real defect here: the dispatcher spawns
+# worker subprocesses, and Popen does not close its pipe objects when the child
+# exits. That leak shipped once already and the gate did not notice.
+#
+# BOTH entries are required, and this was verified rather than assumed. The leak
+# surfaces when the garbage collector finalises the pipe, which makes it an
+# *unraisable* exception - pytest wraps that in PytestUnraisableExceptionWarning,
+# a class that is not a ResourceWarning, so promoting ResourceWarning alone
+# catches nothing. Measured against a deliberately reintroduced leak:
+# error::ResourceWarning alone -> suite still passes; adding the unraisable
+# entry -> the suite fails. A gate that does not gate is this project's oldest
+# recurring bug; do not drop either line without re-running that check.
+filterwarnings = [
+    "error::ResourceWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 
 [tool.ruff]
 line-length = 100
