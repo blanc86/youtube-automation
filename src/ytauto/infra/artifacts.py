@@ -158,8 +158,17 @@ class ArtifactStore:
         integrity violation from some future constraint is re-raised rather than
         silently reported as a cache hit.
 
-        Must be called outside an open transaction: the INSERTs run in an
-        ``immediate=True`` transaction, which is still refused when nested.
+        Composes inside a caller's already-open transaction (Task 13's
+        dispatcher does exactly this, nesting ``record`` between
+        ``CasStore.record_blob``/``retain`` and the ``job_stages`` update so all
+        four land atomically): when ``self._conn.in_transaction`` is already
+        true, the INSERTs run in a plain savepoint instead of requesting
+        ``immediate=True``, which ``transaction()`` refuses to honour once
+        nested anyway. That downgrade is safe rather than a silent weakening -
+        the outer transaction already holds whatever write lock it needs by
+        the time this runs, so there is no snapshot left to go stale. Called
+        with no transaction already open (every existing caller), behaviour is
+        unchanged: ``immediate=True``, exactly as before.
 
         Raises:
             ValidationError: if ``fingerprint`` is malformed, ``stage_id`` is
@@ -167,9 +176,8 @@ class ArtifactStore:
                 a name, or a referenced blob is absent from the CAS. Every one
                 of those is checked pre-flight, before anything is written.
             sqlite3.OperationalError: if the write lock cannot be acquired
-                within ``busy_timeout`` (legitimate contention).
-            TransactionError: if a transaction is already open on the
-                connection.
+                within ``busy_timeout`` (legitimate contention) - only
+                reachable when this call is the outermost transaction.
             sqlite3.IntegrityError: if an INSERT violates a constraint other
                 than the primary-key collision described above - today
                 unreachable, since the primary key is this table's only
@@ -204,7 +212,7 @@ class ArtifactStore:
 
         now = utc_now_iso()
         try:
-            with transaction(self._conn, immediate=True):
+            with transaction(self._conn, immediate=not self._conn.in_transaction):
                 for artifact in artifacts:
                     self._conn.execute(
                         "INSERT INTO artifacts "

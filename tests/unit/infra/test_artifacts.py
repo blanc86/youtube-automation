@@ -407,6 +407,23 @@ def test_lookup_is_safe_inside_an_open_transaction(
     assert db_conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
 
 
+def test_record_composes_inside_an_open_transaction(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """Task 13's whole point: the dispatcher commits record_blob + retain +
+    ArtifactStore.record + the job_stages update as one transaction. Before
+    this fix record()'s own unconditional immediate=True made that impossible
+    - nesting it inside any already-open transaction raised TransactionError,
+    even though the outer BEGIN IMMEDIATE already held the write lock record()
+    was trying to protect."""
+    ref = _put(store, "narration", b"audio")
+
+    with transaction(db_conn, immediate=True):
+        assert artifacts.record(FP, "tts", [ref]) is True
+
+    assert artifacts.lookup(FP) == (ref,)
+
+
 def test_a_partially_vanished_set_is_a_miss(artifacts: ArtifactStore, store: CasStore) -> None:
     """One missing artifact invalidates the whole stage output, not just itself."""
     narration = _put(store, "narration", b"audio")
