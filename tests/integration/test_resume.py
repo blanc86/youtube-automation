@@ -52,6 +52,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -226,12 +227,14 @@ def _pipeline() -> Pipeline:
 
 
 @pytest.fixture()
-def db_conn(tmp_path: Path) -> sqlite3.Connection:
+def db_conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     """A migrated database. Closed on teardown so Windows can delete tmp_path."""
     conn = connect(tmp_path / "t.db")
     apply_migrations(conn)
-    yield conn
-    conn.close()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 @pytest.fixture()
