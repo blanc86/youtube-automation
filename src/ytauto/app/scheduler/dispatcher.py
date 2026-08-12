@@ -631,6 +631,19 @@ class Dispatcher:
         type/version (``decode`` returning ``None``) is silently skipped -
         version skew, not a bug.
 
+        ``proc.stdout``/``proc.stderr`` are explicitly closed in ``finally``
+        - ``Popen`` never closes its pipe file objects on its own once the
+        process exits, only on GC, and Task 14 is what first exercises this
+        method against real OS pipes rather than the unit suite's
+        ``io.StringIO`` doubles, where the leak is invisible. ``stderr`` is
+        never read here: a worker that writes enough to it while nothing
+        drains the pipe could in principle block waiting for buffer space
+        while this method blocks waiting for it via ``proc.wait()`` - today's
+        synthetic stages never write enough to trigger it, but a future
+        provider stage logging verbosely to stderr could. Flagged for Phase 2
+        rather than fixed here: closing it safely dead requires draining it
+        concurrently with stdout, a larger change than this task's scope.
+
         Raises:
             Nothing itself. Exceptions from ``commit_stage``/``handle_error``
             propagate.
@@ -673,6 +686,10 @@ class Dispatcher:
                 proc.kill()
                 proc.wait()
         finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
             self._governor.release_all(owner)
             self._running.pop(owner, None)
 
