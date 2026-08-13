@@ -59,11 +59,13 @@ import json
 import sqlite3
 import subprocess
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import Popen
+from typing import IO
 
 from ytauto.app.scheduler.governor import Governor
 from ytauto.app.scheduler.queue import ClaimedJob, JobQueue
@@ -87,6 +89,8 @@ from ytauto.infra.clock import utc_now_iso
 from ytauto.infra.db.engine import transaction
 
 _DEFAULT_JOB_LEASE_S = 300.0
+_DEFAULT_PUMP_DEADLINE_S = 1800.0
+"""Bounds a worker that writes nothing to stdout and never exits - see _pump."""
 _DEFAULT_RETRY_AFTER_S = 60.0
 _BASE_BACKOFF_S = 5.0
 _MAX_BACKOFF_S = 3600.0
@@ -235,6 +239,7 @@ class Dispatcher:
         pipelines: Mapping[str, Pipeline],
         owner: str = "dispatcher",
         job_lease_s: float = _DEFAULT_JOB_LEASE_S,
+        pump_deadline_s: float = _DEFAULT_PUMP_DEADLINE_S,
     ) -> None:
         # Must be the exact connection `cas`/`artifacts`/`queue` were
         # themselves constructed with - the module docstring's "one
@@ -250,6 +255,7 @@ class Dispatcher:
         self._pipelines: dict[str, Pipeline] = dict(pipelines)
         self._owner = owner
         self._job_lease_s = job_lease_s
+        self._pump_deadline_s = pump_deadline_s
         self._running: dict[str, Popen[str]] = {}
 
     # -- planning -----------------------------------------------------
@@ -748,6 +754,7 @@ class Dispatcher:
             return False
 
         started = False
+        stderr_file: IO[bytes] | None = None
         try:
             ctx.workdir.mkdir(parents=True, exist_ok=True)
             now = utc_now_iso()
@@ -767,11 +774,19 @@ class Dispatcher:
             # there), and doing it after Popen would leave a live worker
             # blocked forever on a stdin that is never written.
             payload = json.dumps(assignment)
+            # A worker's stderr goes to a per-attempt file, never a pipe: see
+            # _pump's docstring for why 60 KB there once deadlocked this
+            # method permanently, and ffmpeg - Phase 2a's first real stderr
+            # writer - routinely logs far more than that. A file has no OS
+            # buffer to fill, so there is nothing left to drain concurrently.
+            log_path = ctx.workdir / f"stderr.attempt-{claimed.attempts}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_file = log_path.open("wb")
             proc = Popen(
                 [sys.executable, "-m", "ytauto.app.worker"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=stderr_file,
                 text=True,
                 # Explicit, never the host locale. text=True alone decodes
                 # with the locale codec - cp1252 on a typical Windows box,
@@ -796,12 +811,27 @@ class Dispatcher:
             if not started:
                 self._running.pop(owner, None)
                 self._governor.release_all(owner)
+                # _pump takes ownership of stderr_file only once a worker
+                # actually starts (the `started` path below). Every path that
+                # leaves this method without reaching that hand-off - a
+                # failed Popen, an exception before it - must close the
+                # handle itself, or the ResourceWarning gate (pyproject.toml)
+                # fails the whole suite, possibly in an unrelated test.
+                if stderr_file is not None:
+                    stderr_file.close()
 
-        self._pump(claimed.job_id, stage.id, fingerprint, proc, owner)
+        assert stderr_file is not None, "started=True implies stderr_file was opened"
+        self._pump(claimed.job_id, stage.id, fingerprint, proc, owner, stderr_file)
         return True
 
     def _pump(
-        self, job_id: str, stage_id: str, fingerprint: str, proc: Popen[str], owner: str
+        self,
+        job_id: str,
+        stage_id: str,
+        fingerprint: str,
+        proc: Popen[str],
+        owner: str,
+        stderr_file: IO[bytes],
     ) -> None:
         """Read one worker's stdout until a terminal message, then settle it.
 
@@ -814,18 +844,38 @@ class Dispatcher:
         type/version (``decode`` returning ``None``) is silently skipped -
         version skew, not a bug.
 
-        ``proc.stdout``/``proc.stderr`` are explicitly closed in ``finally``
-        - ``Popen`` never closes its pipe file objects on its own once the
-        process exits, only on GC, and Task 14 is what first exercises this
-        method against real OS pipes rather than the unit suite's
-        ``io.StringIO`` doubles, where the leak is invisible. ``stderr`` is
-        never read here: a worker that writes enough to it while nothing
-        drains the pipe could in principle block waiting for buffer space
-        while this method blocks waiting for it via ``proc.wait()`` - today's
-        synthetic stages never write enough to trigger it, but a future
-        provider stage logging verbosely to stderr could. Flagged for Phase 2
-        rather than fixed here: closing it safely dead requires draining it
-        concurrently with stdout, a larger change than this task's scope.
+        ``stderr_file`` is the per-attempt log ``_spawn`` opened and pointed
+        the worker's stderr at - never a pipe. 60 KB of worker stderr was
+        measured to deadlock this method permanently: nothing drained the
+        stderr pipe concurrently with the stdout loop above, so a worker
+        that filled the OS pipe buffer writing to stderr blocked on that
+        write forever, while this method blocked forever reading stdout -
+        and ffmpeg, Phase 2a's first real stderr writer, clears 60 KB in
+        seconds under ordinary logging. A file has no OS buffer to fill, so
+        there is nothing left to drain. ``_spawn`` hands this method
+        ownership of the handle only once a worker actually starts; it is
+        closed here, in ``finally``, exactly once - every other path closes
+        it in ``_spawn`` itself, since this method is never reached.
+
+        A worker that writes nothing and never exits is a second, independent
+        way to hang forever: the stdout loop above blocks on ``for raw_line
+        in stdout`` with no timeout of its own, and the 60 KB fix does
+        nothing for a worker that never writes anything at all. ``watchdog``,
+        a ``threading.Timer`` armed for ``pump_deadline_s`` before the read
+        loop starts, bounds that: killing the process closes its stdout,
+        which ends the loop above through its ordinary EOF path with no
+        change to the loop itself. A reader-thread-plus-queue redesign would
+        also work but restructures that read loop; the watchdog does not and
+        is the smaller change. ``timed_out`` records which of the two ways
+        this method's "no terminal message" branch was reached, so a retried
+        stage's ``last_error`` names the real cause instead of always
+        claiming a clean exit.
+
+        ``proc.stdout`` is explicitly closed in ``finally`` - ``Popen`` never
+        closes its pipe file objects on its own once the process exits, only
+        on GC, and Task 14 is what first exercises this method against real
+        OS pipes rather than the unit suite's ``io.StringIO`` doubles, where
+        the leak is invisible.
 
         Raises:
             Nothing itself. Exceptions from ``commit_stage``/``handle_error``
@@ -834,6 +884,15 @@ class Dispatcher:
         staged: list[Staged] = []
         result: Result | None = None
         error: Error | None = None
+        timed_out = False
+
+        def _kill_on_deadline() -> None:
+            nonlocal timed_out
+            timed_out = True
+            proc.kill()
+
+        watchdog = threading.Timer(self._pump_deadline_s, _kill_on_deadline)
+        watchdog.start()
         try:
             stdout = proc.stdout
             if stdout is not None:
@@ -869,10 +928,10 @@ class Dispatcher:
                 proc.kill()
                 proc.wait()
         finally:
+            watchdog.cancel()
             if proc.stdout is not None:
                 proc.stdout.close()
-            if proc.stderr is not None:
-                proc.stderr.close()
+            stderr_file.close()
             self._governor.release_all(owner)
             self._running.pop(owner, None)
 
@@ -884,16 +943,20 @@ class Dispatcher:
             self.handle_error(error)
         else:
             # stdout closed with no terminal message: the worker died without
-            # reporting anything. Reset now rather than waiting for the job
-            # lease to expire and reap() to notice - but charge the attempt,
-            # because a worker that dies this way dies again on the next
-            # spawn, and requeueing at zero without counting is an unbounded
-            # fork loop (see _retry_stage).
+            # reporting anything, or the watchdog killed it. Reset now rather
+            # than waiting for the job lease to expire and reap() to notice -
+            # but charge the attempt, because a worker that dies this way
+            # dies again on the next spawn, and requeueing at zero without
+            # counting is an unbounded fork loop (see _retry_stage).
+            reason = (
+                f"exceeded the {self._pump_deadline_s}s pump deadline and was killed"
+                if timed_out
+                else f"exited without a terminal message (exit code {proc.returncode})"
+            )
             with transaction(self._conn):
                 self._reset_stage(job_id, stage_id)
             self._retry_stage(
                 job_id,
                 stage_id,
-                f"worker for stage {stage_id!r} exited without a terminal message "
-                f"(exit code {proc.returncode})",
+                f"worker for stage {stage_id!r} {reason}",
             )

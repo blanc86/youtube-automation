@@ -1,5 +1,8 @@
 import io
+import os
 import sqlite3
+import subprocess
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import suppress
 from pathlib import Path
@@ -137,6 +140,69 @@ class DeadOnArrivalSpawnSpy(SpawnSpy):
         return proc
 
 
+class _NeverExitingProcess:
+    """A subprocess.Popen double whose stdout blocks forever until killed.
+
+    Backed by a genuine OS pipe (``os.pipe()``), not ``io.StringIO``: an
+    empty ``StringIO`` reaches EOF immediately, which cannot exercise the
+    blocking read the pump deadline (Step 5's test) needs to interrupt. The
+    pipe's write end is never closed by anything except ``kill()`` - a silent,
+    immortal worker - so ``_pump``'s ``for raw_line in stdout`` loop stays
+    blocked until something calls it, exactly the way killing a real worker
+    closes its real stdout pipe and ends the loop through its ordinary EOF
+    path.
+    """
+
+    def __init__(self) -> None:
+        self.pid = -1
+        self.returncode: int | None = None
+        read_fd, self._write_fd = os.pipe()
+        self.stdin: io.StringIO = io.StringIO()
+        self.stdout: io.TextIOWrapper | None = io.TextIOWrapper(
+            io.FileIO(read_fd, "rb"), encoding="utf-8"
+        )
+        self.stderr: io.StringIO | None = io.StringIO("")
+        self._exited = threading.Event()
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._exited.wait(timeout=timeout):
+            raise subprocess.TimeoutExpired(cmd="never-exiting", timeout=timeout or 0)
+        assert self.returncode is not None
+        return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        if self._exited.is_set():
+            return
+        self.returncode = -9
+        os.close(self._write_fd)
+        self._exited.set()
+
+    def terminate(self) -> None:
+        self.kill()
+
+
+class NeverExitingSpawnSpy:
+    """Replaces subprocess.Popen with a worker that writes nothing and never
+    exits - the case the pump deadline (not the stderr-file fix) bounds.
+
+    Not a SpawnSpy subclass: SpawnSpy.__call__ is typed to return
+    _FakeProcess, and this needs to return an unrelated double.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.processes: list[_NeverExitingProcess] = []
+
+    def __call__(self, argv: Sequence[str], **kwargs: object) -> _NeverExitingProcess:
+        self.calls += 1
+        proc = _NeverExitingProcess()
+        self.processes.append(proc)
+        return proc
+
+
 @pytest.fixture()
 def store(tmp_path: Path, db_conn: sqlite3.Connection) -> CasStore:
     """A CasStore sharing the migrated connection from ``db_conn``."""
@@ -213,6 +279,51 @@ def _status(conn: sqlite3.Connection, job_id: str, stage_id: str) -> str | None:
         "SELECT status FROM job_stages WHERE job_id = ? AND stage_id = ?", (job_id, stage_id)
     ).fetchone()
     return str(row["status"]) if row is not None else None
+
+
+def _dispatcher(
+    conn: sqlite3.Connection, tmp_path: Path, *, pump_deadline_s: float = 1800.0
+) -> Dispatcher:
+    """Build a fresh Dispatcher over the two-stage test pipeline, with nothing
+    enqueued yet.
+
+    Unlike the ``dispatcher`` fixture (pre-wired with "j1" already claimed and
+    its "tts" stage running - the baseline every reap()-focused test needs),
+    this starts from an empty queue so a test can control both what gets
+    enqueued and pump_deadline_s, which the fixture has no way to override.
+    """
+    store = CasStore(root=tmp_path / "cas", conn=conn)
+    artifacts = ArtifactStore(store, conn)
+    governor = Governor()
+    queue = JobQueue(conn)
+    return Dispatcher(
+        conn,
+        store,
+        artifacts,
+        governor,
+        queue,
+        pipelines={_TEST_PIPELINE_ID: _test_pipeline(), _SOLO_PIPELINE_ID: _solo_pipeline()},
+        pump_deadline_s=pump_deadline_s,
+    )
+
+
+def _enqueue(
+    conn: sqlite3.Connection, job_id: str, *, stages: tuple[str, ...] = ("fetch", "tts")
+) -> None:
+    """Enqueue a fresh job against ``_test_pipeline()`` (fetch -> tts).
+
+    ``stages`` documents which stage(s) the calling test actually drives; the
+    pipeline itself is always the fixed fetch->tts one, so passing a
+    different tuple does not change what runs - it exists for readability at
+    call sites.
+    """
+    JobQueue(conn).enqueue(job_id, "p1", _TEST_PIPELINE_ID)
+
+
+def _job_last_error(conn: sqlite3.Connection, job_id: str) -> str:
+    row = conn.execute("SELECT last_error FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    last_error = row["last_error"]
+    return str(last_error) if last_error is not None else ""
 
 
 def _job_state(conn: sqlite3.Connection, job_id: str) -> str:
@@ -499,6 +610,34 @@ def test_a_worker_that_dies_without_a_terminal_message_is_not_respawned_forever(
     assert _job_state(db_conn, "j1") == "failed"
     assert _stage_attempts(db_conn, "j1", "fetch") == _MAX_STAGE_ATTEMPTS + 1
     assert db_conn.execute("SELECT last_error FROM jobs WHERE id='j1'").fetchone()["last_error"]
+
+
+def test_a_worker_that_never_exits_is_killed_by_the_pump_deadline(
+    db_conn: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A silent, immortal worker must not hang the dispatcher forever.
+
+    The stderr-to-file fix (this task's other half) does nothing for this
+    case: a worker that writes nothing at all to either pipe and never exits
+    still blocks ``_pump``'s ``for raw_line in stdout`` forever, since that
+    loop has no timeout of its own. Only the watchdog bounds it.
+
+    ``NeverExitingSpawnSpy`` hands back a process backed by a genuine OS pipe
+    whose write end nothing closes except its own ``kill()`` - see
+    ``_NeverExitingProcess`` for why ``io.StringIO`` (the rest of this file's
+    doubles) cannot exercise a blocking read at all.
+    """
+    spy = NeverExitingSpawnSpy()
+    monkeypatch.setattr(dispatcher_module, "Popen", spy)
+    dispatcher = _dispatcher(db_conn, tmp_path, pump_deadline_s=0.2)
+    _enqueue(db_conn, "j1", stages=("fetch",))
+
+    report = dispatcher.tick()
+
+    assert report.spawned == ("fetch",)
+    assert _status(db_conn, "j1", "fetch") == "pending", "a timed-out stage must reset"
+    assert _stage_attempts(db_conn, "j1", "fetch") == 1, "a deadline kill must charge an attempt"
+    assert "deadline" in _job_last_error(db_conn, "j1")
 
 
 def test_a_FATAL_error_fails_the_job_without_requeueing(
