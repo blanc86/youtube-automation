@@ -31,6 +31,19 @@ def _linear() -> Pipeline:
     )
 
 
+def _diamond() -> Pipeline:
+    """a -> b, a -> c, (b, c) -> d."""
+    return Pipeline(
+        id="p",
+        stages=(
+            FakeStage("a"),
+            FakeStage("b", ("a",)),
+            FakeStage("c", ("a",)),
+            FakeStage("d", ("b", "c")),
+        ),
+    )
+
+
 def test_topological_order_respects_dependencies() -> None:
     assert [s.id for s in _linear().topological_order()] == ["ingest", "rewrite", "tts"]
 
@@ -168,3 +181,44 @@ def test_downstream_across_a_diamond_reaches_the_join() -> None:
 def test_downstream_rejects_an_unknown_stage() -> None:
     with pytest.raises(ValidationError, match="nope"):
         _linear().downstream_of("nope")
+
+
+def test_ready_stages_with_nothing_done_returns_the_roots() -> None:
+    p = _diamond()  # a -> b, a -> c, (b, c) -> d
+    assert [s.id for s in p.ready_stages(frozenset())] == ["a"]
+
+
+def test_ready_stages_returns_independent_stages_together() -> None:
+    """The parallelism the governor needs to see. topological_order() flattens
+    b and c into an arbitrary sequence and cannot reveal they are independent."""
+    p = _diamond()
+    assert [s.id for s in p.ready_stages(frozenset({"a"}))] == ["b", "c"]
+
+
+def test_a_stage_is_not_ready_until_every_dependency_is_done() -> None:
+    p = _diamond()
+    assert [s.id for s in p.ready_stages(frozenset({"a", "b"}))] == ["c"]
+    assert [s.id for s in p.ready_stages(frozenset({"a", "b", "c"}))] == ["d"]
+
+
+def test_a_done_stage_is_never_ready_again() -> None:
+    p = _diamond()
+    assert p.ready_stages(frozenset({"a", "b", "c", "d"})) == ()
+
+
+def test_ready_stages_is_ordered_by_id() -> None:
+    """Deterministic, so a dispatcher's choice under capacity pressure is
+    reproducible across runs."""
+    p = _diamond()
+    assert [s.id for s in p.ready_stages(frozenset({"a"}))] == sorted(["c", "b"])
+
+
+def test_upstream_of_is_transitive() -> None:
+    p = _diamond()
+    assert p.upstream_of("d") == frozenset({"a", "b", "c"})
+    assert p.upstream_of("a") == frozenset()
+
+
+def test_upstream_of_rejects_an_unknown_stage() -> None:
+    with pytest.raises(ValidationError, match="unknown stage"):
+        _diamond().upstream_of("nope")

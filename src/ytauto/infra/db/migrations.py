@@ -100,7 +100,7 @@ _M003 = Migration(
         "ALTER TABLE jobs ADD COLUMN available_at TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE job_stages ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
         "DROP INDEX idx_jobs_claimable",
-        "CREATE INDEX idx_jobs_claimable ON jobs (state, available_at, priority DESC, created_at)",
+        "CREATE INDEX idx_jobs_claimable ON jobs (state, priority DESC, created_at, available_at)",
     ),
 )
 

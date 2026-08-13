@@ -4,8 +4,13 @@ import pytest
 
 from ytauto.core.errors import ValidationError
 from ytauto.core.models.artifact import ArtifactRef
+from ytauto.core.pipeline.fingerprint import FingerprintSpec, compute_fingerprint
+from ytauto.core.pipeline.stage import StageResult
 from ytauto.infra.artifacts import ArtifactStore
+from ytauto.infra.cas.eviction import EvictionPolicy, Evictor
 from ytauto.infra.cas.store import CasStore
+from ytauto.infra.clock import utc_now_iso
+from ytauto.infra.db.engine import transaction
 
 FP = "f" * 64
 
@@ -101,12 +106,55 @@ def test_lookup_returns_several_artifacts_in_name_order(
     assert [a.name for a in artifacts.lookup(FP) or ()] == ["narration", "timings"]
 
 
-def test_record_retains_each_digest_once(artifacts: ArtifactStore, store: CasStore) -> None:
-    """Retaining is what stops the evictor deleting a cached stage output."""
+def test_declaration_order_and_cached_order_produce_one_fingerprint(
+    artifacts: ArtifactStore, store: CasStore
+) -> None:
+    """The regression the whole-branch review found: a downstream stage must
+    fingerprint identically whether its inputs came fresh from StageResult or
+    back from the cache."""
+    timings = _put(store, "timings", b"json")
+    narration = _put(store, "narration", b"audio")
+    fresh = StageResult(artifacts=(timings, narration), meta={}).artifacts
+    artifacts.record(FP, "tts", list(fresh))
+    cached = artifacts.lookup(FP) or ()
+
+    def downstream(arts: tuple[ArtifactRef, ...]) -> str:
+        return compute_fingerprint(
+            FingerprintSpec(
+                stage_id="render",
+                stage_version=1,
+                provider_id="ffmpeg",
+                provider_version="7.1",
+                input_digests=tuple((a.name, a.digest) for a in arts),
+                settings={},
+            )
+        )
+
+    assert downstream(fresh) == downstream(cached)
+
+
+def test_recording_does_not_pin_the_blob(artifacts: ArtifactStore, store: CasStore) -> None:
+    """The cache must not pin. A cached blob that nothing else holds has to stay
+    evictable, or the disk ceiling stops being enforceable and the evictor's only
+    remaining candidates become the outputs of running stages."""
     ref = _put(store, "narration", b"audio")
-    assert store.refcount(ref.digest) == 0
     artifacts.record(FP, "tts", [ref])
-    assert store.refcount(ref.digest) == 1
+    assert store.refcount(ref.digest) == 0
+    assert [d for d, _ in store.iter_evictable()] == [ref.digest]
+
+
+def test_a_cached_artifact_is_evictable_and_the_ceiling_is_enforced(
+    artifacts: ArtifactStore, store: CasStore
+) -> None:
+    """Direct regression test for carry-forward 1.1."""
+    ref = _put(store, "narration", b"x" * 1000)
+    artifacts.record(FP, "tts", [ref])
+
+    report = Evictor(store, EvictionPolicy(max_bytes=1)).run()
+
+    assert report.evicted == 1
+    assert not store.exists(ref.digest)
+    assert artifacts.lookup(FP) is None, "an aged-out entry is a miss, not a hit"
 
 
 def test_recording_the_same_fingerprint_twice_is_idempotent(
@@ -115,29 +163,57 @@ def test_recording_the_same_fingerprint_twice_is_idempotent(
     """A crash-resume re-records a completed stage's fingerprint. Without the
     already-recorded check that second call would hit PRIMARY KEY
     (fingerprint, name) and kill the worker on every resume; the check converts
-    it into the documented False. It is not what keeps refcounts symmetric -
-    the primary key rejects the duplicate INSERT before the retain loop runs
-    again either way."""
+    it into the documented False. The rows it already wrote must survive that
+    second call untouched - False means "already cached", not "rewritten"."""
     ref = _put(store, "narration", b"audio")
     assert artifacts.record(FP, "tts", [ref]) is True
     assert artifacts.record(FP, "tts", [ref]) is False
-    assert store.refcount(ref.digest) == 1
+    assert artifacts.lookup(FP) == (ref,)
 
 
-def test_forget_releases_and_removes(artifacts: ArtifactStore, store: CasStore) -> None:
+def test_forget_removes_the_rows(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
     ref = _put(store, "narration", b"audio")
     artifacts.record(FP, "tts", [ref])
     artifacts.forget(FP)
     assert artifacts.lookup(FP) is None
-    assert store.refcount(ref.digest) == 0
+    assert _row_count(db_conn, FP) == 0
 
 
-def test_forget_is_idempotent(artifacts: ArtifactStore, store: CasStore) -> None:
+def test_forget_does_not_release(artifacts: ArtifactStore, store: CasStore) -> None:
+    """Symmetry: record() no longer retains, so forget() must not release, or
+    it would drive the refcount below what other holders expect."""
+    ref = _put(store, "narration", b"audio")
+    store.retain(ref.digest)  # a job pins it
+    artifacts.record(FP, "tts", [ref])
+    artifacts.forget(FP)
+    assert store.refcount(ref.digest) == 1, "the job's pin must survive forget()"
+
+
+def test_forget_clears_an_entry_whose_blobs_were_evicted(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """forget() cannot decide on lookup() alone: an entry whose blobs were aged
+    out reads as a miss but still has rows. Without the raw row check it would
+    return early and leave those rows behind for good."""
+    ref = _put(store, "narration", b"audio")
+    artifacts.record(FP, "tts", [ref])
+    store.path_for(ref.digest).unlink()
+
+    artifacts.forget(FP)
+
+    assert _row_count(db_conn, FP) == 0
+
+
+def test_forget_is_idempotent(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
     ref = _put(store, "narration", b"audio")
     artifacts.record(FP, "tts", [ref])
     artifacts.forget(FP)
     artifacts.forget(FP)
-    assert store.refcount(ref.digest) == 0
+    assert _row_count(db_conn, FP) == 0
 
 
 def test_recording_no_artifacts_is_rejected(artifacts: ArtifactStore) -> None:
@@ -199,14 +275,15 @@ def test_record_returns_false_when_a_concurrent_writer_won_the_race(
     between - normal, since cross-project dedup means shared fingerprints are
     expected. Monkeypatching lookup to miss reproduces the loser's stale
     pre-commit snapshot deterministically, without threads. The loser must
-    return False, not raise, and must not retain: the winner holds the pin."""
+    return False rather than raise, and - like the winner - must leave the blob
+    unpinned."""
     ref = _put(store, "narration", b"audio")
     assert artifacts.record(FP, "tts", [ref]) is True
 
     monkeypatch.setattr(artifacts, "lookup", lambda fingerprint: None)
 
     assert artifacts.record(FP, "tts", [ref]) is False
-    assert store.refcount(ref.digest) == 1, "the loser must not retain a second time"
+    assert store.refcount(ref.digest) == 0, "neither writer may pin the blob"
 
 
 def test_an_integrity_error_that_is_not_a_collision_is_re_raised(
@@ -248,10 +325,11 @@ def test_a_failure_inside_the_insert_loop_rolls_back_the_whole_batch(
 def test_forget_tolerates_a_blob_whose_cas_row_already_vanished(
     artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
 ) -> None:
-    """forget() commits its row deletes before releasing, so a release that
-    raises leaves the caller with 'rows gone, blobs half-released' behind an
-    exception that reads as 'bad input, nothing happened'. A missing
-    cas_objects row is the end state forget() wants anyway, so it is tolerated."""
+    """forget() touches the index and nothing else, so a fingerprint whose
+    cas_objects row is already gone is not a special case - there is no release
+    to fail. This pins that: reintroducing a release loop would make forget()
+    raise ValidationError here, reporting 'bad input, nothing happened' for a
+    call that had already deleted the rows."""
     ref = _put(store, "narration", b"audio")
     artifacts.record(FP, "tts", [ref])
     db_conn.execute("DELETE FROM cas_objects WHERE hash = ?", (ref.digest,))
@@ -272,9 +350,10 @@ def test_recording_with_a_blank_stage_id_is_rejected(
 
 
 def test_lookup_treats_a_vanished_blob_as_a_miss(artifacts: ArtifactStore, store: CasStore) -> None:
-    """record() commits rows before retaining blobs, so a crash in that window
-    leaves rows pointing at evictable blobs. Reporting a hit for artifacts that
-    no longer exist would make the scheduler skip a stage whose output is gone."""
+    """The cache pins nothing it records, so a cached blob is an ordinary
+    eviction candidate and its rows routinely outlive it. Reporting a hit for
+    artifacts that no longer exist would make the scheduler skip a stage whose
+    output is gone."""
     ref = _put(store, "narration", b"audio")
     artifacts.record(FP, "tts", [ref])
     store.path_for(ref.digest).unlink()
@@ -282,21 +361,67 @@ def test_lookup_treats_a_vanished_blob_as_a_miss(artifacts: ArtifactStore, store
     assert artifacts.lookup(FP) is None
 
 
-def test_lookup_drops_the_stale_rows_it_finds(
+def test_lookup_does_not_delete_stale_rows(
     artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
 ) -> None:
-    """Self-healing: a miss caused by a vanished blob must not be re-detected
-    on every subsequent lookup."""
+    """lookup() must be a pure read so the scheduler can probe the cache while
+    holding a claim. It still reports a MISS - only the DELETE moves out."""
     ref = _put(store, "narration", b"audio")
     artifacts.record(FP, "tts", [ref])
     store.path_for(ref.digest).unlink()
 
-    artifacts.lookup(FP)
+    assert artifacts.lookup(FP) is None, "a vanished blob is still a miss"
+    assert _row_count(db_conn, FP) == 1, "but the row must survive the read"
 
-    remaining = db_conn.execute(
-        "SELECT count(*) FROM artifacts WHERE fingerprint = ?", (FP,)
-    ).fetchone()[0]
-    assert remaining == 0
+
+def test_heal_reclaims_what_lookup_left_behind(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    ref = _put(store, "narration", b"audio")
+    artifacts.record(FP, "tts", [ref])
+    store.path_for(ref.digest).unlink()
+
+    assert artifacts.heal() == 1
+    assert _row_count(db_conn, FP) == 0
+    assert artifacts.heal() == 0, "idempotent"
+
+
+def test_lookup_is_safe_inside_an_open_transaction(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """The scheduler claims a job and probes the cache in one transaction. Before
+    this change the probe's self-healing DELETE took a write lock and rolled the
+    caller's claim back."""
+    ref = _put(store, "narration", b"audio")
+    artifacts.record(FP, "tts", [ref])
+    store.path_for(ref.digest).unlink()
+
+    with transaction(db_conn, immediate=True):
+        db_conn.execute(
+            "INSERT INTO jobs (id, project_id, pipeline_id, state, "
+            "created_at, updated_at) VALUES ('j1','p1','pipe','running',?,?)",
+            (utc_now_iso(), utc_now_iso()),
+        )
+        assert artifacts.lookup(FP) is None
+
+    assert db_conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+
+
+def test_record_composes_inside_an_open_transaction(
+    artifacts: ArtifactStore, store: CasStore, db_conn: sqlite3.Connection
+) -> None:
+    """Task 13's whole point: the dispatcher commits record_blob + retain +
+    ArtifactStore.record + the job_stages update as one transaction. Before
+    this fix record()'s own unconditional immediate=True made that impossible
+    - nesting it inside any already-open transaction raised TransactionError,
+    even though the outer BEGIN IMMEDIATE already held the write lock record()
+    was trying to protect."""
+    ref = _put(store, "narration", b"audio")
+
+    with transaction(db_conn, immediate=True):
+        assert artifacts.record(FP, "tts", [ref]) is True
+
+    assert artifacts.lookup(FP) == (ref,)
 
 
 def test_a_partially_vanished_set_is_a_miss(artifacts: ArtifactStore, store: CasStore) -> None:

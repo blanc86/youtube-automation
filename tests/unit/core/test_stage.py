@@ -4,12 +4,17 @@ import pytest
 
 from ytauto.core.errors import ValidationError
 from ytauto.core.models.artifact import ArtifactRef
-from ytauto.core.models.content_hash import hash_bytes
+from ytauto.core.models.content_hash import ContentHash, hash_bytes
 from ytauto.core.pipeline.stage import JobContext, Stage, StageResult
 
 
 def _ref(name: str) -> ArtifactRef:
     return ArtifactRef(name=name, kind="blob", digest=hash_bytes(name.encode()))
+
+
+@pytest.fixture()
+def fake_digest() -> ContentHash:
+    return hash_bytes(b"fake")
 
 
 def _ctx(**overrides: object) -> JobContext:
@@ -51,6 +56,32 @@ def test_result_exposes_a_named_artifact() -> None:
 def test_result_rejects_duplicate_artifact_names() -> None:
     with pytest.raises(ValidationError, match="duplicate"):
         StageResult(artifacts=(_ref("narration"), _ref("narration")))
+
+
+def test_artifacts_are_sorted_by_name(fake_digest: ContentHash) -> None:
+    """Declaration order must equal name order, because ArtifactStore.lookup
+    returns name order and a stage's fresh and cached paths must agree."""
+    result = StageResult(
+        artifacts=(
+            ArtifactRef(name="timings", kind="blob", digest=fake_digest),
+            ArtifactRef(name="narration", kind="blob", digest=fake_digest),
+        ),
+        meta={},
+    )
+    assert [a.name for a in result.artifacts] == ["narration", "timings"]
+
+
+def test_a_stage_declaring_reverse_order_still_round_trips(fake_digest: ContentHash) -> None:
+    """The property that matters: whatever order the stage declared, the tuple
+    matches what a later lookup() will hand back."""
+    declared = StageResult(
+        artifacts=(
+            ArtifactRef(name="zulu", kind="blob", digest=fake_digest),
+            ArtifactRef(name="alpha", kind="blob", digest=fake_digest),
+        ),
+        meta={},
+    )
+    assert [a.name for a in declared.artifacts] == sorted(a.name for a in declared.artifacts)
 
 
 def test_missing_result_artifact_raises() -> None:

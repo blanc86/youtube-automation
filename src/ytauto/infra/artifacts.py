@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from ytauto.core.errors import ValidationError
 from ytauto.core.models.artifact import ArtifactRef
 from ytauto.core.models.content_hash import ContentHash, validate_digest
+from ytauto.core.models.names import assert_unique_names
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.clock import utc_now_iso
 from ytauto.infra.db.engine import transaction
@@ -39,22 +40,19 @@ class ArtifactStore:
         """Return the artifacts recorded for this fingerprint, or None on a miss.
 
         A recorded fingerprint whose blobs are no longer in the store counts as
-        a miss, and its stale rows are dropped. This is what makes the cache
-        safe: ``record`` commits rows before it retains blobs (see the class
-        docstring), so a crash in that window can leave rows pointing at
-        evictable blobs. Reporting a hit for artifacts that no longer exist
-        would make the scheduler skip a stage whose output is gone.
+        a miss. The cache pins nothing it records, so a cached blob is an
+        ordinary eviction candidate and being aged out is an expected miss, not
+        corruption. Reporting a hit for artifacts that no longer exist would
+        make the scheduler skip a stage whose output is gone.
 
-        Must be called outside an open transaction: the self-healing path opens
-        its own, and ``transaction`` is not re-entrant.
+        Detecting those stale rows is all this does with them; reclaiming them
+        is ``heal``'s job. The split is deliberate and load-bearing: this stays
+        a pure read, so the scheduler can probe the cache from inside the same
+        transaction that claims a job. A self-healing DELETE here would take a
+        write lock on the caller's connection and roll that claim back.
 
         Raises:
             ValidationError: if ``fingerprint`` is malformed.
-            sqlite3.OperationalError: if the self-healing delete cannot acquire
-                the write lock within ``busy_timeout`` (legitimate contention).
-            TransactionError: if a transaction is already open on the
-                connection. Note this is reachable from a method that reads as a
-                pure query - the self-healing path takes a write lock.
         """
         self._validate_fingerprint(fingerprint)
         rows = self._conn.execute(
@@ -71,48 +69,56 @@ class ArtifactStore:
         if all(self._cas.exists(artifact.digest) for artifact in found):
             return found
 
-        self._drop_rows(fingerprint)
         return None
 
+    def heal(self) -> int:
+        """Drop rows whose blobs are gone. Returns the number of fingerprints cleared.
+
+        ``lookup`` deliberately does not do this: it must stay a pure read so the
+        scheduler can probe the cache while holding a job claim. Detection lives
+        there, reclamation lives here, and the split is why a cache probe cannot
+        take a write lock.
+
+        Raises:
+            sqlite3.OperationalError: if the delete cannot acquire the write lock
+                within ``busy_timeout`` (legitimate contention).
+            TransactionError: if ``immediate=True`` is requested inside an open
+                transaction - do not call this from inside a claim.
+        """
+        rows = self._conn.execute("SELECT DISTINCT fingerprint FROM artifacts").fetchall()
+        stale = [
+            row["fingerprint"]
+            for row in rows
+            if not all(
+                self._cas.exists(ContentHash(a["digest"]))
+                for a in self._conn.execute(
+                    "SELECT digest FROM artifacts WHERE fingerprint = ?", (row["fingerprint"],)
+                )
+            )
+        ]
+        for fingerprint in stale:
+            self._drop_rows(fingerprint)
+        return len(stale)
+
     def _drop_rows(self, fingerprint: str) -> None:
-        """Delete a fingerprint's rows without releasing blobs.
+        """Delete a fingerprint's rows without touching blob refcounts.
 
-        Used when the blobs are already gone, so releasing would drive
-        refcounts below what the remaining holders expect.
-
-        Not releasing is right for one of the two callers and lossy for the
-        other, and the rows alone cannot tell them apart:
-
-        - Crash window (``record`` committed rows, then died before retaining):
-          no retain ever happened, so releasing would push the refcount below
-          what other holders expect. Dropping the rows is exactly correct.
-        - Retained-then-vanished (``record`` completed, the blob file was later
-          lost): the +1 from ``retain`` is still on the ``cas_objects`` row and
-          this path strands it - a refcount above zero with no holder, which
-          makes the blob permanently unevictable.
-
-        The stranded count is normally reclaimed by
-        ``CasStore.forget_rows_without_files()`` (driven by
-        ``Evictor.sweep_orphans``), which deletes the whole row, refcount
-        included. That reclamation is lost if identical content is re-stored
-        before the sweep runs: ``put_bytes``'s ``ON CONFLICT DO UPDATE`` touches
-        only ``last_accessed_at``, so the phantom +1 survives forever.
-
-        Telling the two branches apart needs a ``retained`` marker column, an
-        append-only migration that belongs with the Phase 1b savepoint work
-        (carry-forward 1.2) that makes ``record`` atomic and dissolves this
-        whole class of window.
+        There is no pin to release: the cache does not retain what it records,
+        so every refcount on one of these blobs belongs to somebody else - a
+        project asset, or an in-flight job holding what it consumes. Releasing
+        here would drive those below what their holders expect.
         """
         with transaction(self._conn, immediate=True):
             self._conn.execute("DELETE FROM artifacts WHERE fingerprint = ?", (fingerprint,))
 
     def _has_rows(self, fingerprint: str) -> bool:
-        """Whether any row exists for this fingerprint, without self-healing.
+        """Whether any row exists for this fingerprint, regardless of its blobs.
 
         ``lookup`` cannot answer this question: it treats a row whose blob is
-        gone as a miss and deletes it. This is the raw table state, which is what
-        distinguishes a concurrent writer's committed rows from an integrity
-        violation that has nothing to do with the primary key.
+        gone as a miss. This is the raw table state, which is what distinguishes
+        a concurrent writer's committed rows from an integrity violation that has
+        nothing to do with the primary key, and a stale entry ``forget`` must
+        still clear from a fingerprint that was never recorded at all.
         """
         row = self._conn.execute(
             "SELECT 1 FROM artifacts WHERE fingerprint = ? LIMIT 1", (fingerprint,)
@@ -120,18 +126,26 @@ class ArtifactStore:
         return row is not None
 
     def record(self, fingerprint: str, stage_id: str, artifacts: Sequence[ArtifactRef]) -> bool:
-        """Store the artifacts for a fingerprint and retain their blobs.
+        """Index the artifacts a fingerprint produced. The blobs are not pinned.
 
         Returns True on a first write, False if this fingerprint was already
         recorded.
 
-        The already-recorded check buys idempotence, not refcount protection.
-        ``PRIMARY KEY (fingerprint, name)`` rejects the duplicate INSERT before
-        the retain loop below can run a second time, so refcounts stay symmetric
-        with or without the check. What it converts is the failure mode: a
-        crash-resume re-executing a completed stage would otherwise take an
-        ``IntegrityError`` and kill the worker on every single resume. The guard
-        turns that would-be primary-key violation into the documented False.
+        Recording deliberately does not ``retain``. A cache entry is not a
+        holder: it says "these bytes were produced by this stage", not "somebody
+        needs these bytes now". Pinning here put every cached blob permanently
+        beyond ``iter_evictable``'s ``WHERE refcount = 0``, which stopped the
+        disk ceiling being enforceable and left the evictor with nothing to
+        choose from but the outputs of running stages. In-flight protection
+        belongs to the job, which retains what it consumes and releases when it
+        finishes or is reaped; an entry whose blob was aged out in the meantime
+        is a miss, which ``lookup`` already reports.
+
+        The already-recorded check buys idempotence: a crash-resume
+        re-executing a completed stage would otherwise take an
+        ``IntegrityError`` from ``PRIMARY KEY (fingerprint, name)`` and kill the
+        worker on every single resume. The guard turns that would-be primary-key
+        violation into the documented False.
 
         The same violation is also reachable legitimately. The check reads in
         one transaction and the INSERT runs in another with no lock held across
@@ -142,24 +156,28 @@ class ArtifactStore:
         contract, so it is caught and reported as False - but only after
         confirming rows for this fingerprint actually exist, so that an
         integrity violation from some future constraint is re-raised rather than
-        silently reported as a cache hit. The loser must not retain: the winner
-        already did, and a second retain would be the inflation this docstring
-        used to wrongly claim the check prevents.
+        silently reported as a cache hit.
 
-        Must be called outside an open transaction: it opens its own, and
-        ``transaction`` is not re-entrant.
+        Composes inside a caller's already-open transaction (Task 13's
+        dispatcher does exactly this, nesting ``record`` between
+        ``CasStore.record_blob``/``retain`` and the ``job_stages`` update so all
+        four land atomically): when ``self._conn.in_transaction`` is already
+        true, the INSERTs run in a plain savepoint instead of requesting
+        ``immediate=True``, which ``transaction()`` refuses to honour once
+        nested anyway. That downgrade is safe rather than a silent weakening -
+        the outer transaction already holds whatever write lock it needs by
+        the time this runs, so there is no snapshot left to go stale. Called
+        with no transaction already open (every existing caller), behaviour is
+        unchanged: ``immediate=True``, exactly as before.
 
         Raises:
             ValidationError: if ``fingerprint`` is malformed, ``stage_id`` is
                 blank, ``artifacts`` is empty, two artifacts in the batch share
-                a name, or a referenced blob is absent from the CAS. The last is
-                also raised late, from ``retain`` after the rows are committed,
-                for a blob whose file is present but whose ``cas_objects`` row
-                is not - the orphan state the eviction sweep exists to reclaim.
+                a name, or a referenced blob is absent from the CAS. Every one
+                of those is checked pre-flight, before anything is written.
             sqlite3.OperationalError: if the write lock cannot be acquired
-                within ``busy_timeout`` (legitimate contention).
-            TransactionError: if a transaction is already open on the
-                connection.
+                within ``busy_timeout`` (legitimate contention) - only
+                reachable when this call is the outermost transaction.
             sqlite3.IntegrityError: if an INSERT violates a constraint other
                 than the primary-key collision described above - today
                 unreachable, since the primary key is this table's only
@@ -176,13 +194,11 @@ class ArtifactStore:
         # collision below) reporting False for it would silently swallow a
         # caller bug. It has to be caught here, before any write, so the
         # IntegrityError handler never sees it.
-        seen: set[str] = set()
-        for artifact in artifacts:
-            if artifact.name in seen:
-                raise ValidationError(
-                    f"duplicate artifact name in one batch for {fingerprint}: {artifact.name!r}"
-                )
-            seen.add(artifact.name)
+        assert_unique_names(
+            (artifact.name for artifact in artifacts),
+            what="artifact",
+            context=f"one batch for {fingerprint}",
+        )
 
         for artifact in artifacts:
             if not self._cas.exists(artifact.digest):
@@ -196,7 +212,7 @@ class ArtifactStore:
 
         now = utc_now_iso()
         try:
-            with transaction(self._conn, immediate=True):
+            with transaction(self._conn, immediate=not self._conn.in_transaction):
                 for artifact in artifacts:
                     self._conn.execute(
                         "INSERT INTO artifacts "
@@ -218,56 +234,40 @@ class ArtifactStore:
             # standing assumption, verify it: a later migration adding a CHECK or
             # FOREIGN KEY would otherwise turn this handler into a silent
             # swallower of real errors. Ask the table directly instead of calling
-            # lookup(), whose self-healing path would report a miss (and delete
-            # the winner's rows) if the blobs had since vanished.
+            # lookup(), which would report a miss - and so re-raise as if nothing
+            # had been written - if the winner's blobs had since been evicted.
             if not self._has_rows(fingerprint):
                 raise
-            # Somebody else recorded it. No retain: the winner holds the pin.
+            # Somebody else recorded it: the documented False.
             return False
-        for artifact in artifacts:
-            self._cas.retain(artifact.digest)
         return True
 
     def forget(self, fingerprint: str) -> None:
-        """Drop a fingerprint's artifacts and release their blobs. Idempotent.
+        """Drop a fingerprint's index rows. Idempotent. Blobs are not released.
 
-        Must be called outside an open transaction: it opens its own, and
-        ``transaction`` is not re-entrant.
+        Symmetry with ``record``: nothing was retained, so nothing may be
+        released. Any refcount these blobs carry belongs to another holder - a
+        project asset, or a job holding what it consumes - and releasing it here
+        would drive that below what the holder expects. Dropping the rows simply
+        returns the blobs to the evictor's ordinary candidate pool.
+
+        The row check runs alongside ``lookup`` because they answer different
+        questions: a fingerprint whose blobs were evicted is a *miss* but still
+        has rows, and forgetting it must clear them rather than silently no-op.
+
+        Must be called outside an open transaction: the row delete runs in an
+        ``immediate=True`` transaction, which is still refused when nested.
 
         Raises:
-            ValidationError: if ``fingerprint`` is malformed. Note this can only
-                be raised before anything is written; a release that fails
-                because its ``cas_objects`` row is already gone is tolerated
-                rather than reported, so a caller seeing ValidationError from
+            ValidationError: if ``fingerprint`` is malformed. Raised before
+                anything is written, so a caller seeing ValidationError from
                 ``forget`` can rely on "bad input, nothing happened".
-            sqlite3.OperationalError: if the row delete, or a ``release``'s own
-                transaction, cannot acquire the write lock within
-                ``busy_timeout`` (legitimate contention). Unlike ValidationError above,
-                this one can arrive from the release loop *after* the rows are
-                committed, leaving the blobs partly released.
+            sqlite3.OperationalError: if the row delete cannot acquire the write
+                lock within ``busy_timeout`` (legitimate contention).
             TransactionError: if a transaction is already open on the
                 connection.
         """
         self._validate_fingerprint(fingerprint)
-        existing = self.lookup(fingerprint)
-        if existing is None:
+        if self.lookup(fingerprint) is None and not self._has_rows(fingerprint):
             return
         self._drop_rows(fingerprint)
-        for artifact in existing:
-            try:
-                self._cas.release(artifact.digest)
-            except ValidationError:
-                # release() raises ValidationError for exactly two reasons: a
-                # malformed digest, or no cas_objects row for that digest. Every
-                # ArtifactRef validates its digest in __post_init__, and these
-                # refs were constructed by lookup(), so the digest is provably
-                # well-formed - the only reachable cause here is the missing
-                # row. Without that argument this catch would be swallowing two
-                # different failures.
-                #
-                # A missing row means the pin is already gone, which is the end
-                # state forget() is driving towards. Propagating instead would
-                # be actively worse: _drop_rows has already committed, so the
-                # caller would get "bad input" semantics for a half-finished
-                # release with the rows irrecoverably deleted.
-                continue

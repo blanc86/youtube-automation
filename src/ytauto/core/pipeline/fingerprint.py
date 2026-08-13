@@ -19,7 +19,7 @@ from typing import Any
 from ytauto.core.errors import ValidationError
 from ytauto.core.models.content_hash import ContentHash
 
-FINGERPRINT_SCHEMA_VERSION = 1
+FINGERPRINT_SCHEMA_VERSION: int = 2
 """Bump when canonicalisation changes, so old artifacts invalidate rather than
 colliding with differently-computed new ones."""
 
@@ -77,14 +77,17 @@ class FingerprintSpec:
     """Everything that determines a stage's output.
 
     ``input_digests`` is ordered because order changes the result - concatenating
-    two clips the other way round produces a different video.
+    two clips the other way round produces a different video. Each entry carries
+    its artifact name alongside the digest because two artifacts swapping names
+    while keeping their digests would otherwise be indistinguishable - a false
+    cache HIT that serves one arrangement of inputs as another's output.
     """
 
     stage_id: str
     stage_version: int
     provider_id: str
     provider_version: str
-    input_digests: tuple[ContentHash, ...]
+    input_digests: tuple[tuple[str, ContentHash], ...]
     settings: Mapping[str, object]
 
 
@@ -101,7 +104,7 @@ def compute_fingerprint(spec: FingerprintSpec) -> str:
         "stage_version": spec.stage_version,
         "provider_id": spec.provider_id,
         "provider_version": spec.provider_version,
-        "input_digests": list(spec.input_digests),
+        "input_digests": [[name, digest] for name, digest in spec.input_digests],
         "settings": dict(spec.settings),
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
