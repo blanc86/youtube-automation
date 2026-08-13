@@ -75,7 +75,11 @@ pytestmark = pytest.mark.integration
 
 def test_a_worker_that_floods_stderr_still_reports_its_result(dispatcher_env):
     """200 KB of stderr must not deadlock the pump. 60 KB was measured as fatal."""
-    env = dispatcher_env(stage="tests.integration.stages:StderrFlooder")
+    # The bounded deadline is load-bearing for Step 9's guard-pin, not just
+    # for this run: with the default 1800 s, reverting the stderr fix would
+    # hang for half an hour instead of failing, and the predicted failure
+    # could not be observed.
+    env = dispatcher_env(stage="tests.integration.stages:StderrFlooder", pump_deadline_s=60.0)
     report = env.dispatcher.tick()
     assert report.spawned == ("flood",), "the flooding stage must complete, not hang"
     assert env.stage_status("flood") == "succeeded"
@@ -194,7 +198,7 @@ Expected: ALL CHECKS PASSED, unit count +1, integration count +1.
 - [ ] **Step 9: Guard-pin both fixes**
 
 Revert `stderr=stderr_file` to `stderr=subprocess.PIPE`, keeping the watchdog. Run the flood test.
-**Predicted:** it no longer hangs — the watchdog kills it — so it fails on `assert report.spawned == ("flood",)` with the stage reset to `pending`. Confirm the failure message names the deadline, not a hang.
+**Predicted:** it does not hang — the 60 s watchdog kills the deadlocked worker — so it fails on `assert report.spawned == ("flood",)` with the stage reset to `pending`, roughly 60 s in. Confirm the failure names the deadline rather than hanging indefinitely; a hang means the watchdog is not firing and Step 7 is broken too.
 
 Then restore, and delete `watchdog.start()`. Run the deadline test.
 **Predicted:** hangs, killed by `--timeout`.
@@ -460,7 +464,7 @@ def test_build_stage_resolves_through_entry_points(cas, monkeypatch):
     assert stage.id == "ingest_story"
 
 
-def test_an_unknown_stage_id_names_what_was_available():
+def test_an_unknown_stage_id_names_what_was_available(cas):
     with pytest.raises(ValidationError, match="ingest_stroy"):
         build_stage("story_video", "ingest_stroy", cas, {})
 ```
@@ -877,11 +881,17 @@ def test_one_dialogue_event_per_word_not_per_group():
 
 
 def test_each_event_accents_exactly_one_word_and_shows_them_all():
-    tl = _timeline(groups=[_group(words=[("a", 0.0, 0.5), ("b", 0.5, 1.0)])])
+    tl = _timeline(groups=[_group(words=[("alpha", 0.0, 0.5), ("beta", 0.5, 1.0)])])
     lines = [ln for ln in render_ass(tl, width=1080, height=1920, style=_style(accent="&H0000FFFF")).splitlines()
              if ln.startswith("Dialogue:")]
-    assert lines[0].count("&H0000FFFF") == 1, "exactly one word is accented per event"
-    assert lines[0].endswith("a b") is False and "a" in lines[0] and "b" in lines[0]
+
+    assert len(lines) == 2
+    for line in lines:
+        assert line.count("&H0000FFFF") == 1, "exactly one word is accented per event"
+        assert "alpha" in line and "beta" in line, "the whole group stays on screen"
+    # The accent must move: event 0 accents alpha, event 1 accents beta.
+    assert lines[0].index("&H0000FFFF") < lines[0].index("beta")
+    assert lines[1].index("&H0000FFFF") > lines[1].index("alpha")
 
 
 def test_event_timings_use_ass_centisecond_format():
