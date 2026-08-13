@@ -6,7 +6,9 @@
 
 **Architecture:** Seven stages on the existing content-addressed DAG. The dispatcher spawns one worker per stage; workers never touch SQLite. Providers sit behind the existing ports and are resolved through entry points so `app/` never imports `providers/`. Two sibling compose stages render the two canvases from identical upstream artifacts.
 
-**Tech Stack:** Python 3.12, SQLite (WAL), ffmpeg + `h264_nvenc`, `edge-tts`, libass, pytest, mypy `--strict` on `src/`, ruff, import-linter.
+**Tech Stack:** Python 3.12, SQLite (WAL), ffmpeg + `h264_nvenc`, `edge-tts`, libass, pytest, mypy, ruff, import-linter.
+
+**mypy strictness, stated precisely** — `pyproject.toml` sets `packages = ["ytauto"]` with `strict = true` **only** under the `ytauto.core.*` override. Everything outside `core` is checked at mypy's default settings, and `tests/` is not checked at all. So: code you add under `src/ytauto/core/` must satisfy `--strict`; code under `app/`, `infra/`, `providers/` and `cli/` must satisfy the default profile. Annotate new code fully regardless — but do not report a task as blocked because non-`core` code would fail `--strict`, and do not tell a reviewer the whole tree is strict.
 
 **Spec:** `docs/superpowers/specs/2026-08-13-phase-2a-first-light-design.md`
 
@@ -134,7 +136,7 @@ Delete the two `proc.stderr` lines from `_pump`'s `finally`; there is no stderr 
 - [ ] **Step 4: Run the flood test again**
 
 Run: `pytest tests/integration/test_worker_stderr.py -v -m integration`
-Expected: PASS. Confirm `stderr.attempt-0.log` exists and is 200,000 bytes.
+Expected: PASS. Confirm the log file exists and is 200,000 bytes. Note the filename is `stderr.attempt-1.log`, not `-0`: `JobQueue.claim()` increments `attempts` before returning the `ClaimedJob`, so the first attempt is 1.
 
 - [ ] **Step 5: Write the failing deadline test**
 
@@ -198,7 +200,14 @@ Expected: ALL CHECKS PASSED, unit count +1, integration count +1.
 - [ ] **Step 9: Guard-pin both fixes**
 
 Revert `stderr=stderr_file` to `stderr=subprocess.PIPE`, keeping the watchdog. Run the flood test.
-**Predicted:** it does not hang — the 60 s watchdog kills the deadlocked worker — so it fails on `assert report.spawned == ("flood",)` with the stage reset to `pending`, roughly 60 s in. Confirm the failure names the deadline rather than hanging indefinitely; a hang means the watchdog is not firing and Step 7 is broken too.
+
+**Predicted:** it does not hang — the 60 s watchdog kills the deadlocked worker — so the test fails roughly 60 s in, on `assert env.stage_status("flood") == "succeeded"` receiving `'pending'`.
+
+**Not** on `assert report.spawned == ("flood",)`: `_spawn` returns `True` and `tick()` reports the spawn as soon as `Popen` succeeds and the assignment is written, so reverting the stderr fix cannot make that assertion false. Only the stage's *outcome* changes.
+
+Expect a second failure too: a teardown `PytestUnraisableExceptionWarning` for the leaked stderr pipe, promoted to an error by `filterwarnings`. Step 3 deletes the `proc.stderr.close()` lines, so reverting only the `Popen` argument leaves the pipe with nothing to close it. That is the historical leaked-pipe gate firing correctly — independent confirmation the fix matters.
+
+A hang means the watchdog is not firing and Step 7 is broken too.
 
 Then restore, and delete `watchdog.start()`. Run the deadline test.
 **Predicted:** hangs, killed by `--timeout`.
