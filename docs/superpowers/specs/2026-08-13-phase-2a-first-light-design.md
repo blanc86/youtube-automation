@@ -166,6 +166,17 @@ reflection; the assignment gains `pipeline_id`. The registry is imported by
 **both** processes — the dispatcher constructs stages too, because it calls
 `stage.fingerprint(ctx)` for the cache probe.
 
+**It must resolve those factories through entry points, not imports.**
+`pyproject.toml` declares a `forbidden` contract — *"app depends only on core
+and infra"*, with `ytauto.providers` in the forbidden list — so a registry in
+`app/` that imports a concrete provider breaks the gate. Resolution therefore
+goes through `importlib.metadata.entry_points(group="ytauto.stages")`, with the
+factories declared in `pyproject.toml` and living in `providers/`. This is not a
+workaround: it is what `core/ports/providers.py`'s own docstring already
+specifies — *"a new TTS engine or LLM is added by implementing the relevant
+Protocol and registering an entry point — with no change to core/ or app/."*
+Entry-point loading is dynamic, so the static contract stays kept.
+
 Provider identity (`provider_id`, `provider_version`) is resolved from the
 registry **parent-side**, since the fingerprint is computed there.
 
