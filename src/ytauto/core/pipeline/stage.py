@@ -100,6 +100,17 @@ class Stage(Protocol):
     so an unstable fingerprint silently disables all caching.
     """
 
+    settings_keys: tuple[str, ...]
+    """Which project settings this stage's output actually depends on.
+
+    Declared per stage, and narrow on purpose: ``fingerprint`` hashes the
+    settings it is given whole, so a stage that fingerprinted the entire
+    project settings would be re-run whenever any unrelated setting changed -
+    a caption colour edit re-running the TTS engine. A stage that reads no
+    settings declares ``()``. See ``app.stage_support.project_settings``,
+    which is the projection every stage is expected to fingerprint through.
+    """
+
     @property
     def id(self) -> str:
         """Stable identifier, unique within a pipeline."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from ytauto.core.models.narration import Narration
 from ytauto.core.ports.capability import CapabilityDescriptor
 
 
@@ -38,8 +39,18 @@ class SpeechSynthesizer(Protocol):
 
     capabilities: CapabilityDescriptor
 
-    def synthesize(self, text: str, *, voice: str) -> bytes:
-        """Return encoded audio bytes."""
+    def synthesize(self, text: str, *, voice: str) -> Narration:
+        """Return the synthesised audio, with word boundaries if this engine
+        emits them.
+
+        Returning ``Narration`` rather than bare bytes is what makes the free
+        captioning path possible: an engine that already knows where each word
+        starts (edge-tts reports offset+duration per word as it streams) has
+        given away for free exactly what ASR would otherwise need a GPU lease
+        to recover. An engine that reports nothing sets
+        ``Narration.boundaries`` to None, which is the signal a
+        boundary-consuming transcriber refuses on rather than guessing.
+        """
 
 
 @runtime_checkable
@@ -53,8 +64,16 @@ class Transcriber(Protocol):
 
     capabilities: CapabilityDescriptor
 
-    def transcribe(self, audio: bytes) -> tuple[tuple[str, float, float], ...]:
-        """Return (word, start_seconds, end_seconds) triples."""
+    def transcribe(self, narration: Narration) -> tuple[tuple[str, float, float], ...]:
+        """Return (word, start_seconds, end_seconds) triples.
+
+        Takes the whole ``Narration``, not just its bytes, so that the two
+        implementations differ only in which half they read: the free one
+        consumes ``boundaries`` and raises when it is None; the ASR one
+        ignores ``boundaries`` and decodes ``audio``. A bytes-only signature
+        would force the boundaries to travel beside the port as a second
+        argument every caller had to remember to pass.
+        """
 
 
 @runtime_checkable

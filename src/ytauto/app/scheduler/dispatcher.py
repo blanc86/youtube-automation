@@ -77,6 +77,7 @@ from ytauto.app.scheduler.worker_protocol import (
     Staged,
     decode,
 )
+from ytauto.app.services.projects import ProjectService
 from ytauto.core.errors import ErrorKind, ValidationError
 from ytauto.core.models.artifact import ArtifactRef
 from ytauto.core.models.content_hash import ContentHash
@@ -138,26 +139,32 @@ def _build_assignment(
 ) -> dict[str, object]:
     """Serialise everything ``app/worker.py`` needs to run one stage.
 
-    ``stage_import`` (``"module:QualName"``, resolved by reflection off the
-    stage's own class) is a placeholder for the provider/stage registry
-    Phase 2 will build: Phase 1b ships no concrete ``Stage`` implementations
-    to register, so the worker imports and zero-arg-constructs the same
-    class the dispatcher already holds a reference to. It only works for a
-    module-level class with a no-argument constructor - true of every
-    synthetic test stage in this phase, not guaranteed once real provider
-    parameters exist.
+    ``pipeline_id`` plus ``stage_id`` is the registry key
+    (``app/registry.py``): the worker rebuilds the stage from the
+    ``ytauto.stages`` entry point named ``"<pipeline_id>:<stage_id>"``, handing
+    it the CAS store it opened and the settings below. It replaces the
+    ``stage_import`` string this used to carry - ``"module:QualName"``,
+    resolved by reflection off the dispatcher's own in-memory stage object and
+    zero-arg constructed on the far side - which could not give a stage its
+    ``CasStore`` or its settings at all, and which would have silently
+    bypassed the registry for any stage that happened to remain zero-arg
+    constructible.
+
+    ``settings`` is the project's real settings mapping (see ``tick``), so
+    ``json.dumps`` on the result can now fail on a value a project stored
+    that is not JSON-serialisable. ``_spawn`` serialises *before* it spawns
+    for exactly that reason.
     """
-    stage_type = type(stage)
     return {
         "job_id": claimed.job_id,
         "stage_id": stage.id,
         "project_id": claimed.project_id,
+        "pipeline_id": claimed.pipeline_id,
         "correlation_id": f"{claimed.job_id}:{stage.id}:{claimed.attempts}",
         "cas_root": cas_root,
         "workdir": str(ctx.workdir),
         "settings": dict(ctx.settings),
         "fingerprint": fingerprint,
-        "stage_import": f"{stage_type.__module__}:{stage_type.__qualname__}",
         "inputs": {
             stage_id: [
                 {"name": artifact.name, "kind": artifact.kind, "digest": str(artifact.digest)}
@@ -225,7 +232,17 @@ class Dispatcher:
     Nothing in the schema stores a serialised pipeline - a job's DAG is code,
     constructed once at process start and handed in here - so the caller
     that assembles a ``Dispatcher`` is also the one place a pipeline
-    registry needs to exist.
+    registry needs to exist. ``app.registry.build_pipeline`` is what a caller
+    is expected to build that mapping with; this class deliberately does not
+    call it itself, so a test can hand in a pipeline nothing has registered.
+
+    Note that these stage objects are constructed once, per process, while a
+    worker's are constructed per job from that job's own settings. The two
+    must agree on ``fingerprint``, which is why ``Stage.fingerprint`` has to
+    be a pure function of its ``JobContext`` - a stage that fingerprinted
+    something decided at construction time (a provider chosen from the
+    settings its factory was handed) would have the dispatcher record one
+    digest and the worker compute another.
     """
 
     def __init__(
@@ -252,6 +269,12 @@ class Dispatcher:
         self._artifacts = artifacts
         self._governor = governor
         self._queue = queue
+        # Built from the connection this dispatcher already owns rather than
+        # injected: a constructor parameter would have to be threaded through
+        # every call site to say the same thing this line does, and a
+        # ProjectService over a *different* connection would read a different
+        # snapshot of the settings it is asked for.
+        self._projects = ProjectService(conn)
         self._pipelines: dict[str, Pipeline] = dict(pipelines)
         self._owner = owner
         self._job_lease_s = job_lease_s
@@ -312,8 +335,14 @@ class Dispatcher:
 
         Raises:
             ValidationError: the claimed job's ``pipeline_id`` names no
-                registered pipeline, or an upstream fingerprint recorded in
-                ``job_stages`` is malformed (from ``gather_inputs``).
+                registered pipeline, its ``project_id`` names no row in
+                ``projects`` (from ``ProjectService.settings_for``), or an
+                upstream fingerprint recorded in ``job_stages`` is malformed
+                (from ``gather_inputs``). A job pointing at a project that
+                does not exist is unrunnable, not merely settingless:
+                defaulting to an empty mapping would run every stage on
+                provider defaults and record cache entries under fingerprints
+                no correctly-configured run will ever reproduce.
             sqlite3.Error: a claim, read or write fails - includes
                 ``sqlite3.OperationalError`` for lock contention and
                 ``sqlite3.IntegrityError`` propagated from
@@ -339,10 +368,16 @@ class Dispatcher:
 
         stage = ready[0]
         inputs = gather_inputs(pipeline, stage.id, fingerprints, self._artifacts)
+        # The project's real settings, not the empty mapping this passed until
+        # Phase 2a. A stage's fingerprint is computed from what is in here
+        # (narrowed to its own settings_keys - see app.stage_support), so an
+        # empty mapping does not fail anything: it silently runs every stage
+        # on provider defaults and makes two projects with different voices
+        # share one cache entry.
         ctx = JobContext(
             job_id=claimed.job_id,
             project_id=claimed.project_id,
-            settings={},
+            settings=self._projects.settings_for(claimed.project_id),
             inputs=inputs,
             workdir=self._workdir_for(claimed.job_id, stage.id),
         )

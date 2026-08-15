@@ -18,12 +18,13 @@ Both tests spawn real ``python -m ytauto.app.worker`` subprocesses, so they
 are integration tests, not unit tests - marked accordingly and run as the
 gate's separate integration step.
 
-**Cross-process plumbing.** ``app/worker.py`` resolves a stage via reflection
-off ``"module:QualName"`` and zero-arg-constructs it (Task 13's placeholder
-for the provider registry Phase 2 will build - see that module's
-docstring), so the three synthetic ``Stage`` classes below live at module
-scope in *this* file and take no constructor arguments. Two consequences
-follow:
+**Cross-process plumbing.** ``app/worker.py`` resolves a stage through
+``app/registry.py``: an entry point named ``"<pipeline_id>:<stage_id>"`` under
+the ``ytauto.stages`` group, whose value is a factory taking ``cas`` and
+``settings``. The three synthetic stages below are registered that way in
+``tests/ytauto_it_stages-0.0.0.dist-info/entry_points.txt`` and constructed
+through their ``make_*`` factories at the bottom of this section. Two
+consequences follow:
 
 1. The worker subprocess must be able to ``importlib.import_module`` this
    module. Pytest's own import makes it reachable as ``integration.test_resume``
@@ -33,17 +34,20 @@ follow:
    ``sys.path``, not the subprocess's. The ``env`` fixture below propagates it
    via the ``PYTHONPATH`` environment variable, which ``Popen`` (no explicit
    ``env=`` in ``dispatcher._spawn``) inherits from this process at call time.
-2. A zero-arg stage has no constructor-injected ``CasStore`` to write its own
-   output through (a real ``Stage`` gets one at construction - see
-   ``runner.py``'s module docstring). The synthetic stages recover the CAS
-   root the same out-of-band way: an environment variable the ``env`` fixture
-   sets before any dispatcher tick runs.
+   The same ``PYTHONPATH`` entry is what makes the entry-point metadata under
+   ``tests/`` discoverable in the subprocess.
+2. Each stage writes its output through the ``CasStore`` its factory was
+   handed, exactly as a real ``Stage`` does (see ``runner.py``'s module
+   docstring). Before the registry existed these stages were zero-arg
+   constructed and had to recover the CAS root from an environment variable;
+   that channel is gone.
 
-Each stage's execution counter (Step 2 of the brief) lives in a third
-environment-variable-addressed location: a directory of one append-only file
-per stage id, deliberately keyed by stage id alone rather than job id, so the
-twice-run test's assertion ("still 1" after a second job) is checking the
-*same* file both times.
+Each stage's execution counter (Step 2 of the brief) still lives in an
+environment-variable-addressed location - it is test instrumentation, not
+pipeline state: a directory of one append-only file per stage id,
+deliberately keyed by stage id alone rather than job id, so the twice-run
+test's assertion ("still 1" after a second job) is checking the *same* file
+both times.
 """
 
 from __future__ import annotations
@@ -52,21 +56,21 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
 
+from ytauto.app.registry import build_pipeline
 from ytauto.app.scheduler.dispatcher import Dispatcher
 from ytauto.app.scheduler.governor import Governor
 from ytauto.app.scheduler.queue import JobQueue
-from ytauto.app.scheduler.runner import build_spec
+from ytauto.app.services.projects import ProjectService
+from ytauto.app.stage_support import stage_fingerprint
 from ytauto.core.models.artifact import ArtifactRef
-from ytauto.core.models.content_hash import ContentHash
 from ytauto.core.models.job import JobState, StageStatus
-from ytauto.core.pipeline.fingerprint import compute_fingerprint
 from ytauto.core.pipeline.graph import Pipeline
-from ytauto.core.pipeline.stage import JobContext, ProgressFn, Stage, StageResult
+from ytauto.core.pipeline.stage import JobContext, ProgressFn, StageResult
 from ytauto.infra.artifacts import ArtifactStore
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.clock import utc_now_iso
@@ -78,7 +82,6 @@ pytestmark = pytest.mark.integration
 # -- cross-process plumbing (see module docstring) --------------------------
 
 _TESTS_ROOT = Path(__file__).resolve().parent.parent
-_CAS_ROOT_ENV = "YTAUTO_T14_CAS_ROOT"
 _COUNTER_DIR_ENV = "YTAUTO_T14_COUNTER_DIR"
 _KILL_STAGE_ENV = "YTAUTO_T14_KILL_STAGE"
 _PIPELINE_ID = "t14-three-stage"
@@ -86,22 +89,6 @@ _PAUSE_S = 20.0
 """Upper bound on how long a to-be-killed stage waits before giving up and
 running anyway. Bounds a test bug (the kill never arrives) to a slow failure
 instead of an indefinite hang."""
-
-
-def _write_blob(data: bytes, *, kind: str) -> ContentHash:
-    """Write ``data`` into the CAS root the ``env`` fixture published.
-
-    Filesystem-only, mirroring ``app/worker.py``'s own throwaway ``:memory:``
-    connection - see that module's docstring for why ``CasStore``'s
-    constructor needs a connection at all despite never executing a
-    statement against it here.
-    """
-    conn = sqlite3.connect(":memory:")
-    try:
-        cas = CasStore(root=Path(os.environ[_CAS_ROOT_ENV]), conn=conn)
-        return cas.stage_file(data, kind=kind)
-    finally:
-        conn.close()
 
 
 def _record_run(stage_id: str) -> None:
@@ -138,27 +125,26 @@ def _maybe_pause_for_kill(ctx: JobContext, stage_id: str) -> None:
         time.sleep(0.05)
 
 
-def _fingerprint(stage: Stage, ctx: JobContext) -> str:
-    """The sanctioned pattern (``runner.build_spec`` + ``compute_fingerprint``),
-    the same one a real Stage implementation is expected to use."""
-    spec = build_spec(stage, "synthetic", "1", ctx.inputs, ctx.settings)
-    return compute_fingerprint(spec)
-
-
 class FetchStage:
     """Stage 1: no inputs, one deterministic output blob."""
 
     id = "fetch"
     version = 1
     depends_on: tuple[str, ...] = ()
+    settings_keys: tuple[str, ...] = ()
+
+    def __init__(self, cas: CasStore) -> None:
+        self._cas = cas
 
     def fingerprint(self, ctx: JobContext) -> str:
-        return _fingerprint(self, ctx)
+        """The sanctioned pattern (``app.stage_support.stage_fingerprint``),
+        the same one a real Stage implementation is expected to use."""
+        return stage_fingerprint(self, ctx, provider_id="synthetic", provider_version="1")
 
     def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
         _record_run(self.id)
         _maybe_pause_for_kill(ctx, self.id)
-        digest = _write_blob(b"fetched script bytes", kind="blob")
+        digest = self._cas.stage_file(b"fetched script bytes", kind="blob")
         return StageResult(artifacts=(ArtifactRef(name="script", kind="blob", digest=digest),))
 
 
@@ -176,16 +162,24 @@ class TtsStage:
     id = "tts"
     version = 1
     depends_on: tuple[str, ...] = ("fetch",)
+    settings_keys: tuple[str, ...] = ()
+
+    def __init__(self, cas: CasStore) -> None:
+        self._cas = cas
 
     def fingerprint(self, ctx: JobContext) -> str:
-        return _fingerprint(self, ctx)
+        return stage_fingerprint(self, ctx, provider_id="synthetic", provider_version="1")
 
     def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
         _record_run(self.id)
         _maybe_pause_for_kill(ctx, self.id)
         script = ctx.input("fetch", "script")
-        timings_digest = _write_blob(b"timings:" + script.digest.encode("ascii"), kind="blob")
-        narration_digest = _write_blob(b"narrated:" + script.digest.encode("ascii"), kind="blob")
+        timings_digest = self._cas.stage_file(
+            b"timings:" + script.digest.encode("ascii"), kind="blob"
+        )
+        narration_digest = self._cas.stage_file(
+            b"narrated:" + script.digest.encode("ascii"), kind="blob"
+        )
         return StageResult(
             artifacts=(
                 ArtifactRef(name="timings", kind="blob", digest=timings_digest),
@@ -207,21 +201,45 @@ class RenderStage:
     id = "render"
     version = 1
     depends_on: tuple[str, ...] = ("tts",)
+    settings_keys: tuple[str, ...] = ()
+
+    def __init__(self, cas: CasStore) -> None:
+        self._cas = cas
 
     def fingerprint(self, ctx: JobContext) -> str:
-        return _fingerprint(self, ctx)
+        return stage_fingerprint(self, ctx, provider_id="synthetic", provider_version="1")
 
     def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
         _record_run(self.id)
         _maybe_pause_for_kill(ctx, self.id)
         upstream = ctx.inputs.get("tts", ())
         payload = b"rendered:" + b",".join(a.digest.encode("ascii") for a in upstream)
-        digest = _write_blob(payload, kind="blob")
+        digest = self._cas.stage_file(payload, kind="blob")
         return StageResult(artifacts=(ArtifactRef(name="video", kind="blob", digest=digest),))
 
 
-def _pipeline() -> Pipeline:
-    return Pipeline(id=_PIPELINE_ID, stages=(FetchStage(), TtsStage(), RenderStage()))
+# -- entry points (tests/ytauto_it_stages-0.0.0.dist-info) -------------------
+
+
+def make_fetch(*, cas: CasStore, settings: Mapping[str, object]) -> FetchStage:
+    """Entry point ``t14-three-stage:fetch``."""
+    return FetchStage(cas)
+
+
+def make_tts(*, cas: CasStore, settings: Mapping[str, object]) -> TtsStage:
+    """Entry point ``t14-three-stage:tts``."""
+    return TtsStage(cas)
+
+
+def make_render(*, cas: CasStore, settings: Mapping[str, object]) -> RenderStage:
+    """Entry point ``t14-three-stage:render``."""
+    return RenderStage(cas)
+
+
+def _pipeline(cas: CasStore) -> Pipeline:
+    """The dispatcher's in-process view of the same three stages the worker
+    will rebuild from the entry-point table on the far side of the pipe."""
+    return build_pipeline(_PIPELINE_ID, cas, {})
 
 
 # -- fixtures -----------------------------------------------------------
@@ -254,18 +272,32 @@ def queue(db_conn: sqlite3.Connection) -> JobQueue:
 
 
 @pytest.fixture()
-def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cas: CasStore) -> Path:
-    """Wire the synthetic stages' three out-of-band channels (see module
-    docstring) and return the counter directory.
+def project_id(db_conn: sqlite3.Connection) -> str:
+    """A real ``projects`` row for the jobs below to point at.
+
+    ``Dispatcher.tick`` reads this project's settings into every
+    ``JobContext``; a job naming a project that does not exist is unrunnable,
+    not merely settingless.
+    """
+    return ProjectService(db_conn).create(
+        slug="t14", title="Resume criterion", story_digest=None, settings={}
+    )
+
+
+@pytest.fixture()
+def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Wire the synthetic stages' out-of-band channels (see module docstring)
+    and return the counter directory.
 
     ``PYTHONPATH`` is extended, not replaced, in case the host environment
-    already sets one.
+    already sets one. It carries two things at once: the import path for the
+    stage modules, and the directory the entry-point metadata that names them
+    lives in.
     """
     counters = tmp_path / "counters"
     existing = os.environ.get("PYTHONPATH")
     pythonpath = os.pathsep.join([str(_TESTS_ROOT), existing]) if existing else str(_TESTS_ROOT)
     monkeypatch.setenv("PYTHONPATH", pythonpath)
-    monkeypatch.setenv(_CAS_ROOT_ENV, str(cas.root))
     monkeypatch.setenv(_COUNTER_DIR_ENV, str(counters))
     monkeypatch.delenv(_KILL_STAGE_ENV, raising=False)
     return counters
@@ -334,14 +366,15 @@ def test_a_killed_worker_resumes_from_its_last_completed_stage(
     artifacts: ArtifactStore,
     queue: JobQueue,
     env: Path,
+    project_id: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The dispatcher's process-isolation contract: a genuinely killed worker
     loses no completed work, and the job finishes on resume."""
     monkeypatch.setenv(_KILL_STAGE_ENV, "tts")
-    pipeline = _pipeline()
+    pipeline = _pipeline(cas)
     job_id = "resume-job"
-    queue.enqueue(job_id, "proj-1", _PIPELINE_ID)
+    queue.enqueue(job_id, project_id, _PIPELINE_ID)
 
     dispatcher = Dispatcher(
         db_conn, cas, artifacts, Governor(), queue, pipelines={_PIPELINE_ID: pipeline}
@@ -435,6 +468,7 @@ def test_running_the_same_job_twice_hits_the_cache_on_every_stage(
     artifacts: ArtifactStore,
     queue: JobQueue,
     env: Path,
+    project_id: str,
 ) -> None:
     """The fingerprint cache delivers hits across a *different* job.
 
@@ -462,12 +496,12 @@ def test_running_the_same_job_twice_hits_the_cache_on_every_stage(
     that drift cannot occur here. Reverting both ordering sorts leaves every
     integration test green.
     """
-    pipeline = _pipeline()
+    pipeline = _pipeline(cas)
     dispatcher = Dispatcher(
         db_conn, cas, artifacts, Governor(), queue, pipelines={_PIPELINE_ID: pipeline}
     )
 
-    queue.enqueue("job-one", "proj-1", _PIPELINE_ID)
+    queue.enqueue("job-one", project_id, _PIPELINE_ID)
     first = dispatcher.run_until_idle(max_ticks=10)
     assert set(first.spawned) == {"fetch", "tts", "render"}
     assert first.skipped == ()
@@ -475,7 +509,7 @@ def test_running_the_same_job_twice_hits_the_cache_on_every_stage(
     for stage_id in ("fetch", "tts", "render"):
         assert _run_count(env, stage_id) == 1
 
-    queue.enqueue("job-two", "proj-1", _PIPELINE_ID)
+    queue.enqueue("job-two", project_id, _PIPELINE_ID)
     second = dispatcher.run_until_idle(max_ticks=10)
     assert second.spawned == ()
     assert set(second.skipped) == {"fetch", "tts", "render"}

@@ -1,6 +1,7 @@
 import pytest
 
 from ytauto.core.errors import ValidationError
+from ytauto.core.models.narration import Narration, WordBoundary
 from ytauto.core.ports.capability import CapabilityDescriptor, CostModel, LatencyClass
 from ytauto.core.ports.providers import (
     ImageGenerator,
@@ -101,10 +102,52 @@ def test_a_conforming_synthesizer_satisfies_the_protocol() -> None:
     class Fake:
         capabilities = _descriptor()
 
-        def synthesize(self, text: str, *, voice: str) -> bytes:
-            return b""
+        def synthesize(self, text: str, *, voice: str) -> Narration:
+            return Narration(audio=b"", boundaries=None)
 
     assert isinstance(Fake(), SpeechSynthesizer)
+
+
+def test_a_boundary_transcriber_and_an_asr_one_share_the_same_port() -> None:
+    """The seam's whole point: the free path and the GPU path are
+    interchangeable. A bytes-only ``transcribe`` could not express the free
+    one at all - the boundaries would have to travel beside the port."""
+
+    class FromBoundaries:
+        capabilities = _descriptor()
+
+        def transcribe(self, narration: Narration) -> tuple[tuple[str, float, float], ...]:
+            if narration.boundaries is None:
+                raise ValidationError("this engine emitted no word boundaries")
+            return tuple((b.text, b.start_s, b.end_s) for b in narration.boundaries)
+
+    class FromAudio:
+        capabilities = _descriptor()
+
+        def transcribe(self, narration: Narration) -> tuple[tuple[str, float, float], ...]:
+            return (("decoded", 0.0, 1.0),) if narration.audio else ()
+
+    spoken = Narration(audio=b"\x00", boundaries=(WordBoundary("hi", 0.5, 0.25),))
+    assert isinstance(FromBoundaries(), Transcriber)
+    assert isinstance(FromAudio(), Transcriber)
+    assert FromBoundaries().transcribe(spoken) == (("hi", 0.5, 0.75),)
+    assert FromAudio().transcribe(spoken) == (("decoded", 0.0, 1.0),)
+
+
+def test_a_boundary_transcriber_refuses_audio_only_narration() -> None:
+    """Fabricating timings would ship captions that drift out of sync - far
+    harder to catch in review than a stage that failed."""
+
+    class FromBoundaries:
+        capabilities = _descriptor()
+
+        def transcribe(self, narration: Narration) -> tuple[tuple[str, float, float], ...]:
+            if narration.boundaries is None:
+                raise ValidationError("this engine emitted no word boundaries")
+            return ()
+
+    with pytest.raises(ValidationError, match="boundaries"):
+        FromBoundaries().transcribe(Narration(audio=b"\x00", boundaries=None))
 
 
 def test_a_synthesizer_missing_synthesize_does_not_satisfy_it() -> None:

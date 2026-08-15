@@ -32,7 +32,7 @@ def test_a_worker_that_floods_stderr_still_reports_its_result(
     default 1800s, reverting the stderr fix would hang for half an hour
     instead of failing within a reasonable test timeout.
     """
-    env = dispatcher_env(stage="integration.stages:StderrFlooder", pump_deadline_s=60.0)
+    env = dispatcher_env(pipeline_id="it-flood", pump_deadline_s=60.0)
 
     report = env.dispatcher.tick()
 

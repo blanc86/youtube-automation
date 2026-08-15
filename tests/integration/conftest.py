@@ -3,10 +3,16 @@
 ``dispatcher_env`` builds a real ``Dispatcher`` wired to spawn genuine
 ``python -m ytauto.app.worker`` subprocesses, wrapping the cross-process
 plumbing ``tests/integration/test_resume.py``'s module docstring explains:
-stage resolution by reflection off ``"module:QualName"``, ``PYTHONPATH``
-propagation so the subprocess can import a stage from ``tests/``, and
-out-of-band CAS-root delivery via an environment variable since a zero-arg
-stage has no constructor to receive one through.
+stage resolution through ``ytauto.stages`` entry points (declared in
+``tests/ytauto_it_stages-0.0.0.dist-info``) and ``PYTHONPATH`` propagation, so
+that both this process and the subprocess can discover *and* import the same
+stage factories.
+
+Both halves of that are load-bearing. The dispatcher needs in-process stage
+objects to compute fingerprints and walk the DAG; the worker needs to
+construct the same stage again on the far side of a pipe. They agree because
+they call the same ``app.registry`` function against the same entry-point
+table, not because the assignment carries an import path.
 """
 
 from __future__ import annotations
@@ -19,17 +25,15 @@ from pathlib import Path
 
 import pytest
 
+from ytauto.app.registry import build_pipeline
 from ytauto.app.scheduler.dispatcher import Dispatcher
 from ytauto.app.scheduler.governor import Governor
 from ytauto.app.scheduler.queue import JobQueue
-from ytauto.app.worker import _load_stage
-from ytauto.core.pipeline.graph import Pipeline
+from ytauto.app.services.projects import ProjectService
 from ytauto.infra.artifacts import ArtifactStore
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
-
-from .stages import CAS_ROOT_ENV
 
 _TESTS_ROOT = Path(__file__).resolve().parent.parent
 
@@ -54,32 +58,42 @@ class DispatcherEnv:
 def dispatcher_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[Callable[..., DispatcherEnv]]:
-    """Factory fixture: ``dispatcher_env(stage=..., pump_deadline_s=..., job_id=...)``.
+    """Factory fixture: ``dispatcher_env(pipeline_id=..., pump_deadline_s=..., job_id=...)``.
 
-    ``stage`` is the ``"module:QualName"`` string a worker subprocess resolves
-    via reflection (``app/worker.py``'s ``_load_stage`` - the same convention
-    ``dispatcher._build_assignment`` already uses), resolved here too so the
-    single-stage ``Pipeline`` this builds holds the exact same kind of object
-    a real dispatcher would. ``job_id`` defaults to ``"job"`` since no current
-    caller needs more than one job per test.
+    ``pipeline_id`` is resolved through ``app.registry.build_pipeline``, which
+    assembles every stage registered under that id - the same table the
+    worker subprocess resolves its single stage from, so the two cannot drift.
+
+    A real ``projects`` row is created and the job enqueued against it:
+    ``Dispatcher.tick`` reads the project's settings into every
+    ``JobContext`` now, and a job pointing at a project that does not exist is
+    unrunnable rather than settingless. ``job_id`` defaults to ``"job"`` since
+    no current caller needs more than one job per test.
     """
     connections: list[sqlite3.Connection] = []
     existing = os.environ.get("PYTHONPATH")
     pythonpath = os.pathsep.join([str(_TESTS_ROOT), existing]) if existing else str(_TESTS_ROOT)
     monkeypatch.setenv("PYTHONPATH", pythonpath)
 
-    def _make(*, stage: str, pump_deadline_s: float = 1800.0, job_id: str = "job") -> DispatcherEnv:
+    def _make(
+        *,
+        pipeline_id: str,
+        pump_deadline_s: float = 1800.0,
+        job_id: str = "job",
+        settings: dict[str, object] | None = None,
+    ) -> DispatcherEnv:
         conn = connect(tmp_path / f"{job_id}.db")
         apply_migrations(conn)
         connections.append(conn)
         cas = CasStore(root=tmp_path / "cas", conn=conn)
         artifacts = ArtifactStore(cas, conn)
         queue = JobQueue(conn)
-        monkeypatch.setenv(CAS_ROOT_ENV, str(cas.root))
 
-        stage_obj = _load_stage(stage)
-        pipeline_id = f"it-{stage_obj.id}"
-        pipeline = Pipeline(id=pipeline_id, stages=(stage_obj,))
+        project_settings = {} if settings is None else settings
+        project_id = ProjectService(conn).create(
+            slug=job_id, title=job_id, story_digest=None, settings=project_settings
+        )
+        pipeline = build_pipeline(pipeline_id, cas, project_settings)
         dispatcher = Dispatcher(
             conn,
             cas,
@@ -89,7 +103,7 @@ def dispatcher_env(
             pipelines={pipeline_id: pipeline},
             pump_deadline_s=pump_deadline_s,
         )
-        queue.enqueue(job_id, "proj-1", pipeline_id)
+        queue.enqueue(job_id, project_id, pipeline_id)
         return DispatcherEnv(dispatcher=dispatcher, conn=conn, job_id=job_id)
 
     yield _make

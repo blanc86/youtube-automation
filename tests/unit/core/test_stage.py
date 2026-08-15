@@ -98,6 +98,7 @@ def test_a_conforming_class_satisfies_the_protocol() -> None:
         id = "echo"
         version = 1
         depends_on: tuple[str, ...] = ()
+        settings_keys: tuple[str, ...] = ()
 
         def fingerprint(self, ctx: JobContext) -> str:
             return "f" * 64
@@ -113,8 +114,32 @@ def test_a_class_missing_run_does_not_satisfy_the_protocol() -> None:
         id = "partial"
         version = 1
         depends_on: tuple[str, ...] = ()
+        settings_keys: tuple[str, ...] = ()
 
         def fingerprint(self, ctx: JobContext) -> str:
             return "f" * 64
 
     assert not isinstance(Partial(), Stage)
+
+
+def test_a_class_that_declares_no_settings_keys_does_not_satisfy_the_protocol() -> None:
+    """``settings_keys`` is required, not optional-with-a-default.
+
+    A stage that simply omitted it would fall through to
+    ``AttributeError`` deep inside ``stage_fingerprint`` at run time - in a
+    worker subprocess, mid-job. A stage that reads no settings says so
+    explicitly with ``()``.
+    """
+
+    class Undeclared:
+        id = "undeclared"
+        version = 1
+        depends_on: tuple[str, ...] = ()
+
+        def fingerprint(self, ctx: JobContext) -> str:
+            return "f" * 64
+
+        def run(self, ctx: JobContext, emit: object) -> StageResult:
+            return StageResult(artifacts=())
+
+    assert not isinstance(Undeclared(), Stage)
