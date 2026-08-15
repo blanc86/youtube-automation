@@ -1,21 +1,31 @@
-"""``PastedStorySource``: a verbatim, UTF-8 read of a local text file.
+"""``PastedStorySource``, and ``make_stage``'s wiring of it into ``IngestStory``.
 
-Nothing here exercises ``IngestStory`` - that stage's tests live in
-``tests/unit/app/stages/test_ingest_story.py``, grouped with the rest of the
-stage suite even though the class itself is implemented in
-``ytauto.providers.story.pasted`` (see that module's docstring for why the
-stage cannot live under ``app/``).
+``IngestStory`` itself is typed against the ``StorySource`` Protocol and
+lives in ``ytauto.app.stages.ingest_story`` - its behavioural tests are in
+``tests/unit/app/stages/test_ingest_story.py``. What belongs here is
+everything specific to this concrete provider: that ``fetch`` behaves
+correctly, that its ``CapabilityDescriptor`` is honest, that it actually
+satisfies the ``StorySource`` Protocol it claims to, and that ``make_stage``
+- the one function allowed to import both sides of the ``app``/``providers``
+boundary - wires the two together correctly.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+from ytauto.app.stages.ingest_story import IngestStory
 from ytauto.core.errors import ErrorKind, ProviderError
+from ytauto.core.pipeline.stage import JobContext
 from ytauto.core.ports.capability import CostModel
-from ytauto.providers.story.pasted import PastedStorySource
+from ytauto.core.ports.providers import StorySource
+from ytauto.infra.cas.store import CasStore
+from ytauto.infra.db.engine import connect
+from ytauto.infra.db.migrations import apply_migrations
+from ytauto.providers.story.pasted import PastedStorySource, make_stage
 
 
 def test_a_pasted_story_is_read_verbatim(tmp_path: Path) -> None:
@@ -47,3 +57,56 @@ def test_the_capability_descriptor_declares_a_free_offline_no_gpu_provider() -> 
     assert caps.offline is True
     assert caps.requires_gpu is False
     assert caps.vram_mb is None
+
+
+def test_pasted_story_source_conforms_to_the_storysource_protocol() -> None:
+    """``StorySource`` is ``@runtime_checkable`` specifically so this is
+    cheap to check. Without it, ``PastedStorySource`` could silently drift
+    from the Protocol ``IngestStory`` depends on - a renamed method or a
+    dropped ``capabilities`` attribute would only surface as a confusing
+    ``AttributeError`` deep inside a worker, since nothing else here
+    statically confirms conformance (mypy does not check that an
+    unannotated class satisfies a Protocol it never declares)."""
+    assert isinstance(PastedStorySource(), StorySource)
+
+
+def test_make_stage_wires_a_pastedstorysource_into_ingest_story(tmp_path: Path) -> None:
+    """``make_stage`` is the one function allowed to import both
+    ``app.stages.ingest_story`` and this module's own ``PastedStorySource``;
+    this is the test that its wiring actually produces a working stage."""
+    conn = connect(tmp_path / "t.db")
+    apply_migrations(conn)
+    try:
+        cas = CasStore(root=tmp_path / "cas", conn=conn)
+        story_path = tmp_path / "story.txt"
+        story_path.write_text("hello\n", encoding="utf-8")
+
+        stage = make_stage(cas=cas, settings={"voice": "en-GB-RyanNeural"})
+        assert isinstance(stage, IngestStory)
+
+        ctx = JobContext(
+            job_id="j1",
+            project_id="p1",
+            settings={"story_path": str(story_path), "story_digest": "a" * 64},
+            inputs={},
+            workdir=tmp_path,
+        )
+        result = stage.run(ctx, lambda fraction, note: None)
+
+        assert cas.read_bytes(result.artifact("story.txt").digest) == b"hello\n"
+    finally:
+        conn.close()
+
+
+def test_make_stage_ignores_settings_it_has_no_use_for(tmp_path: Path) -> None:
+    """``make_stage`` accepts the project's whole settings per the uniform
+    factory contract but makes no decision from them - this stage has
+    exactly one provider. An unrelated or even nonsensical settings mapping
+    must not prevent construction."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        cas = CasStore(root=tmp_path / "cas", conn=conn)
+        stage = make_stage(cas=cas, settings={})
+        assert stage.id == "ingest_story"
+    finally:
+        conn.close()

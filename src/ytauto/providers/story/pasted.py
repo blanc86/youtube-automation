@@ -1,27 +1,28 @@
-"""The pasted-story source, and the ``ingest_story`` stage built on it.
+"""The pasted-story source, and the entry-point factory that wires it into ``ingest_story``.
 
-Both the port implementation (``PastedStorySource``) and the stage
-(``IngestStory``) live in this one module, under ``providers/`` rather than
-split across ``providers/`` and ``app/stages/``. ``ytauto.app`` may not
-import ``ytauto.providers`` - an import-linter ``forbidden`` contract - so a
-stage that needs a provider at construction time cannot itself live in
-``app/`` while the provider it wraps lives in ``providers/``. The two are
-wired together the way every stage is: ``app/registry.py`` resolves the
-entry point ``"story_video:ingest_story"`` to ``make_stage`` below without
-ever importing this module by name, so ``app`` never depends on
-``providers`` and the contract stays intact.
+``PastedStorySource`` (the ``StorySource`` port implementation) lives here,
+under ``providers/``, where every concrete provider belongs. The stage that
+consumes it, ``IngestStory``, lives in ``ytauto.app.stages.ingest_story``
+instead - typed against the ``StorySource`` Protocol, never against this
+concrete class - because ``ytauto.app`` may not import ``ytauto.providers``
+(an import-linter ``forbidden`` contract). ``make_stage`` below is the one
+thing that stands on both sides of that boundary: it is free to import both
+``app.stages.ingest_story`` and this module's own ``PastedStorySource``,
+since the forbidden contract runs only one way (``app`` may not import
+``providers``; nothing stops ``providers`` importing ``app``), and it is
+resolved by ``app/registry.py`` dynamically through ``importlib.metadata``
+entry points - invisible to import-linter's static analysis - so ``app``
+never names this module either.
 
-``IngestStory`` fingerprints over ``settings["story_digest"]``, never
-``settings["story_path"]``. The digest is computed once by the CLI at
-enqueue time, from the same bytes this stage will read at run time.
-Fingerprinting the path instead would put a machine-specific filesystem path
-into the hash - ``core.pipeline.fingerprint``'s ``_encode`` rejects a bare
-``Path`` for exactly this reason, but a ``str(path)`` would sail through
-undetected, hashing happily and uselessly. Fingerprinting by reading the
-file inside ``fingerprint()`` would make it impure instead: two different
-files that happened to occupy the same path at different times would
-fingerprint identically, and ``fingerprint`` must be a pure function of the
-``JobContext`` alone.
+An earlier version of this module defined ``IngestStory`` itself, reasoning
+that a stage needing a provider at construction time could not live in
+``app/`` while the provider lived in ``providers/``. Review caught that this
+conflated needing a *concrete provider class* with depending on the *port
+Protocol* purpose-built for this seam: ``StorySource`` already lets
+``IngestStory`` live in ``app/`` and receive its provider by injection here.
+The version that skipped the Protocol could not be tested against a fake
+source and had no check that ``PastedStorySource`` actually satisfied the
+Protocol it claimed to implement - both fixed below.
 """
 
 from __future__ import annotations
@@ -29,18 +30,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
-from ytauto.app.stage_support import stage_fingerprint
+from ytauto.app.stages.ingest_story import IngestStory
 from ytauto.core.errors import ErrorKind, ProviderError
-from ytauto.core.models.artifact import ArtifactRef
-from ytauto.core.pipeline.stage import JobContext, ProgressFn, StageResult
 from ytauto.core.ports.capability import CapabilityDescriptor, CostModel, LatencyClass
 from ytauto.infra.cas.store import CasStore
 
 PROVIDER_VERSION = "1"
 """Bump when ``PastedStorySource.fetch``'s behaviour changes.
 
-Fed to ``stage_fingerprint`` as ``provider_version``. A behaviour change that
-did not bump this would let artifacts staged under the old behaviour
+Fed to ``stage_fingerprint`` (via ``IngestStory.fingerprint``, which reads it
+off ``capabilities.version``) as ``provider_version``. A behaviour change
+that did not bump this would let artifacts staged under the old behaviour
 masquerade as this version's output - the same hazard ``Stage.version``
 guards against for the stage itself, one layer down at the provider.
 """
@@ -62,8 +62,12 @@ class PastedStorySource:
         offline=True,
         requires_gpu=False,
         vram_mb=None,
+        # Highest tier: the story's *content* reaches the pipeline unchanged.
+        # Content, not bytes - fetch()'s read_text call normalises newlines
+        # (see its own docstring), so this is fidelity to what a human
+        # wrote, not a literal byte-for-byte copy of the file on disk.
         quality_tier=5,
-        # A byte-for-byte passthrough has no language-specific behaviour to
+        # A pass-through provider has no language-specific behaviour to
         # restrict - "und" (ISO 639-2 "undetermined") signals that rather
         # than naming a language this provider does not actually care about.
         languages=frozenset({"und"}),
@@ -110,50 +114,17 @@ class PastedStorySource:
             ) from exc
 
 
-class IngestStory:
-    """The pipeline's first stage: turns a pasted story into ``story.txt``.
-
-    See the module docstring for why this fingerprints over
-    ``settings["story_digest"]`` rather than ``settings["story_path"]``.
-    """
-
-    id = "ingest_story"
-    version = 1
-    depends_on: tuple[str, ...] = ()
-    settings_keys: tuple[str, ...] = ("story_digest",)
-
-    def __init__(self, *, cas: CasStore, settings: Mapping[str, object]) -> None:
-        # ``settings`` is accepted, not stored: every entry-point factory has
-        # the same ``(*, cas, settings)`` shape, but this stage has exactly
-        # one provider and makes no construction-time decision from project
-        # settings - the fingerprint-divergence hazard registry.build_stage
-        # warns about only exists for a factory that does. What this stage
-        # actually reads at run time comes from ``ctx.settings`` instead (see
-        # ``run``), which is the job's own settings rather than whatever this
-        # process happened to be constructed with.
-        self._cas = cas
-        self._source = PastedStorySource()
-
-    def fingerprint(self, ctx: JobContext) -> str:
-        return stage_fingerprint(self, ctx, provider_id="pasted", provider_version=PROVIDER_VERSION)
-
-    def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
-        """Read the story named by ``ctx.settings["story_path"]`` and stage it.
-
-        Raises:
-            ProviderError: FATAL, propagated from ``PastedStorySource.fetch``
-                if the story file is missing or not valid UTF-8.
-            KeyError: if ``ctx.settings`` carries no ``"story_path"`` - a job
-                enqueued with no story attached. ``run_stage`` (the worker's
-                caller) translates any exception raised here into a FATAL
-                worker-protocol error, so this is not caught specially.
-        """
-        story_path = ctx.settings["story_path"]
-        text = self._source.fetch(str(story_path))
-        digest = self._cas.stage_file(text.encode("utf-8"), kind="text")
-        return StageResult(artifacts=(ArtifactRef(name="story.txt", kind="text", digest=digest),))
-
-
 def make_stage(*, cas: CasStore, settings: Mapping[str, object]) -> IngestStory:
-    """Entry point ``story_video:ingest_story``."""
-    return IngestStory(cas=cas, settings=settings)
+    """Entry point ``story_video:ingest_story``.
+
+    ``settings`` is accepted, not forwarded: every entry-point factory has
+    the same ``(*, cas, settings)`` shape (``app.registry.build_stage``'s
+    contract), but ``IngestStory`` needs nothing from project settings at
+    construction time - it reads ``ctx.settings["story_path"]`` at run time
+    instead (see ``IngestStory.run``). This factory picks exactly one
+    provider unconditionally, so there is no settings-dependent decision
+    here that could disagree between the dispatcher's copy of this stage and
+    the worker's - see ``registry.build_stage``'s fingerprint-divergence
+    warning.
+    """
+    return IngestStory(cas=cas, source=PastedStorySource())
