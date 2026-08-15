@@ -512,21 +512,72 @@ def build_stage(
 
 Declare the seven entry points in `pyproject.toml` under `[project.entry-points."ytauto.stages"]` as they are built (Tasks 4–12). Add the two that exist after this task only.
 
-- [ ] **Step 8: Wire settings and the registry into the dispatcher and worker**
+- [ ] **Step 8: Cover `project_settings` directly**
+
+`stage_fingerprint`'s tests exercise the projection only indirectly. These pin it on its own:
+
+```python
+def test_projecting_omits_keys_the_settings_do_not_have():
+    """An absent declared key must be omitted, not defaulted to None -
+    a None would enter the hash and differ from the key being absent."""
+    assert project_settings({"voice": "v"}, ("voice", "rate")) == {"voice": "v"}
+
+
+def test_projecting_an_empty_key_tuple_yields_an_empty_mapping():
+    """A stage that declares no settings must fingerprint identically
+    regardless of what the project settings contain."""
+    assert project_settings({"voice": "v", "seed": 3}, ()) == {}
+```
+
+- [ ] **Step 9: Wire settings and the registry into the dispatcher and worker**
 
 In `dispatcher.tick()`, replace `settings={}` with `self._projects.settings_for(claimed.project_id)`. In `_build_assignment`, replace `stage_import` with `pipeline_id`. In `worker.main()`, replace `_load_stage(assignment["stage_import"])` with `build_stage(assignment["pipeline_id"], assignment["stage_id"], cas, assignment["settings"])` and delete `_load_stage`.
 
-- [ ] **Step 9: Run the gate**
+**Migrate `tests/integration/stages.py` in this step.** Task 1 added test stages that are zero-arg constructed, because that is what `_load_stage` required. Replacing `_load_stage` with a registry factory breaks them, and the integration suite with them. They must move to the `factory(cas=..., settings=...)` shape in the same commit.
+
+- [ ] **Step 10: Pin the settings plumbing end to end**
+
+The projection tests prove the *helper* is right. Nothing yet proves real project settings actually reach a stage — which is the entire point of §4.2, and the thing `settings={}` silently prevented.
+
+```python
+def test_a_stages_context_carries_the_projects_real_settings(db_conn, tmp_path):
+    """The dispatcher hardcoded settings={} until this task. A regression to
+    that would leave every stage running on defaults, failing nothing."""
+    ProjectService(db_conn).create(slug="s", title="T", story_digest=None,
+                                   settings={"voice": "en-GB-RyanNeural"})
+    seen: dict[str, object] = {}
+    dispatcher = _dispatcher(db_conn, tmp_path, capture_ctx=seen.update)
+    _enqueue_for_project(db_conn, "j1", slug="s")
+
+    dispatcher.tick()
+
+    assert seen["voice"] == "en-GB-RyanNeural", "project settings must reach the JobContext"
+
+
+def test_the_assignment_carries_pipeline_id_not_a_stage_import(db_conn, tmp_path):
+    """The worker resolves stages through the registry now; a lingering
+    stage_import would work by reflection and silently bypass the registry."""
+    assignment = _build_assignment(_claimed(), _stage(), _ctx(), "f" * 64, "/cas")
+    assert assignment["pipeline_id"] == "story_video"
+    assert "stage_import" not in assignment
+```
+
+- [ ] **Step 11: Run the gate**
 
 Run: `python scripts/check.py`
 Expected: ALL CHECKS PASSED, and `import-linter` still reports **4 kept, 0 broken**. If "app depends only on core and infra" breaks, the registry is importing a provider statically — fix the registry, not the contract.
 
-- [ ] **Step 10: Guard-pin the projection**
+- [ ] **Step 12: Guard-pin the projection**
 
 Change `project_settings` to `return dict(settings)`.
 **Predicted:** `test_a_stage_fingerprint_ignores_settings_it_did_not_declare` fails with two differing hex digests — *not* an error, and *not* the contrast test. Confirm the contrast test still passes, which is what proves the first test is not vacuous.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 13: Guard-pin the settings plumbing**
+
+Revert `dispatcher.tick()` to `settings={}`.
+**Predicted:** `test_a_stages_context_carries_the_projects_real_settings` fails with a `KeyError: 'voice'` on `seen["voice"]` — the context carries an empty mapping, so the key is absent rather than wrong. If it fails some other way, report that.
+
+- [ ] **Step 14: Commit**
 
 ```bash
 git add -A
