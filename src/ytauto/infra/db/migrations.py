@@ -104,7 +104,42 @@ _M003 = Migration(
     ),
 )
 
-MIGRATIONS: tuple[Migration, ...] = (_M001, _M002, _M003)
+_M004 = Migration(
+    version=4,
+    name="projects_and_broll",
+    statements=(
+        """
+        CREATE TABLE projects (
+            id            TEXT PRIMARY KEY,
+            slug          TEXT NOT NULL UNIQUE,
+            title         TEXT NOT NULL,
+            story_digest  TEXT,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE broll_clips (
+            id                          TEXT PRIMARY KEY,
+            source_digest               TEXT NOT NULL,
+            normalised_landscape_digest TEXT NOT NULL,
+            normalised_vertical_digest  TEXT NOT NULL,
+            duration_s                  REAL NOT NULL,
+            width                       INTEGER NOT NULL,
+            height                      INTEGER NOT NULL,
+            source_url                  TEXT NOT NULL,
+            licence                     TEXT NOT NULL,
+            attribution                 TEXT NOT NULL DEFAULT '',
+            notes                       TEXT NOT NULL DEFAULT '',
+            added_at                    TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_broll_source_digest ON broll_clips (source_digest)",
+    ),
+)
+
+MIGRATIONS: tuple[Migration, ...] = (_M001, _M002, _M003, _M004)
 HEAD_VERSION: int = MIGRATIONS[-1].version
 
 

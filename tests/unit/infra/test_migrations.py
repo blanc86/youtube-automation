@@ -204,11 +204,11 @@ def test_the_claim_index_avoids_a_sort_pass(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_head_version_is_three(tmp_path: Path) -> None:
+def test_head_version_is_four(tmp_path: Path) -> None:
     conn = connect(tmp_path / "t.db")
     apply_migrations(conn)
-    assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 3
-    assert HEAD_VERSION == 3
+    assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 4
+    assert HEAD_VERSION == 4
     conn.close()
 
 
@@ -248,7 +248,8 @@ def test_migration_003_is_applied_on_top_of_an_existing_002(tmp_path: Path) -> N
     )
     assert "available_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
 
-    assert apply_migrations(conn) == 3
+    with patch("ytauto.infra.db.migrations.MIGRATIONS", MIGRATIONS[:3]):
+        assert apply_migrations(conn) == 3
     job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
     stage_cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_stages)")}
     assert "available_at" in job_cols
@@ -289,10 +290,30 @@ def test_a_job_inserted_under_v2_is_claimable_after_a_real_upgrade_to_v3(
         (now, now),
     )
 
-    assert apply_migrations(conn) == 3
+    with patch("ytauto.infra.db.migrations.MIGRATIONS", MIGRATIONS[:3]):
+        assert apply_migrations(conn) == 3
 
     row = conn.execute(
         "SELECT id FROM jobs WHERE state = 'queued' AND available_at <= ?", (now,)
     ).fetchone()
     assert row["id"] == "j1"
     conn.close()
+
+
+def test_migration_004_adds_projects_and_broll_clips(db_conn: sqlite3.Connection) -> None:
+    apply_migrations(db_conn)
+    assert current_version(db_conn) == 4
+    tables = {
+        r["name"] for r in db_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert {"projects", "broll_clips"} <= tables
+
+
+def test_broll_clips_records_a_licence_and_both_normalised_digests(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Provenance is not optional - it is the DMCA defence for the channel."""
+    apply_migrations(db_conn)
+    cols = {r["name"] for r in db_conn.execute("PRAGMA table_info(broll_clips)")}
+    assert {"source_url", "licence", "attribution", "notes"} <= cols
+    assert {"normalised_landscape_digest", "normalised_vertical_digest"} <= cols
