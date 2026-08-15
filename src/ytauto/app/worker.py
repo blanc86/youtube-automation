@@ -128,18 +128,43 @@ def _fingerprint_disagreement(
     the same conclusion, having burned an attempt to do it. Both digests are
     named because the disagreement, not either value, is the bug.
 
+    A ``fingerprint`` that *raises* is translated the same way, for the same
+    reason ``run_stage`` translates everything ``stage.run`` raises into a
+    ``FATAL`` error (``runner.py``): ``fingerprint`` is stage code by the same
+    definition, and catching one stage method while letting the other kill the
+    process is the inconsistency, not the catch. Letting it escape would kill
+    the worker with no terminal message, which lands in ``_pump``'s death
+    branch - one attempt charged, 5/10/20/40/80 s of backoff, and only then a
+    failed job. That is roughly two and a half minutes of *guaranteed
+    identical* failures before an operator sees anything, because a raising
+    fingerprint is deterministic: the settings arrive over the pipe byte-for-
+    byte the same on every attempt. The traceback is the real cost of
+    catching, so the message keeps ``f"{type(exc).__name__}: {exc}"`` - the
+    same shape ``run_stage`` uses - and the exception type survives into
+    ``jobs.last_error`` even though the traceback does not.
+
+    ``main``'s carve-out for a malformed assignment (crash rather than emit)
+    does not reach here: that exists because there is no trustworthy
+    job/stage/correlation id to stamp a message with, and by this point all
+    three have been read.
+
     Returns None when the two agree, which is every correctly-written stage.
 
     Raises:
-        Nothing itself. ``stage.fingerprint`` is called here rather than
-        inside ``run_stage``'s exception translation, so an exception from it
-        crashes the worker with a traceback on the per-attempt stderr log -
-        deliberately: the dispatcher already computed this same fingerprint
-        for this same context without raising, so a stage that raises here is
-        a disagreement of a more serious kind, and the traceback says far more
-        about it than a one-line protocol message could.
+        Nothing.
     """
-    computed = stage.fingerprint(ctx)
+    try:
+        computed = stage.fingerprint(ctx)
+    except Exception as exc:
+        return Error(
+            job_id=assignment["job_id"],
+            stage_id=stage.id,
+            correlation_id=correlation_id,
+            message=(
+                f"stage {stage.id!r} could not fingerprint itself: {type(exc).__name__}: {exc}"
+            ),
+            kind=ErrorKind.FATAL,
+        )
     expected = assignment["fingerprint"]
     if computed == expected:
         return None
@@ -167,18 +192,18 @@ def main() -> int:
     digest that will never be looked up again).
 
     Raises:
-        Nothing from a well-formed assignment: every exception ``run_stage``
-        can produce is already caught there and returned as an ``Error``
-        message, emitted and reported via the exit code rather than raised
-        here. A malformed assignment (missing JSON keys, a ``pipeline_id``
-        and ``stage_id`` pair no entry point is registered under) is
-        deliberately NOT caught - there is no trustworthy
+        Nothing from a well-formed assignment: every exception a stage can
+        produce is translated into an ``Error`` message and reported via the
+        exit code rather than raised here - ``run_stage`` does that for
+        ``stage.run``, and ``_fingerprint_disagreement`` for
+        ``stage.fingerprint``. A malformed assignment (missing JSON keys, a
+        ``pipeline_id`` and ``stage_id`` pair no entry point is registered
+        under) is deliberately NOT caught - there is no trustworthy
         job/stage/correlation id to stamp a protocol ``error`` message with in
         that case, so the process crashes with a traceback on stderr and a
-        nonzero exit instead of emitting a message that could be wrong. The
-        fingerprint check sits *after* those ids have been read, which is
-        exactly why a disagreement is reported as an ``error`` message rather
-        than crashing the same way.
+        nonzero exit instead of emitting a message that could be wrong. Both
+        stage-code translations sit *after* those three ids have been read,
+        which is exactly why they emit rather than crash.
     """
     _use_utf8_stdout()
     assignment: dict[str, Any] = json.loads(sys.stdin.read())

@@ -88,3 +88,35 @@ class FixedFingerprint:
 def make_fixed_fingerprint(*, cas: CasStore, settings: Mapping[str, object]) -> FixedFingerprint:
     """Entry point ``it-fingerprint:fixed``."""
     return FixedFingerprint(cas)
+
+
+class Unfingerprintable:
+    """A stage whose ``fingerprint`` raises, standing in for a stage bug.
+
+    The raise is produced by production code rather than a bare ``raise``:
+    reaching for an upstream artifact the runner did not supply is the
+    realistic shape of this failure, and ``JobContext.input`` raises
+    ``ValidationError`` for it. What matters to the test is only that
+    ``fingerprint`` raises something - a stage that computes a digest from an
+    input it never declared in ``depends_on`` is one plausible way to get
+    there, and a plain programming error is another.
+    """
+
+    id = "unfingerprintable"
+    version = 1
+    depends_on: tuple[str, ...] = ()
+    settings_keys: tuple[str, ...] = ()
+
+    def __init__(self, cas: CasStore) -> None:
+        self._cas = cas
+
+    def fingerprint(self, ctx: JobContext) -> str:
+        return str(ctx.input("never-ran", "missing").digest)
+
+    def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
+        raise AssertionError("unreachable: the fingerprint always raises first")
+
+
+def make_unfingerprintable(*, cas: CasStore, settings: Mapping[str, object]) -> Unfingerprintable:
+    """Entry point ``it-fingerprint:unfingerprintable``."""
+    return Unfingerprintable(cas)

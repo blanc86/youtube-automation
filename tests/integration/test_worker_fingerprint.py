@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from .stages import FixedFingerprint
+from .stages import FixedFingerprint, Unfingerprintable
 
 pytestmark = pytest.mark.integration
 
@@ -36,15 +36,17 @@ _TESTS_ROOT = Path(__file__).resolve().parent.parent
 _PIPELINE_ID = "it-fingerprint"
 
 
-def _assignment(tmp_path: Path, *, fingerprint: str) -> dict[str, object]:
+def _assignment(
+    tmp_path: Path, *, fingerprint: str, stage_id: str = FixedFingerprint.id
+) -> dict[str, object]:
     """The shape ``dispatcher._build_assignment`` emits, with ``fingerprint``
     under the test's control."""
     return {
         "job_id": "fp-job",
-        "stage_id": FixedFingerprint.id,
+        "stage_id": stage_id,
         "project_id": "proj-1",
         "pipeline_id": _PIPELINE_ID,
-        "correlation_id": "fp-job:fixed:1",
+        "correlation_id": f"fp-job:{stage_id}:1",
         "cas_root": str(tmp_path / "cas"),
         "workdir": str(tmp_path / "work"),
         "settings": {},
@@ -92,6 +94,38 @@ def test_a_worker_refuses_a_stage_it_fingerprints_differently(tmp_path: Path) ->
     assert error["stage_id"] == FixedFingerprint.id
     assert FixedFingerprint.FINGERPRINT in str(error["message"]), "the computed digest"
     assert assigned in str(error["message"]), "the assigned digest"
+    assert completed.returncode == 1
+
+
+def test_a_stage_that_cannot_fingerprint_itself_fails_fatally(tmp_path: Path) -> None:
+    """A raising ``fingerprint`` is stage code failing, and stage code failing
+    is a FATAL protocol error - the same contract ``run_stage`` applies to
+    ``stage.run``.
+
+    Letting it escape instead would kill the worker with no terminal message,
+    which the dispatcher can only read as "died for an unknown reason": one
+    attempt charged, 5/10/20/40/80 s of backoff, and only then a failed job.
+    Every one of those retries is guaranteed to fail identically, because the
+    settings arrive over the pipe byte-for-byte the same each time.
+
+    The traceback is the cost of catching, so the assertion below is that the
+    exception *type* survives into the message - that is what reaches
+    ``jobs.last_error`` and is all an operator gets.
+    """
+    completed = _run_worker(
+        _assignment(tmp_path, fingerprint="c" * 64, stage_id=Unfingerprintable.id)
+    )
+
+    messages = _messages(completed.stdout)
+    assert [m["type"] for m in messages] == ["error"], (
+        f"a raising fingerprint must be reported, not crash the worker; got {messages!r}"
+    )
+    error = messages[0]
+    assert error["kind"] == "fatal"
+    assert error["stage_id"] == Unfingerprintable.id
+    assert "ValidationError" in str(error["message"]), "the exception type must survive"
+    assert "never-ran" in str(error["message"]), "and so must what it said"
+    assert b"Traceback" not in completed.stderr, "the worker must not have crashed"
     assert completed.returncode == 1
 
 
