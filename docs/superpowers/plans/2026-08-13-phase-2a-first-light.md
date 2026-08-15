@@ -600,6 +600,31 @@ Light review — a straightforward wrapper.
 
 The stage reads `settings["story_path"]` at run time but fingerprints over `settings["story_digest"]` — the digest is computed by the CLI at enqueue time. Fingerprinting the path would put a filesystem path into the hash; fingerprinting by reading the file would make `fingerprint()` impure.
 
+### Three things Task 3 established that bind this task
+
+**1. This is the first task that registers an entry point, so it is the first that must reinstall.** Task 3 built the registry but registered nothing, because no stage existed yet. After adding to `[project.entry-points."ytauto.stages"]` you **must** run:
+
+```bash
+pip install -e ".[dev]"
+```
+
+Forgetting produces an entry point that silently does not exist — `build_stage` raises `ValidationError: no stage registered as 'story_video:ingest_story'; registered: [...]`. The name format is `"<pipeline_id>:<stage_id>"`; setuptools preserves the colon (verified in Task 3).
+
+**2. Add the id-vs-name guard to `build_stage` as part of this task.** It was a deferred Minor from Task 3's review, promoted here because this task creates the first of seven such entries:
+
+```python
+if stage.id != stage_id:
+    raise ValidationError(
+        f"entry point {name!r} constructed a stage whose id is {stage.id!r}"
+    )
+```
+
+Without it, a mismatched entry point builds a valid `Pipeline` and a valid fingerprint dispatcher-side, and then **every worker crashes** with "no stage registered as …" until the job exhausts `_MAX_STAGE_ATTEMPTS`. Loud, but in the wrong process at the wrong time. Pin it with a test.
+
+**3. The fingerprint-divergence hazard applies to every factory from here on.** The dispatcher builds stages once per process; the worker rebuilds them per job with that job's settings; and **the dispatcher's fingerprint is the one recorded**. A factory that reads a settings key to choose a provider, and bakes `provider_id` into the stage, silently breaks caching.
+
+Task 3 added a worker-side backstop — `_fingerprint_disagreement` refuses a stage whose fingerprint disagrees with the assignment's — so this now fails loudly rather than poisoning the cache. Do not treat that as licence to be careless: a stage that fingerprints differently between processes will fail **every** job it is given, not some. Keep `make_stage` free of decisions that depend on settings the stage does not declare in `settings_keys`.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```python
