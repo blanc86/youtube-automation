@@ -69,6 +69,12 @@ def make_other(*, cas: CasStore, settings: Mapping[str, object]) -> _RecordingSt
     return _RecordingStage("other", cas, settings)
 
 
+def make_mismatched(*, cas: CasStore, settings: Mapping[str, object]) -> _RecordingStage:
+    """A factory that constructs a stage whose ``id`` disagrees with the
+    entry-point name it is registered under - the id-vs-name guard's target."""
+    return _RecordingStage("some_other_id", cas, settings)
+
+
 def _entry(name: str, factory: str) -> EntryPoint:
     """A real EntryPoint pointing back into this module, so ``load()`` runs."""
     return EntryPoint(name=name, value=f"{__name__}:{factory}", group=_GROUP)
@@ -143,6 +149,19 @@ def test_a_stage_registered_under_another_pipeline_is_not_resolved(
 
     with pytest.raises(ValidationError, match="shorts:ingest_story"):
         build_stage("shorts", "ingest_story", cas, {})
+
+
+def test_build_stage_refuses_an_entry_point_whose_stage_id_disagrees_with_its_name(
+    cas: CasStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 3's deferred guard, promoted here. Without it, a mismatched entry
+    point builds a valid ``Pipeline`` and a valid fingerprint dispatcher-side,
+    and every worker then crashes with 'no stage registered as ...' - loud,
+    but in the wrong process, long after the mistake was made."""
+    _register(monkeypatch, _entry("story_video:ingest_story", "make_mismatched"))
+
+    with pytest.raises(ValidationError, match="ingest_story"):
+        build_stage("story_video", "ingest_story", cas, {})
 
 
 def test_build_pipeline_assembles_exactly_the_stages_registered_under_its_id(

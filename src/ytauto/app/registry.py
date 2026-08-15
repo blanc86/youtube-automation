@@ -95,6 +95,14 @@ def build_stage(
             likely cause is a typo or a package that was added to the entry
             point table without a reinstall - both of which are invisible
             otherwise.
+        ValidationError: the factory built a stage whose own ``id`` does not
+            match ``stage_id`` - an entry point registered under the wrong
+            name, or a factory returning the wrong stage. Left unchecked,
+            this builds a perfectly valid ``Pipeline`` and a perfectly valid
+            fingerprint dispatcher-side, and only fails once a worker
+            rebuilds the same stage from ``assignment["stage_id"]`` and finds
+            no entry point matching *that* id - loud, but in a different
+            process, long after the mistake was made.
     """
     name = f"{pipeline_id}:{stage_id}"
     found = _registered()
@@ -103,6 +111,8 @@ def build_stage(
         raise ValidationError(f"no stage registered as {name!r}; registered: {sorted(found)}")
     factory = entry.load()
     stage: Stage = factory(cas=cas, settings=settings)
+    if stage.id != stage_id:
+        raise ValidationError(f"entry point {name!r} constructed a stage whose id is {stage.id!r}")
     return stage
 
 

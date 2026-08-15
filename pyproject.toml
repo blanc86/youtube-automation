@@ -24,6 +24,9 @@ dev = [
 [project.scripts]
 ytauto = "ytauto.cli.__main__:main"
 
+[project.entry-points."ytauto.stages"]
+"story_video:ingest_story" = "ytauto.providers.story.pasted:make_stage"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
