@@ -49,10 +49,11 @@ from typing import Any
 
 from ytauto.app.registry import build_stage
 from ytauto.app.scheduler.runner import RunnerContext, run_stage
-from ytauto.app.scheduler.worker_protocol import Message, Result, Staged, encode
+from ytauto.app.scheduler.worker_protocol import Error, Message, Result, Staged, encode
+from ytauto.core.errors import ErrorKind
 from ytauto.core.models.artifact import ArtifactRef
 from ytauto.core.models.content_hash import ContentHash
-from ytauto.core.pipeline.stage import JobContext
+from ytauto.core.pipeline.stage import JobContext, Stage
 from ytauto.infra.cas.store import CasStore
 
 
@@ -102,8 +103,68 @@ def _emit(message: Message) -> None:
     print(encode(message), flush=True)
 
 
+def _fingerprint_disagreement(
+    stage: Stage, ctx: JobContext, assignment: dict[str, Any], correlation_id: str
+) -> Error | None:
+    """Refuse to run a stage this worker fingerprints differently to its parent.
+
+    The dispatcher computes a stage's fingerprint from its *own* copy of that
+    stage - built once per process, from whatever settings its caller passed -
+    and records the stage's artifacts under it. This worker builds the stage
+    again, per job, from that job's real settings (``registry.build_stage``).
+    Nothing reconciled the two: ``run_stage`` verifies that every artifact a
+    stage claims exists in the CAS, which says nothing about the digest it
+    gets indexed under.
+
+    So a stage whose ``fingerprint`` depends on anything decided at
+    construction time - a provider chosen from the settings its factory was
+    handed being the obvious one - would have its output recorded under a
+    digest the executed configuration never reproduces. Every later run
+    recomputes the parent's digest, misses, re-runs, and records again:
+    silent, permanent cache poisoning, with nothing failing anywhere.
+
+    ``FATAL`` rather than ``RETRYABLE`` because a retry rebuilds the same two
+    disagreeing stage objects from the same two sets of settings and reaches
+    the same conclusion, having burned an attempt to do it. Both digests are
+    named because the disagreement, not either value, is the bug.
+
+    Returns None when the two agree, which is every correctly-written stage.
+
+    Raises:
+        Nothing itself. ``stage.fingerprint`` is called here rather than
+        inside ``run_stage``'s exception translation, so an exception from it
+        crashes the worker with a traceback on the per-attempt stderr log -
+        deliberately: the dispatcher already computed this same fingerprint
+        for this same context without raising, so a stage that raises here is
+        a disagreement of a more serious kind, and the traceback says far more
+        about it than a one-line protocol message could.
+    """
+    computed = stage.fingerprint(ctx)
+    expected = assignment["fingerprint"]
+    if computed == expected:
+        return None
+    return Error(
+        job_id=assignment["job_id"],
+        stage_id=stage.id,
+        correlation_id=correlation_id,
+        message=(
+            f"stage {stage.id!r} fingerprints as {computed} in this worker but the "
+            f"dispatcher assigned it {expected}; the two processes built different "
+            f"stages, and running would record artifacts under a digest this "
+            f"configuration never reproduces"
+        ),
+        kind=ErrorKind.FATAL,
+    )
+
+
 def main() -> int:
     """Run one stage assignment read from stdin. Returns the process exit code.
+
+    A stage is only run once this worker's own fingerprint for it agrees with
+    the one the dispatcher assigned - see ``_fingerprint_disagreement``, which
+    is checked after the context is built (so there is something to
+    fingerprint) and before ``run_stage`` (so nothing is written under a
+    digest that will never be looked up again).
 
     Raises:
         Nothing from a well-formed assignment: every exception ``run_stage``
@@ -114,7 +175,10 @@ def main() -> int:
         deliberately NOT caught - there is no trustworthy
         job/stage/correlation id to stamp a protocol ``error`` message with in
         that case, so the process crashes with a traceback on stderr and a
-        nonzero exit instead of emitting a message that could be wrong.
+        nonzero exit instead of emitting a message that could be wrong. The
+        fingerprint check sits *after* those ids have been read, which is
+        exactly why a disagreement is reported as an ``error`` message rather
+        than crashing the same way.
     """
     _use_utf8_stdout()
     assignment: dict[str, Any] = json.loads(sys.stdin.read())
@@ -134,7 +198,13 @@ def main() -> int:
     try:
         cas = CasStore(root=Path(assignment["cas_root"]), conn=memory_conn)
         stage = build_stage(assignment["pipeline_id"], stage_id, cas, assignment["settings"])
-        message = run_stage(stage, runner_ctx, cas)
+        # Before running anything: the stage this worker rebuilt must agree
+        # with the one the dispatcher fingerprinted, or its output would be
+        # indexed under a digest nothing reproduces.
+        disagreement = _fingerprint_disagreement(stage, ctx, assignment, correlation_id)
+        message: Message = (
+            disagreement if disagreement is not None else run_stage(stage, runner_ctx, cas)
+        )
 
         if isinstance(message, Result):
             for artifact in message.artifacts:

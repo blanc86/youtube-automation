@@ -72,6 +72,23 @@ def build_stage(
     fingerprints (see ``app.stage_support``), and a factory may legitimately
     read a key it does not fingerprint on.
 
+    **A stage's ``fingerprint`` must be a pure function of its
+    ``JobContext``, never of anything this factory decided.** This function is
+    called twice for one stage execution, in two processes, with two different
+    ``settings`` arguments: the dispatcher builds its pipeline once per
+    process from whatever its caller passed (``app.registry.build_pipeline``),
+    and the worker builds the stage again per job from that job's real
+    settings. The dispatcher's copy is the one whose digest gets recorded. A
+    factory that baked a settings-derived decision - a provider chosen from
+    ``settings["tts_engine"]``, say - into something the stage fingerprints on
+    would have the two disagree, and the stage's output would be indexed under
+    a digest the executed configuration never reproduces. Anything that
+    belongs in the fingerprint is read from ``ctx.settings`` at fingerprint
+    time, through ``settings_keys``. ``app/worker.py``'s
+    ``_fingerprint_disagreement`` refuses to run a stage where this was got
+    wrong, so the failure is loud rather than a poisoned cache - but it fails
+    the job, which is not a substitute for writing the stage correctly.
+
     Raises:
         ValidationError: no entry point is registered under this name. The
             message names what *is* registered, because the overwhelmingly

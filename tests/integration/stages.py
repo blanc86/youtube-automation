@@ -56,3 +56,35 @@ class StderrFlooder:
 def make_stderr_flooder(*, cas: CasStore, settings: Mapping[str, object]) -> StderrFlooder:
     """Entry point ``it-flood:flood``."""
     return StderrFlooder(cas)
+
+
+class FixedFingerprint:
+    """A stage that fingerprints to a known constant and does nothing else.
+
+    Exists so a test can hand a worker an assignment whose ``fingerprint``
+    field agrees or disagrees with what the stage itself computes, without
+    reproducing a real fingerprint calculation to predict the agreeing value.
+    Produces no artifacts and touches nothing, so the only thing its outcome
+    can be about is the agreement check itself.
+    """
+
+    id = "fixed"
+    version = 1
+    depends_on: tuple[str, ...] = ()
+    settings_keys: tuple[str, ...] = ()
+
+    FINGERPRINT = "a" * 64
+
+    def __init__(self, cas: CasStore) -> None:
+        self._cas = cas
+
+    def fingerprint(self, ctx: JobContext) -> str:
+        return self.FINGERPRINT
+
+    def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
+        return StageResult(artifacts=())
+
+
+def make_fixed_fingerprint(*, cas: CasStore, settings: Mapping[str, object]) -> FixedFingerprint:
+    """Entry point ``it-fingerprint:fixed``."""
+    return FixedFingerprint(cas)
