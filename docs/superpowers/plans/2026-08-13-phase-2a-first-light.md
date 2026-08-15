@@ -683,6 +683,18 @@ Light review. **This is the first network-touching provider** — its tests must
 - Consumes: `Narration`, `WordBoundary` (Task 3); artifact `story.txt` (Task 4).
 - Produces: stage id `synthesize_speech`, `settings_keys = ("voice", "rate")`, emits `narration.mp3` (kind `audio`) and `boundaries.json` (kind `json`).
 
+### Do not copy Task 4's provider-identity pattern here
+
+Task 4's stage reads `provider_id`/`provider_version` off its injected source's `capabilities` rather than from literals. **That is safe there and unsafe here**, and Task 4's own re-review flagged this task by name as the place it breaks.
+
+It is safe in Task 4 because `make_stage` injects `PastedStorySource()` unconditionally — no branch on settings — so the dispatcher (which builds the stage once per process) and the worker (which rebuilds it per job) always inject the same source and compute the same fingerprint.
+
+The moment a factory picks its provider from settings — `edge-tts` vs Piper vs ElevenLabs — the two processes can inject *different* sources from *different* settings snapshots, and their fingerprints diverge. `registry.py`'s docstring states the rule plainly: a stage's fingerprint "must be a pure function of its `JobContext`, never of anything this factory decided."
+
+Task 3's `_fingerprint_disagreement` catches this loudly rather than silently poisoning the cache — but a stage that fingerprints differently in the two processes fails **every** job it is given, not some.
+
+**For this task:** `make_stage` constructs `EdgeTtsSynthesizer` unconditionally. Provider selection from settings is a Phase 2b concern. If you find yourself writing `if settings["tts_engine"] == ...` inside a factory, stop and report it rather than working around it — that is the design question this plan deliberately deferred.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```python
@@ -1339,6 +1351,39 @@ git commit -m "feat: render the vertical master from the same upstream artifacts
 - Produces: `ytauto project create --slug <s> --title <t> --story <path>`; `ytauto run --project <slug> [--max-ticks N]`.
 
 `project create` hashes the story file, `put_bytes` it into the CAS, and stores the digest in `projects.story_digest` **and** in `settings_json` as `story_digest`, alongside `story_path`. That double-write is what makes `ingest_story`'s fingerprint pure (Task 4) while keeping the story readable on disk.
+
+### Hash the normalised text, not the raw file bytes
+
+Found by Task 4's review, and it is a real cache defect if ignored.
+
+`PastedStorySource.fetch` reads with `Path.read_text(encoding="utf-8")`, which performs universal-newline translation — `\r\n` and `\r` both become `\n`. That is required by Task 4's pinned verbatim test and is correct. But **every CAS hashing path in this repo hashes raw bytes**: `hash_file` opens `"rb"`, and `stage_file` hashes what it is handed.
+
+So if this command hashes the file directly, a CRLF story and an LF story with identical text get **different** `story_digest` values — and on Windows, this project's own platform, a story saved from a typical editor is routinely CRLF. Two identical stories would fingerprint differently and spuriously miss the cache, even though `ingest_story` stages byte-identical `story.txt` for both.
+
+Compute it over the normalised text:
+
+```python
+text = story_path.read_text(encoding="utf-8")
+story_digest = hash_bytes(text.encode("utf-8"))
+```
+
+CRLF and LF versions of the same story then hash identically — which is the correct semantics, because they *are* the same story — and the digest agrees with what `ingest_story` actually stages.
+
+- [ ] **Step 0: Pin this before anything else**
+
+```python
+def test_the_story_digest_ignores_line_ending_convention(tmp_path):
+    """A CRLF and an LF copy of one story are the same story and must
+    fingerprint identically, or every Windows-authored story misses the cache."""
+    lf = tmp_path / "lf.txt"
+    crlf = tmp_path / "crlf.txt"
+    lf.write_bytes(b"The train never stopped.\nIt kept going.\n")
+    crlf.write_bytes(b"The train never stopped.\r\nIt kept going.\r\n")
+
+    assert story_digest_for(lf) == story_digest_for(crlf)
+```
+
+**Guard-pin it:** switch `story_digest_for` to `hash_file(path)` (raw bytes). **Predicted:** the test fails with two differing 64-character hex digests — not an error. Report if it fails any other way.
 
 - [ ] **Step 1: Write the failing test**
 
