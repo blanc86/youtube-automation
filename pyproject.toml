@@ -30,6 +30,7 @@ ytauto = "ytauto.cli.__main__:main"
 "story_video:synthesize_speech" = "ytauto.providers.tts.edge:make_stage"
 "story_video:transcribe" = "ytauto.providers.transcribe.edge_boundary:make_stage"
 "story_video:plan_timeline" = "ytauto.app.stages.plan_timeline:make_stage"
+"story_video:select_broll" = "ytauto.providers.visual.library:make_stage"
 
 [tool.setuptools.packages.find]
 where = ["src"]
