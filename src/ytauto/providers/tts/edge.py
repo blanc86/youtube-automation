@@ -37,7 +37,7 @@ without touching the network.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 
 import edge_tts
 
@@ -86,25 +86,41 @@ async def _drain(stream: AsyncIterator[edge_tts.typing.TTSChunk]) -> Narration:
     return Narration(audio=bytes(audio), boundaries=tuple(boundaries))
 
 
-def _consume(stream: AsyncIterator[edge_tts.typing.TTSChunk]) -> Narration:
-    """Run ``_drain`` to completion and translate edge-tts's exceptions into
-    ``ProviderError``.
+def _consume(make_stream: Callable[[], AsyncIterator[edge_tts.typing.TTSChunk]]) -> Narration:
+    """Build a stream via ``make_stream`` and drain it, translating any
+    exception - raised while *building* the stream or while *draining* it -
+    into a ``ProviderError``.
 
-    This is the seam ``tests/unit/providers/test_edge_tts.py``'s
-    ``_synthesize_from``/``_synthesize_raising`` helpers inject a fake stream
-    through: calling this directly with a fake async generator exercises the
-    exact accumulation and error-mapping logic ``EdgeTtsSynthesizer.synthesize``
-    uses, with no websocket ever opened - which is what keeps this the first
-    network-touching provider's tests hermetic.
+    Takes a zero-argument **factory**, not an already-built stream, on
+    purpose. Task 5's review found that an earlier version of this function
+    took the stream directly, so ``EdgeTtsSynthesizer.synthesize`` had to
+    build ``edge_tts.Communicate(...)`` *before* calling this function -
+    outside this try/except entirely. That matters because
+    ``Communicate.__init__`` validates ``voice``/``rate``/``volume``/``pitch``
+    synchronously (``edge_tts.data_classes.TTSConfig.__post_init__``) and can
+    raise a bare ``ValueError`` - for a malformed voice string like
+    ``"not-a-real-voice"`` - before ``.stream()`` is ever called, let alone
+    iterated. The old split left that specific call uncovered: the headline
+    FATAL case the brief describes leaked past the mapping table entirely,
+    caught only by ``run_stage``'s unrelated catch-all one layer up. Passing
+    a factory here instead means ``EdgeTtsSynthesizer.synthesize`` can defer
+    *all* of ``Communicate(...)`` - construction and iteration alike - to
+    inside this one try/except, with nothing constructed outside it.
+
+    This is the seam ``tests/unit/providers/test_edge_tts.py`` drives
+    directly: ``_synthesize_from``/``_synthesize_raising`` wrap a fake stream
+    in a zero-arg lambda the same shape ``EdgeTtsSynthesizer.synthesize``
+    uses, and ``test_synthesize_maps_a_construction_time_error_to_fatal``
+    exercises ``synthesize`` itself with a patched ``edge_tts.Communicate``
+    that raises at ``__init__`` - the exact call path this factory shape
+    exists to cover. No test opens a websocket.
 
     Raises:
         ProviderError: FATAL, for ``ValueError`` (edge-tts validates a
             malformed voice string, e.g. ``"not-a-real-voice"``, synchronously
-            at ``Communicate()`` construction - before this function is even
-            reached in production, but the mapping lives here so the fake-raise
-            tests exercise the real logic) and for
-            ``edge_tts.exceptions.NoAudioReceived`` (a well-formed voice name
-            that simply does not exist - confirmed against the installed
+            at ``Communicate()`` construction, before any network call) and
+            for ``edge_tts.exceptions.NoAudioReceived`` (a well-formed voice
+            name that simply does not exist - confirmed against the installed
             package: the server accepts the request but the stream ends with
             no audio). Neither will succeed on retry.
         ProviderError: RETRYABLE, for anything else - a dropped connection, a
@@ -112,7 +128,7 @@ def _consume(stream: AsyncIterator[edge_tts.typing.TTSChunk]) -> Narration:
             nothing about whether it will be flaky on the next attempt.
     """
     try:
-        return asyncio.run(_drain(stream))
+        return asyncio.run(_drain(make_stream()))
     except (ValueError, edge_tts.exceptions.NoAudioReceived) as exc:
         raise ProviderError(str(exc), provider_id=PROVIDER_ID, kind=ErrorKind.FATAL) from exc
     except Exception as exc:
@@ -151,13 +167,31 @@ class EdgeTtsSynthesizer:
     def synthesize(self, text: str, *, voice: str) -> Narration:
         """Return the synthesised audio and its word boundaries.
 
+        ``edge_tts.Communicate(...)`` is not constructed here directly - it is
+        deferred into ``make_stream``, a zero-argument closure passed to
+        ``_consume``, so that *both* its own synchronous validation (which
+        can raise) and the network call its ``.stream()`` makes fall inside
+        one shared error-mapping boundary. See ``_consume``'s docstring for
+        why an earlier version of this split got that wrong.
+
         Raises:
-            ProviderError: see ``_consume``.
+            ProviderError: FATAL, for a malformed voice string (edge-tts
+                validates ``voice``/``rate`` synchronously when
+                ``Communicate(...)`` is constructed, before any network call)
+                or a well-formed voice name that does not exist (discovered
+                only after a real request - see ``_consume``). Neither will
+                succeed on retry.
+            ProviderError: RETRYABLE, for anything else raised while building
+                or draining the stream - a dropped connection, a websocket
+                error, a timeout.
         """
-        stream = edge_tts.Communicate(
-            text, voice, rate=self._rate, boundary="WordBoundary"
-        ).stream()
-        return _consume(stream)
+
+        def make_stream() -> AsyncIterator[edge_tts.typing.TTSChunk]:
+            return edge_tts.Communicate(
+                text, voice, rate=self._rate, boundary="WordBoundary"
+            ).stream()
+
+        return _consume(make_stream)
 
 
 def make_stage(*, cas: CasStore, settings: Mapping[str, object]) -> SynthesizeSpeech:

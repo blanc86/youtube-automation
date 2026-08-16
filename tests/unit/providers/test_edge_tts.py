@@ -10,11 +10,24 @@ What belongs here is everything specific to this concrete provider: that
 ``SpeechSynthesizer`` Protocol it claims to, and that ``make_stage`` wires
 the two together correctly.
 
-This is the first network-touching provider in the project. Every test here
-goes through ``_consume`` - the exact seam ``EdgeTtsSynthesizer.synthesize``
-itself uses - with a fake async stream standing in for a real
-``edge_tts.Communicate(...).stream()``, or patches ``edge_tts.Communicate``
+This is the first network-touching provider in the project. Most tests here
+go through ``_consume`` - the exact seam ``EdgeTtsSynthesizer.synthesize``
+itself uses - with a fake stream factory standing in for a real
+``lambda: edge_tts.Communicate(...).stream()``, or patch ``edge_tts.Communicate``
 outright. No test in this module opens a websocket.
+
+``test_synthesize_maps_a_construction_time_error_to_fatal`` deliberately
+does *not* go through ``_consume`` directly - it drives
+``EdgeTtsSynthesizer.synthesize`` itself, with a patched ``Communicate``
+whose ``__init__`` raises. Task 5's review found that the production code
+once let exactly this call path leak a bare ``ValueError`` around the
+mapping below, uncaught by anything in this module, because ``_consume``
+used to take an already-built stream rather than a factory - the
+construction call happened outside its try/except entirely. Every test that
+only exercises ``_consume`` (via ``_synthesize_from``/``_synthesize_raising``)
+would have kept passing throughout that defect's lifetime, since none of
+them cross the seam where it lived. That is the reason this one test exists
+separately: it is the one that would have caught it.
 """
 
 from __future__ import annotations
@@ -41,9 +54,10 @@ from ytauto.infra.db.migrations import apply_migrations
 from ytauto.providers.tts.edge import EdgeTtsSynthesizer, _consume, make_stage
 
 # ---------------------------------------------------------------------------
-# The fake-stream seam. `_consume` is the same function `synthesize` calls;
-# feeding it a fake async generator exercises the real accumulation and
-# error-mapping logic with no network involved.
+# The fake-stream-factory seam. `_consume` takes a zero-arg callable that
+# builds the stream - the same shape `EdgeTtsSynthesizer.synthesize` uses for
+# its own `make_stream` closure - so feeding it a fake exercises the real
+# accumulation and error-mapping logic with no network involved.
 # ---------------------------------------------------------------------------
 
 
@@ -58,11 +72,17 @@ async def _raising_stream(exc: Exception) -> AsyncIterator[dict[str, Any]]:
 
 
 def _synthesize_from(events: list[dict[str, Any]]) -> Narration:
-    return _consume(_fake_stream(events))
+    return _consume(lambda: _fake_stream(events))
 
 
 def _synthesize_raising(exc: Exception) -> Narration:
-    return _consume(_raising_stream(exc))
+    """Simulate a *mid-stream* failure - the stream builds fine, then raises
+    once ``_drain`` starts iterating it. Contrast with
+    ``test_synthesize_maps_a_construction_time_error_to_fatal`` below, which
+    simulates a failure in building the stream itself - the case this
+    function's shape cannot reach, since ``_raising_stream(exc)`` only raises
+    once iterated, never when called."""
+    return _consume(lambda: _raising_stream(exc))
 
 
 def test_word_boundary_events_become_word_boundaries() -> None:
@@ -113,6 +133,43 @@ def test_a_well_formed_but_nonexistent_voice_is_also_fatal() -> None:
             )
         )
     assert exc.value.kind is ErrorKind.FATAL
+
+
+def test_synthesize_maps_a_construction_time_error_to_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact defect Task 5's review found: ``edge_tts.Communicate.__init__``
+    validates ``voice``/``rate``/``volume``/``pitch`` synchronously
+    (``edge_tts.data_classes.TTSConfig.__post_init__``) and can raise
+    ``ValueError`` before ``.stream()`` is ever called - confirmed live
+    against the installed package:
+    ``edge_tts.Communicate("x", voice="not-a-real-voice")`` raises
+    ``ValueError("Invalid voice 'not-a-real-voice'.")`` with no network touched
+    at all. An earlier version of ``_consume`` took an already-built stream,
+    so ``EdgeTtsSynthesizer.synthesize`` had to build ``Communicate(...)``
+    *before* calling it - outside the try/except that maps FATAL/RETRYABLE
+    entirely. That left the mapping table unreachable for its own headline
+    case: a bare ``ValueError`` leaked straight out of ``synthesize``, caught
+    only by ``run_stage``'s unrelated catch-all one layer up (which happened
+    to still classify it FATAL, by accident, through a different mechanism).
+
+    Unlike every other error-mapping test in this module, this one drives
+    ``EdgeTtsSynthesizer.synthesize`` itself - not ``_consume`` directly - by
+    patching ``edge_tts.Communicate`` to raise at construction. That is the
+    point: a test that only reaches ``_consume`` cannot observe whether
+    construction happens inside or outside its boundary, so it cannot catch
+    this class of regression."""
+
+    class _RaisingCommunicate:
+        def __init__(self, text: str, voice: str, **kwargs: Any) -> None:
+            raise ValueError(f"Invalid voice {voice!r}.")
+
+    monkeypatch.setattr(edge_tts, "Communicate", _RaisingCommunicate)
+
+    with pytest.raises(ProviderError) as exc:
+        EdgeTtsSynthesizer().synthesize("hello", voice="not-a-real-voice")
+    assert exc.value.kind is ErrorKind.FATAL
+    assert exc.value.provider_id == "edge-tts"
 
 
 def test_the_capability_descriptor_declares_a_free_networked_no_gpu_provider() -> None:

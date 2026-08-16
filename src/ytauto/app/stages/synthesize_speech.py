@@ -91,7 +91,16 @@ class SynthesizeSpeech:
                 failure.
             ProviderError: propagated verbatim from the injected
                 synthesizer's ``synthesize`` for any other failure - retried
-                or not per that error's own ``kind``.
+                or not per that error's own ``kind``. This stage trusts the
+                injected ``SpeechSynthesizer`` to raise ``ProviderError`` for
+                everything it can classify, never a bare exception;
+                ``EdgeTtsSynthesizer.synthesize`` holds up that end (a defect
+                where it briefly did not - a malformed voice string leaking a
+                bare ``ValueError`` around its own mapping - was found in
+                Task 5's review and fixed in ``providers/tts/edge.py``). A
+                synthesizer that violated this would still fail safely:
+                ``run_stage`` classifies any non-``ProviderError`` exception
+                FATAL regardless.
             KeyError: if ``ctx.settings`` carries no ``"voice"`` - a job
                 enqueued with no voice selected. ``run_stage`` translates any
                 exception raised here into a FATAL worker-protocol error, so
