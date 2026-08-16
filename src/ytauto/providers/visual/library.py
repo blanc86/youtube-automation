@@ -89,6 +89,19 @@ class LibraryVisualStrategy:
            fill every candidate can be drawn at most once; repeats become
            possible only after a refill, which is exactly when the library
            has been exhausted for that segment's duration requirement.
+
+           A refill alone is not enough to guarantee this, though: a fresh
+           shuffle of the whole library can, by chance, place the clip that
+           was just drawn (the one whose exhaustion triggered the refill)
+           back at the front - an immediate, visible back-to-back repeat
+           across the boundary, which is exactly the failure this rule
+           exists to prevent. So immediately after a refill, if the first
+           eligible candidate is the immediately-prior selection *and* more
+           than one eligible candidate exists, it is rotated to the back
+           instead of being drawn again right away. Guarded on "more than
+           one eligible candidate": with only one clip either globally or
+           after the duration filter, there is no alternative and repeating
+           it is correct, not a bug.
         2. **A clip shorter than its segment is never chosen for it.** Before
            drawing, the pool is filtered to candidates whose ``duration_s``
            is at least the segment's own duration. A candidate that fails
@@ -129,13 +142,16 @@ class LibraryVisualStrategy:
         rng = random.Random(seed)
         pool: list[VisualCandidate] = []
         placements: list[VisualPlacement] = []
+        previous_asset_id: str | None = None
 
         for duration_s in segment_durations:
             eligible = [c for c in pool if c.duration_s >= duration_s]
+            refilled = False
             if not eligible:
                 pool = list(candidates)
                 rng.shuffle(pool)
                 eligible = [c for c in pool if c.duration_s >= duration_s]
+                refilled = True
             if not eligible:
                 longest = max(c.duration_s for c in candidates)
                 raise ProviderError(
@@ -147,8 +163,20 @@ class LibraryVisualStrategy:
                     kind=ErrorKind.FATAL,
                 )
 
+            if (
+                refilled
+                and previous_asset_id is not None
+                and eligible[0].asset_id == previous_asset_id
+                and len(eligible) > 1
+            ):
+                # A fresh shuffle can, by chance, put the clip that just
+                # exhausted the previous pass back at the front - rotate past
+                # it rather than draw it again immediately. See rule 1 above.
+                eligible = eligible[1:] + eligible[:1]
+
             chosen = eligible[0]
             pool.remove(chosen)
+            previous_asset_id = chosen.asset_id
 
             if chosen.duration_s > duration_s:
                 in_point_s = rng.uniform(0.0, chosen.duration_s - duration_s)

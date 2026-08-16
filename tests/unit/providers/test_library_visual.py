@@ -88,7 +88,18 @@ def test_the_same_seed_selects_the_same_clips() -> None:
 
 
 def test_a_clip_shorter_than_its_segment_is_never_chosen_for_it() -> None:
-    """A short clip would leave the tail of the segment black."""
+    """A short clip would leave the tail of the segment black.
+
+    Reproduced verbatim from this task's brief, seed and all - but this
+    exact seed does not actually exercise the duration filter: verified
+    during this task's guard-pin review that
+    ``random.Random(1).shuffle(["short", "long"])`` puts ``"long"`` first
+    regardless of any filtering, so this assertion holds whether or not the
+    filter code exists. Left as-is because the brief gives it verbatim and
+    it is still a legitimate (if coincidentally weak) positive check; the
+    property is actually pinned, across 20 seeds, by
+    ``test_a_clip_too_short_for_only_one_segment_still_serves_the_others``
+    below. See this task's report for the full account."""
     segments = _select(
         n_segments=1,
         clips=[_clip("short", 1.0), _clip("long", 30.0)],
@@ -198,6 +209,47 @@ def test_a_clip_too_short_for_only_one_segment_still_serves_the_others() -> None
         # answer - the point of this test is only that selecting it did not
         # raise.
         assert segments[1].asset_id in {"short", "long"}
+
+
+# --- The refill-boundary repeat, per this task's review ----------------------
+
+
+def test_no_two_consecutive_segments_repeat_across_a_refill_boundary() -> None:
+    """The Important review finding on this task: a fresh shuffle on refill
+    can, by chance, put the clip that just exhausted the previous pass back
+    at the front of the new one, so it gets drawn again immediately - a
+    visible back-to-back repeat that ``test_no_clip_repeats_until_the_library_
+    is_exhausted`` (4 segments against 6 clips, never reaches a refill) and
+    ``test_selection_wraps_when_there_are_more_segments_than_clips`` (asserts
+    only ``len(segments) == 5``) both miss entirely.
+
+    Reproduces the review's own fixture - 2 clips, 5 segments, seed=1 - which
+    forces two refills (5 draws from a 2-clip pool) and is the exact case the
+    reviewer used to demonstrate the bug against the pre-fix code: unfixed,
+    this produces ``['clip-1', 'clip-0', 'clip-1', 'clip-0', 'clip-0']``,
+    repeating ``clip-0`` across the segment-4/segment-5 boundary. Also swept
+    across 200 seeds with a larger library (6 clips, 12 segments - the
+    review's own wider sweep, which found the bug on ~21% of seeds) so this
+    is not a single-seed guard that could itself get lucky."""
+    segments = _select(n_segments=5, clips=_clips(2), seed=1)
+    ids = [s["clip_id"] for s in segments]
+    for i in range(len(ids) - 1):
+        assert ids[i] != ids[i + 1], f"consecutive repeat at index {i}: {ids}"
+
+    for seed in range(200):
+        segments = _select(n_segments=12, clips=_clips(6), seed=seed)
+        ids = [s["clip_id"] for s in segments]
+        for i in range(len(ids) - 1):
+            assert ids[i] != ids[i + 1], f"consecutive repeat at index {i}, seed={seed}: {ids}"
+
+
+def test_a_single_clip_library_still_succeeds_and_repeats() -> None:
+    """The guard on the refill-boundary fix above must not deadlock or raise
+    when there is no alternative candidate to rotate to - with one clip,
+    every segment is necessarily filled by it, and that repetition is
+    correct, not a bug."""
+    segments = _select(n_segments=4, clips=[_clip("only", 30.0)], seed=1)
+    assert [s["clip_id"] for s in segments] == ["only", "only", "only", "only"]
 
 
 def test_the_capability_descriptor_declares_a_free_offline_no_gpu_provider() -> None:
