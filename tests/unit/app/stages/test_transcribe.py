@@ -252,10 +252,40 @@ def test_run_propagates_a_provider_error_from_the_injected_transcriber(cas: CasS
     assert exc.value.kind is ErrorKind.RETRYABLE
 
 
-def test_run_reads_through_the_injected_transcriber_not_a_hardcoded_one(cas: CasStore) -> None:
-    """The whole point of typing ``Transcribe`` against ``Transcriber`` rather
-    than ``EdgeBoundaryTranscriber``: a fake must be substitutable, and the
-    stage must never construct its own concrete transcriber."""
+def test_run_writes_exactly_what_the_transcriber_returned_not_a_recomputation(
+    cas: CasStore,
+) -> None:
+    """Not about import-linter's forbidden contract - ``app`` cannot import a
+    concrete ``Transcriber`` at all, so "hardcode a real provider" cannot be
+    written here without the import-linter gate catching it first, which
+    made an earlier version of this test's own docstring claim
+    ("the stage must never construct its own concrete transcriber") the
+    wrong reason for a real, live check.
+
+    The failure mode this test actually catches is narrower and easy to
+    introduce by accident: ``run()`` calling ``self._transcriber.transcribe(...)``
+    for its side effect (so a naive check of "was the fake invoked" still
+    passes) and then silently recomputing ``triples`` itself from
+    ``narration.boundaries`` instead of trusting what came back - the exact
+    duplication ``EdgeBoundaryTranscriber.transcribe``'s own docstring warns
+    against ("this provider has only one definition of... a second place is
+    exactly the kind of duplication that could drift"), just relocated one
+    layer up into the stage.
+
+    That mutation was verified live during this test's review: with
+    ``boundaries=()`` (empty ``boundaries.json``) and the fake configured to
+    return a distinct, unrelated sentinel triple, a stage that recomputes
+    inline from ``narration.boundaries`` produces ``[]`` while a stage that
+    trusts the transcriber's return produces the sentinel - so this test
+    fails on that mutation while every other test in this file keeps
+    passing. In particular
+    ``test_run_emits_word_timings_json``'s fixture does *not* catch it: its
+    boundaries and its fake's return value were chosen to be realistic and
+    therefore agree with each other, so a stage that quietly recomputed
+    instead of reading the injected object's answer would produce the same
+    output either way. This test's boundaries and fake return are
+    deliberately unrelated for exactly that reason - see this task's fix
+    report."""
     boundaries_digest = cas.stage_file(b"[]", kind="json")
     fake = _FakeTranscriber((("only-the-fake-could-produce-this", 0.0, 1.0),))
     stage = Transcribe(cas=cas, transcriber=fake)
