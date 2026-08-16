@@ -1230,6 +1230,20 @@ git commit -m "feat: select B-roll segments from the library manifest"
 - Consumes: `segments.json` (Task 10), `timeline.json` (Task 7), `narration.mp3` (Task 5), the manifest (Task 9), `render_ass` (Task 8).
 - Produces: `compose_args(*, clips, ass_path, audio_path, out_path, width, height, encoder) -> list[str]`. Stage id `compose_landscape`, `settings_keys = ("broll_manifest_digest", "caption_style", "encoder")`, emits `master_1920x1080.mp4` (kind `video`) and `captions.ass` (kind `text`).
 
+### Four things earlier tasks established that bind this task
+
+**1. Pass `font_size` explicitly — the default is canvas-agnostic and wrong for one of the two.** Task 8's review deferred this decision here. `render_ass`'s `_DEFAULT_FONT_SIZE = 96` is a fixed constant: ~5% of frame height on the 1920-tall vertical canvas but ~8.9% on the 1080-tall landscape one, a nearly 2× difference in apparent size. Derive it from `height` (a fraction such as `height // 20`) or pass a per-canvas literal, and say which you chose. Never rely on the default.
+
+**2. `segments.json` names `clip_id`, never a digest — resolve it against the manifest for *your* canvas.** Task 10 emits `{"clip_id", "in_point_s", "duration_s"}` precisely so one selection serves both canvases. This stage reads the manifest (its digest arrives in `settings["broll_manifest_digest"]`) and resolves each `clip_id` to `normalised_landscape_digest`. Task 12 does the same against `normalised_vertical_digest`. **That means `broll_manifest_digest` belongs in this stage's `settings_keys`**, not only `select_broll`'s.
+
+**3. `-shortest` truncates the narration tail, and that is accepted.** Task 7's stage derives `audio_duration_s` from the last word's end rather than the real audio duration, so the video track ends where speech stops while `narration.mp3` may carry trailing silence. With `-shortest` the mux ends at the shorter stream — the video — so the tail of the audio is dropped. **This is a recorded, accepted Phase 2a limitation, not a bug to fix here.** Do not add padding, do not extend the last segment, and do not remove `-shortest`.
+
+**4. A failed ffmpeg must name its stderr log.** Task 1 redirects each worker's stderr to `ctx.workdir / f"stderr.attempt-{attempts}.log"`. When ffmpeg exits non-zero, the `ProviderError` message must name that path — the reason the log exists is that ffmpeg's real diagnostic is a hundred lines that will never fit in an error message.
+
+### Encoder availability on this machine, verified before dispatch
+
+`ffmpeg 7.1.1` with `h264_nvenc`, `h264_qsv`, `h264_amf` and `libx264` all present, and the `ass`, `concat`, `scale` and `pad` filters available. A test `h264_nvenc` encode completed without error. **Still implement the fallback chain** — CI runs macOS where nvenc does not exist, so a test asserting nvenc specifically would fail there. Assert on output dimensions and duration, never on which encoder was selected.
+
 - [ ] **Step 1: Write the failing argument tests**
 
 ```python
