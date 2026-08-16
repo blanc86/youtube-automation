@@ -128,6 +128,7 @@ def test_a_lone_backslash_is_doubled_so_it_cannot_form_an_ass_escape() -> None:
     ass = render_ass(tl, width=1080, height=1920, style=_style())
     dialogue_text = ass.split("Dialogue:")[1]
     assert "back\\\\Nslash" in dialogue_text, "the one original backslash must survive, doubled"
+    assert "back\\Nslash" not in dialogue_text, "the raw single-backslash form must not survive"
 
 
 # --- extra coverage: style defaults ------------------------------------------
@@ -187,6 +188,23 @@ def test_a_genuinely_fractional_centisecond_still_truncates_down() -> None:
     ][0]
     assert "0:00:00.29" in line
     assert "0:00:00.30" not in line
+
+
+def test_a_genuine_value_near_a_centisecond_boundary_does_not_round_up() -> None:
+    """1.499999996s is genuinely 0.000000004s short of 1.50s - not float64
+    noise (that's ~1e-13, this gap is ~4e-9) - and must still truncate down
+    to 0:00:01.49, not up to 0:00:01.50. A too-wide epsilon (this guard used
+    to use ``round(seconds * 100, 6)``, which snaps anything within 5e-7 of
+    an integer) would round this up, landing exactly on the
+    late-and-clips-the-word failure the truncation rule exists to prevent."""
+    tl = _timeline(groups=[_group(words=[("w", 1.499999996, 1.499999996)])])
+    line = [
+        ln
+        for ln in render_ass(tl, width=1080, height=1920, style=_style()).splitlines()
+        if ln.startswith("Dialogue:")
+    ][0]
+    assert "0:00:01.49" in line
+    assert "0:00:01.50" not in line
 
 
 def test_timestamps_past_a_minute_carry_into_minutes_and_hours() -> None:

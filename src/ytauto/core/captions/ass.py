@@ -100,17 +100,24 @@ def _format_timestamp(seconds: float) -> str:
     appearing one centisecond early is invisible; one late can clip the
     word's own first frame.
 
-    ``round(seconds * 100, 6)`` before truncating exists only to absorb
-    float64 representation noise - ``0.29 * 100`` is
-    ``28.999999999999996`` in float64, which a bare ``int()`` truncates to
-    ``28`` instead of the intended ``29``. Rounding to 6 decimal places
-    first absorbs that ~1e-13 noise without touching a genuinely fractional
-    centisecond (which differs from an integer by >= 1e-3, several orders of
-    magnitude more than the noise this guards against) - so a real
-    truncation, like 0.297s down to 29 centiseconds, is untouched. Verified
-    directly: see ``test_a_float_noise_near_integer_centisecond_does_not_truncate_short``.
+    The ``+ 1e-9`` before truncating exists only to absorb float64
+    representation noise - ``0.29 * 100`` is ``28.999999999999996`` in
+    float64, which a bare ``int()`` truncates to ``28`` instead of the
+    intended ``29``. ``1e-9`` is sized to that noise specifically (float64
+    noise from a multiply-by-100 is on the order of 1e-13, so 1e-9 is
+    still four orders of magnitude of headroom above it) rather than a
+    coarser fix like ``round(seconds * 100, 6)``: rounding to 6 decimal
+    places snaps anything within 5e-7 of an integer, which is six orders of
+    magnitude more permissive than the noise it exists to absorb - wide
+    enough to catch a *genuine* value like ``1.499999996`` and truncate it
+    up to ``150`` instead of down to the correct ``149``, exactly the
+    late-and-clips-the-word failure this function's own truncation rule
+    exists to prevent. The narrow epsilon absorbs the noise case without
+    ever promoting a genuine near-boundary value. Verified directly: see
+    ``test_a_float_noise_near_integer_centisecond_does_not_truncate_short``
+    and ``test_a_genuine_value_near_a_centisecond_boundary_does_not_round_up``.
     """
-    total_centiseconds = int(round(seconds * 100, 6))
+    total_centiseconds = int(seconds * 100 + 1e-9)
     centiseconds = total_centiseconds % 100
     total_seconds = total_centiseconds // 100
     secs = total_seconds % 60
