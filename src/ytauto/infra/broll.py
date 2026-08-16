@@ -152,7 +152,17 @@ class BrollLibrary:
         normalised digests, duration, source dimensions, and every provenance
         field) happens last, inside a single ``transaction(conn,
         immediate=True)``, so a crash or ffmpeg failure partway through never
-        leaves a half-written row.
+        leaves a half-written row. All three digests are ``retain()``-ed
+        inside that same transaction: the row and its protection against the
+        CAS evictor commit atomically or not at all - the established pattern
+        for every persistent row that references a digest (see
+        ``dispatcher.py``'s job-pin retain, alongside its own note that an
+        un-retained digest is a silent, permanent-until-eviction leak the
+        moment the evictor gets a production caller). Without this, every
+        ingested clip's digests sit at ``refcount = 0`` and are eligible for
+        deletion under disk pressure while ``broll_clips`` rows and the
+        manifest still point at them - exactly the DMCA provenance record
+        this task exists to make durable.
 
         Raises:
             ValidationError: ``source_url`` or ``licence`` is blank, ``path``
@@ -166,9 +176,13 @@ class BrollLibrary:
             sqlite3.OperationalError: the write lock could not be acquired
                 within ``busy_timeout``.
         """
-        if not source_url.strip():
+        # `not source_url.strip()` alone raises AttributeError instead of
+        # ValidationError if a caller ever passes None despite the str
+        # annotation - the short-circuit keeps this a validation error, not a
+        # crash, matching the emptiness check it already promises to make.
+        if not source_url or not source_url.strip():
             raise ValidationError("source_url must not be blank")
-        if not licence.strip():
+        if not licence or not licence.strip():
             raise ValidationError("licence must not be blank")
 
         binaries = locate()
@@ -225,6 +239,12 @@ class BrollLibrary:
                     now,
                 ),
             )
+            # Pin all three against the evictor in the same transaction as the
+            # row that references them - see the docstring above. Each digest
+            # already has a cas_objects row (put_file/record_blob wrote it
+            # earlier), so retain() only ever increments refcount here.
+            for digest in (source_digest, landscape_digest, vertical_digest):
+                self._cas.retain(digest)
         return clip_id
 
     def write_manifest(self) -> ContentHash:
@@ -239,7 +259,13 @@ class BrollLibrary:
 
         Ordered by ``added_at`` so the manifest is deterministic across
         rewrites for an unchanged library, rather than depending on SQLite's
-        unspecified row order.
+        unspecified row order - with ``id`` as a secondary key, since two
+        clips added within the same ``utc_now_iso()`` tick would otherwise
+        order arbitrarily between rewrites, changing the manifest's bytes (and
+        so its digest) with no change to the library at all. That would
+        silently ripple into a spurious cache miss wherever the manifest
+        digest feeds a fingerprint downstream (e.g. ``select_broll``'s), with
+        no visible cause.
 
         Raises:
             sqlite3.Error: the query fails.
@@ -250,7 +276,7 @@ class BrollLibrary:
             SELECT id, duration_s, width, height,
                    normalised_landscape_digest, normalised_vertical_digest
             FROM broll_clips
-            ORDER BY added_at ASC
+            ORDER BY added_at ASC, id ASC
             """
         ).fetchall()
         entries = [

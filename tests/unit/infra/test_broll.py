@@ -19,7 +19,8 @@ import pytest
 
 from ytauto.core.errors import RenderError, ValidationError
 from ytauto.infra.broll import BrollLibrary, _run_normalise, normalise_clip
-from ytauto.infra.cas.store import CasStore
+from ytauto.infra.cas.store import CasStore, hash_file
+from ytauto.infra.db.engine import transaction
 from ytauto.infra.ffmpeg.locator import FfmpegBinaries
 from ytauto.infra.ffmpeg.media_probe import MediaInfo
 
@@ -153,6 +154,31 @@ def test_add_inserts_a_row_with_both_digests_and_the_probed_source_metadata(
     assert row["normalised_landscape_digest"] != row["normalised_vertical_digest"]
 
 
+def test_add_retains_all_three_digests_against_the_evictor(
+    db_conn: sqlite3.Connection,
+    cas: CasStore,
+    source_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row referencing a digest sitting at refcount=0 is a silent-deletion
+    trap the moment the evictor gets a production caller (it has none today -
+    see dispatcher.py's own retain, whose comment warns about exactly this).
+    Every digest a broll_clips row references must be retained in the same
+    transaction as the insert."""
+    _patch_ffmpeg(monkeypatch, tmp_path)
+
+    clip_id = BrollLibrary(db_conn, cas).add(source_file, source_url="local", licence="CC0")
+
+    row = db_conn.execute("SELECT * FROM broll_clips WHERE id = ?", (clip_id,)).fetchone()
+    for digest in (
+        row["source_digest"],
+        row["normalised_landscape_digest"],
+        row["normalised_vertical_digest"],
+    ):
+        assert cas.refcount(digest) == 1
+
+
 def test_add_stores_the_original_source_by_copy_not_move(
     db_conn: sqlite3.Connection,
     cas: CasStore,
@@ -198,6 +224,34 @@ def test_add_rejects_a_blank_source_url(
     assert db_conn.execute("SELECT count(*) AS n FROM broll_clips").fetchone()["n"] == 0
 
 
+def test_add_rejects_a_none_licence_as_a_validation_error_not_a_crash(
+    db_conn: sqlite3.Connection,
+    cas: CasStore,
+    source_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller violating the str annotation must still get ValidationError,
+    not an AttributeError from calling .strip() on None."""
+    _patch_ffmpeg(monkeypatch, tmp_path)
+
+    with pytest.raises(ValidationError, match="licence"):
+        BrollLibrary(db_conn, cas).add(source_file, source_url="local", licence=None)  # type: ignore[arg-type]
+
+
+def test_add_rejects_a_none_source_url_as_a_validation_error_not_a_crash(
+    db_conn: sqlite3.Connection,
+    cas: CasStore,
+    source_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_ffmpeg(monkeypatch, tmp_path)
+
+    with pytest.raises(ValidationError, match="source_url"):
+        BrollLibrary(db_conn, cas).add(source_file, source_url=None, licence="CC0")  # type: ignore[arg-type]
+
+
 def test_add_raises_render_error_when_ffmpeg_fails(
     db_conn: sqlite3.Connection,
     cas: CasStore,
@@ -218,6 +272,13 @@ def test_add_raises_render_error_when_ffmpeg_fails(
         BrollLibrary(db_conn, cas).add(source_file, source_url="local", licence="CC0")
 
     assert db_conn.execute("SELECT count(*) AS n FROM broll_clips").fetchone()["n"] == 0
+    # The source was already staged before the second transcode failed. It is
+    # correctly left un-retained at refcount=0 - an orphan the evictor is free
+    # to reclaim, not a leak to clean up. No row references it, so there is
+    # nothing for a retain to protect.
+    source_digest = hash_file(source_file)
+    assert cas.exists(source_digest)
+    assert cas.refcount(source_digest) == 0
 
 
 def test_add_reports_the_probe_failure_when_duration_cannot_be_determined(
@@ -300,3 +361,45 @@ def test_write_manifest_rewrites_to_reflect_every_add_since_the_last_call(
     assert first_digest != second_digest
     entries = json.loads(cas.read_bytes(second_digest))
     assert len(entries) == 1
+
+
+def test_write_manifest_breaks_added_at_ties_by_id_for_a_stable_digest(
+    db_conn: sqlite3.Connection, cas: CasStore
+) -> None:
+    """Two clips sharing one utc_now_iso() tick must still order the same way
+    on every rewrite - otherwise the manifest's bytes (and so its digest, and
+    so any fingerprint downstream that reads it) change with no change to the
+    library at all. Rows are inserted directly, in reverse-id order, so a
+    query with no tiebreaker would be the one case in this suite likely to
+    expose SQLite's actual (unspecified, often insertion-order) row order."""
+    same_timestamp = "2026-01-01T00:00:00+00:00"
+    with transaction(db_conn, immediate=True):
+        for clip_id in ("zzz-later-id", "aaa-earlier-id"):
+            db_conn.execute(
+                """
+                INSERT INTO broll_clips
+                    (id, source_digest, normalised_landscape_digest,
+                     normalised_vertical_digest, duration_s, width, height,
+                     source_url, licence, attribution, notes, added_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clip_id,
+                    "0" * 64,
+                    "1" * 64,
+                    "2" * 64,
+                    1.0,
+                    640,
+                    480,
+                    "local",
+                    "CC0",
+                    "",
+                    "",
+                    same_timestamp,
+                ),
+            )
+
+    digest = BrollLibrary(db_conn, cas).write_manifest()
+    entries = json.loads(cas.read_bytes(digest))
+
+    assert [e["clip_id"] for e in entries] == ["aaa-earlier-id", "zzz-later-id"]
