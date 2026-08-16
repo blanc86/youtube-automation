@@ -22,6 +22,8 @@
 - **Never put a filesystem path into a fingerprint.** `JobContext.workdir` must not reach `FingerprintSpec.settings`.
 - **`StageResult.artifacts` is auto-sorted by name.** Do not rely on declaration order; encode ordering in names (`seg_000`, `seg_001`).
 - **Guard-pinning is mandatory.** For any test whose name asserts a *reason*, delete the guard and confirm that test fails **for that reason**. **If a predicted failure does not materialise, or materialises for a different reason, report that — do not smooth it over.** Where a guard cannot be falsified by deletion, prove non-vacuity by mutation and record the exception in a code comment.
+- **Pin the public entry point, not just the helper it delegates to.** Learned in Task 5 at the cost of a fix round: its brief pinned `_consume`'s error mapping, but the real defect sat at a seam the test could not cross — `edge_tts.Communicate.__init__` validates synchronously and raises *before* `_consume` runs at all, so the `except` branch was dead code for its own headline case while the test passed happily. A test that cannot reach the production path gives confidence it has not earned.
+- **Every method named in a task's Produces interface needs a test**, whether or not the task's Step text spells one out. Learned in Task 2 at the cost of a fix round: `set_setting` shipped with a documented partial-update contract and zero coverage, because Step 5 listed two tests and the implementer wrote exactly two. If a Step's test list is shorter than the Produces list, the Step is incomplete — say so and cover the gap.
 
 ## Rigour Dial
 
@@ -922,13 +924,49 @@ Walk the groups, accumulating until the accumulated span reaches at least `segme
 Run: `pytest tests/unit/core/test_timeline.py -v`
 Expected: all seven PASS.
 
-- [ ] **Step 8: Implement the stage and run the gate**
+- [ ] **Step 8: Pin the degenerate inputs**
+
+`plan_timeline` is pure with zero dependencies, so its edge cases are the cheapest in the phase to cover — and an off-by-one here surfaces as visibly wrong captions in every video rather than as a test failure.
+
+```python
+def test_a_single_word_produces_one_group_and_one_segment():
+    tl = plan_timeline([("alone", 0.0, 0.8)], 0.8, _template(), seed=1)
+    assert len(tl.groups) == 1
+    assert len(tl.segments) == 1
+    assert tl.segments[0].end_s == pytest.approx(0.8)
+
+
+def test_no_words_produces_no_groups_but_still_covers_the_duration():
+    """Silence is legal input. A segment list that does not reach duration_s
+    leaves the tail of the video black."""
+    tl = plan_timeline([], 4.0, _template(), seed=1)
+    assert tl.groups == ()
+    assert tl.segments[0].start_s == 0.0
+    assert tl.segments[-1].end_s == pytest.approx(4.0)
+
+
+def test_audio_longer_than_the_last_word_still_tiles_to_the_end():
+    """edge-tts pads trailing silence; segments must cover it or the last
+    B-roll clip ends early and the video goes black before the audio does."""
+    tl = plan_timeline([("word", 0.0, 0.5)], 6.0, _template(), seed=1)
+    assert tl.segments[-1].end_s == pytest.approx(6.0)
+
+
+def test_a_zero_length_word_does_not_produce_an_inverted_group():
+    """A group whose end precedes its start makes ffmpeg's ass filter drop the
+    event silently - a caption that never appears, with nothing failing."""
+    tl = plan_timeline([("a", 1.0, 1.0), ("b", 1.0, 1.4)], 2.0, _template(), seed=1)
+    for group in tl.groups:
+        assert group.end_s >= group.start_s
+```
+
+- [ ] **Step 9: Implement the stage and run the gate**
 
 `PlanTimeline.run` reads `word_timings.json`, calls `plan_timeline`, stages `json.dumps(asdict(timeline))`.
 
 Run: `python scripts/check.py`
 
-- [ ] **Step 9: Guard-pin the two rules that matter**
+- [ ] **Step 10: Guard-pin the two rules that matter**
 
 Delete the punctuation check so groups close only on the word cap.
 **Predicted:** `test_a_group_closes_early_on_sentence_ending_punctuation` fails with `[4] != [2, 2]`.
@@ -938,7 +976,7 @@ Restore it, then change segment closing to a fixed 4.0 s independent of group ed
 
 Report both, including the exact assertion text.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add -A
