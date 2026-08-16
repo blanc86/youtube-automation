@@ -124,8 +124,21 @@ def test_no_words_produces_no_groups_but_still_covers_the_duration() -> None:
 
 
 def test_audio_longer_than_the_last_word_still_tiles_to_the_end() -> None:
-    """edge-tts pads trailing silence; segments must cover it or the last
-    B-roll clip ends early and the video goes black before the audio does."""
+    """Pins the pure function against an ``audio_duration_s`` longer than the
+    last word's own end - which is exactly what edge-tts's trailing silence
+    would look like *if* something supplied it.
+
+    Nothing in the current pipeline does: ``PlanTimeline.run`` derives
+    ``audio_duration_s`` as the last word's own ``end_s`` (see
+    ``app/stages/plan_timeline.py``'s ``PlanTimeline`` docstring and
+    ``tests/unit/app/stages/test_plan_timeline.py::test_run_derives_audio_duration_from_the_last_words_end``,
+    which pins that derivation), so the stage can never actually pass a
+    longer value in production, and the render step composites with
+    ``-shortest`` besides, which fails toward a truncated narration tail
+    rather than a black frame either way. This test exists so the day a real
+    probed duration replaces that stand-in, `plan_timeline` is already
+    proven correct for it - not because trailing silence is handled
+    end-to-end today; it is not."""
     tl = plan_timeline([("word", 0.0, 0.5)], 6.0, _template(), seed=1)
     assert tl.segments[-1].end_s == pytest.approx(6.0)
 
@@ -136,6 +149,51 @@ def test_a_zero_length_word_does_not_produce_an_inverted_group() -> None:
     tl = plan_timeline([("a", 1.0, 1.0), ("b", 1.0, 1.4)], 2.0, _template(), seed=1)
     for group in tl.groups:
         assert group.end_s >= group.start_s
+
+
+# --- review fix round: duration_s shorter than the word timings imply ------
+
+
+def test_a_short_duration_cannot_invert_or_overrun_the_final_segment() -> None:
+    """Unreachable today - ``PlanTimeline.run`` derives ``audio_duration_s``
+    as the last word's own ``end_s``, so the stage can never pass a shorter
+    ``duration_s`` than the words it read (see ``PlanTimeline``'s own
+    docstring and ``test_audio_longer_than_the_last_word_still_tiles_to_the_end``
+    above). But this guards the pure function itself: a probed duration
+    that eventually replaces that stand-in can legitimately come back
+    shorter than what the word timings imply, and every other pinned test's
+    ``duration_s`` is at least as long as its words describe, so none of
+    them could have caught this.
+
+    Before the fix, ``boundaries[-1] = duration_s`` naively overwrote only
+    the literal last boundary: with ``duration_s`` shorter than several
+    groups' own ends, that produced an inverted final segment (``start_s``
+    greater than ``end_s``) while every segment between the true duration
+    and the old final boundary silently overran it - both wrong, and both
+    checked here directly rather than only through the tiling invariant
+    ``test_segments_tile_the_whole_duration_without_gap_or_overlap`` already
+    covers for well-behaved input.
+
+    ``inverted``/``overrun`` are collected over the *whole* segment list
+    before either is asserted on, rather than checked inside one
+    short-circuiting loop: boundaries are monotonic, so in this specific
+    scenario an inversion at the tail is never reachable without an earlier
+    segment already overrunning - a per-segment loop that asserted both
+    conditions together would always fail on the earlier overrun first and
+    never actually exercise the inversion check. Keeping them as two
+    independent whole-list assertions means both invariants are genuinely
+    checked, not just the one that happens to trip first."""
+    words = [(f"w{i}", i * 0.4, i * 0.4 + 0.35) for i in range(60)]
+    tl = plan_timeline(words, 2.0, _template(seg_min=3.0, seg_max=5.0), seed=1)
+
+    inverted = [s for s in tl.segments if s.start_s > s.end_s]
+    overrun = [s for s in tl.segments if s.end_s > 2.0]
+    assert inverted == [], f"inverted segment(s): {inverted}"
+    assert overrun == [], f"segment(s) overran duration_s: {overrun}"
+    assert tl.segments[0].start_s == 0.0
+    assert tl.segments[-1].end_s == pytest.approx(2.0)
+    for prev, nxt in zip(tl.segments, tl.segments[1:], strict=False):
+        assert prev.end_s == nxt.start_s
 
 
 # --- words_per_group_min is advisory: additional pin ------------------------

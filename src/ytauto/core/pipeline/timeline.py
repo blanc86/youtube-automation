@@ -210,7 +210,26 @@ def _plan_segments(
     # trailing silence past the last word - so the final segment always
     # extends to cover it, or the last B-roll clip would end early and the
     # video would go black before the audio does.
-    boundaries[-1] = duration_s
+    #
+    # A naive `boundaries[-1] = duration_s` is only correct when every
+    # existing boundary is already <= duration_s. It is not correct in
+    # general: a duration_s shorter than an earlier group's own end -
+    # unreachable while audio_duration_s is derived from the last word's
+    # end (see PlanTimeline's own docstring), but live the moment a real
+    # probed duration replaces that stand-in - would silently invert the
+    # final segment (its start_s, an earlier group's end, would exceed the
+    # overwritten end_s) while every segment between duration_s and the
+    # old final boundary quietly overran the declared duration. Instead:
+    # find the first boundary that would reach or exceed duration_s, drop
+    # it and everything after, and close there at duration_s exactly. When
+    # no boundary reaches duration_s (the ordinary case, including trailing
+    # silence past the last word), this reduces to replacing the last
+    # element, so segment count is unaffected by this guard.
+    overrun_at = next((i for i, b in enumerate(boundaries) if b >= duration_s), None)
+    if overrun_at is None:
+        boundaries[-1] = duration_s
+    else:
+        boundaries = [*boundaries[:overrun_at], duration_s]
 
     segments: list[Segment] = []
     start = 0.0
