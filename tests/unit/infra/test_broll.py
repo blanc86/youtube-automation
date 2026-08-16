@@ -179,6 +179,38 @@ def test_add_retains_all_three_digests_against_the_evictor(
         assert cas.refcount(digest) == 1
 
 
+def test_add_refuses_a_source_already_in_the_library(
+    db_conn: sqlite3.Connection,
+    cas: CasStore,
+    source_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second add() of byte-identical content must not create a second
+    clip_id: it dedupes every digest in the CAS but would still insert a
+    second broll_clips row, making write_manifest emit two entries for one
+    physical clip and skewing selection downstream. The refusal must name the
+    existing clip_id, and must leave CAS state untouched - one row, refcounts
+    still at 1, not 2 - since a duplicate add is refused before it retains
+    anything a second time."""
+    _patch_ffmpeg(monkeypatch, tmp_path)
+    library = BrollLibrary(db_conn, cas)
+    first_clip_id = library.add(source_file, source_url="local", licence="CC0")
+
+    with pytest.raises(ValidationError, match=first_clip_id):
+        library.add(source_file, source_url="local", licence="CC0")
+
+    rows = db_conn.execute("SELECT * FROM broll_clips").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["id"] == first_clip_id
+    for digest in (
+        rows[0]["source_digest"],
+        rows[0]["normalised_landscape_digest"],
+        rows[0]["normalised_vertical_digest"],
+    ):
+        assert cas.refcount(digest) == 1
+
+
 def test_add_stores_the_original_source_by_copy_not_move(
     db_conn: sqlite3.Connection,
     cas: CasStore,

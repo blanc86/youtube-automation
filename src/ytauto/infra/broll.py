@@ -31,6 +31,7 @@ import uuid
 from pathlib import Path
 
 from ytauto.core.errors import RenderError, ValidationError
+from ytauto.core.models.content_hash import hash_file
 from ytauto.infra.cas.store import CasStore, ContentHash
 from ytauto.infra.clock import utc_now_iso
 from ytauto.infra.db.engine import transaction
@@ -164,10 +165,25 @@ class BrollLibrary:
         manifest still point at them - exactly the DMCA provenance record
         this task exists to make durable.
 
+        Refuses a source whose content already has a ``broll_clips`` row,
+        identified by hashing ``path`` *before* any transcoding is attempted -
+        hashing is cheap, two ffmpeg encodes are not, and a duplicate add
+        should cost the caller a second, not a minute. This is a hard refusal,
+        not a silent no-op: the caller explicitly asked to add something, so
+        failing loudly and naming the clip that already holds this footage is
+        the least surprising behaviour. It is also what keeps "one clip, one
+        row" true - without it, a second `add()` of the same file dedupes
+        every digest in the CAS (no new blob) but still inserts a second row
+        under a new ``clip_id``, so ``write_manifest`` would emit two entries
+        for what is physically one clip, silently skewing selection
+        probability and risking the same footage appearing twice in one
+        video.
+
         Raises:
             ValidationError: ``source_url`` or ``licence`` is blank, ``path``
-                does not exist, or ffprobe could not determine the source's
-                dimensions or duration.
+                does not exist, ``path``'s content is already recorded under
+                an existing ``clip_id``, or ffprobe could not determine the
+                source's dimensions or duration.
             RenderError: either normalisation encode exited non-zero.
             subprocess.TimeoutExpired: an encode did not finish within the
                 timeout.
@@ -184,6 +200,24 @@ class BrollLibrary:
             raise ValidationError("source_url must not be blank")
         if not licence or not licence.strip():
             raise ValidationError("licence must not be blank")
+
+        if not path.is_file():
+            raise ValidationError(f"source file does not exist: {path}")
+
+        # Dedup check, before locate()/probe_media()/any transcode: hash_file
+        # is a plain streaming read, cheap next to a subprocess round trip and
+        # nowhere near the cost of two ffmpeg encodes. CasStore.put_file below
+        # recomputes this same digest when it stores the source - a second
+        # read of a B-roll-sized file is a deliberate, sanctioned trade-off
+        # against restructuring the CAS write to return a digest without one.
+        existing = self._conn.execute(
+            "SELECT id FROM broll_clips WHERE source_digest = ?", (hash_file(path),)
+        ).fetchone()
+        if existing is not None:
+            raise ValidationError(
+                f"{path} is already in the B-roll library as clip {existing['id']!r} "
+                "- refusing to add the same footage under a second clip_id"
+            )
 
         binaries = locate()
         info = probe_media(path, ffprobe=binaries.ffprobe)
