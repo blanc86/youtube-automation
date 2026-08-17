@@ -34,9 +34,13 @@ paths go through ``_release_job_pins``; failure has to release too, because
 ``queue.fail`` is terminal and ``claim()`` matches only ``state =
 'queued'``, so nothing can ever revisit a failed job to tidy up after it.
 
-**Governor lease ownership.** Every ``gpu_compute`` lease this module
-acquires is owned by the string ``f"{job_id}:{stage_id}"`` - one stage
-attempt, one owner. ``reap()`` reconstructs that same string from
+**Governor lease ownership.** Every GPU lease this module acquires - from
+``gpu_compute`` or, for a stage that opts into it (see ``_spawn``), from
+``gpu_encode`` - is owned by the string ``f"{job_id}:{stage_id}"`` - one
+stage attempt, one owner, regardless of which pool it came from.
+``release_all(owner)`` frees every lease that owner holds across every pool
+(``Governor``'s own contract), so ``reap()`` does not need to know which
+pool a dead worker's stage used. ``reap()`` reconstructs that same string from
 ``job_stages`` rows still marked ``running`` under a job whose lease expired,
 so it can call ``Governor.release_all`` for a worker that died holding a
 lease it can never release itself.
@@ -97,6 +101,8 @@ _BASE_BACKOFF_S = 5.0
 _MAX_BACKOFF_S = 3600.0
 _MAX_STAGE_ATTEMPTS = 5
 _GPU_POOL = "gpu_compute"
+"""The default lease pool ``_spawn`` uses for any ``Stage`` that does not
+declare its own ``gpu_pool`` class attribute - see ``_spawn``'s docstring."""
 
 
 @dataclass(frozen=True)
@@ -761,27 +767,34 @@ class Dispatcher:
     # -- spawning and pumping a worker --------------------------------------
 
     def _spawn(self, claimed: ClaimedJob, stage: Stage, ctx: JobContext, fingerprint: str) -> bool:
-        """Acquire a ``gpu_compute`` lease, spawn a worker, and block until it
-        reports a terminal message. Returns whether a worker was started.
+        """Acquire a GPU lease, spawn a worker, and block until it reports a
+        terminal message. Returns whether a worker was started.
 
-        Only ``gpu_compute`` exists to lease against in this phase (§3.5 of
-        the design defers ``gpu_encode``/``cpu_heavy``/``net_api`` until
-        something needs them), so every spawn takes it - conservative for a
-        stage that does not actually need the GPU, but correct: nothing in
-        the current ``Stage`` protocol carries a capability descriptor to
-        decide otherwise, and a real ``requires_gpu`` gate is Phase 2's job
-        once providers exist.
+        Every spawn takes a lease from *some* GPU pool - ``gpu_compute`` by
+        default, conservative for a stage that does not actually need the
+        GPU, since nothing in the ``Stage`` Protocol otherwise carries a
+        capability descriptor to decide differently. A stage that does need
+        a specific pool says so with its own optional ``gpu_pool`` class
+        attribute (``app.stages.compose.ComposeStage`` sets it to
+        ``"gpu_encode"`` - Phase 2a's compose stages are the first work that
+        contends for encode hardware rather than compute); ``getattr`` with
+        ``_GPU_POOL`` as the default is what lets every ``Stage`` implementation
+        that predates this stay silent on the question and keep leasing
+        ``gpu_compute`` exactly as before.
 
         A refused lease defers to a later tick rather than blocking - but the
         job has to go back on the queue for that later tick to exist at all,
         and the caller has to be told no worker started, or ``tick`` reports
-        a spawn that never happened.
+        a spawn that never happened. That requeue-on-refusal path is generic
+        over which pool was tried, so it needed no change to grow a second
+        lessable pool.
 
         Raises:
             OSError: the worker subprocess cannot be started.
         """
         owner = f"{claimed.job_id}:{stage.id}"
-        lease = self._governor.lease(_GPU_POOL, owner)
+        pool = getattr(stage, "gpu_pool", _GPU_POOL)
+        lease = self._governor.lease(pool, owner)
         granted = lease.__enter__()
         if not granted:
             lease.__exit__(None, None, None)

@@ -1,6 +1,6 @@
 import pytest
 
-from ytauto.app.scheduler.governor import GPU_COMPUTE_CAPACITY, Governor
+from ytauto.app.scheduler.governor import GPU_COMPUTE_CAPACITY, GPU_ENCODE_CAPACITY, Governor
 from ytauto.core.errors import ValidationError
 
 
@@ -59,3 +59,22 @@ def test_an_unknown_pool_is_rejected(governor: Governor) -> None:
     with pytest.raises(ValidationError, match="unknown pool"):  # noqa: SIM117
         with governor.lease("nonexistent", "w1"):
             pass
+
+
+def test_gpu_encode_capacity_is_one(governor: Governor) -> None:
+    """The compose stages' pool, separate from gpu_compute (Task 11): a
+    render taking the encode engine must not be serialised behind, or
+    block, a future transcription job taking the compute engine."""
+    assert GPU_ENCODE_CAPACITY == 1
+    assert governor.available("gpu_encode") == 1
+
+
+def test_gpu_compute_and_gpu_encode_are_independent_pools(governor: Governor) -> None:
+    """Exhausting one pool must not touch the other - they model physically
+    different hardware engines on the same card."""
+    with governor.lease("gpu_compute", "w1") as compute_granted:
+        assert compute_granted is True
+        with governor.lease("gpu_encode", "w2") as encode_granted:
+            assert encode_granted is True, "gpu_encode must not be blocked by gpu_compute"
+        assert governor.available("gpu_encode") == 1
+    assert governor.available("gpu_compute") == 1

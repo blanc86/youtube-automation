@@ -37,10 +37,16 @@ from ytauto.infra.db.migrations import apply_migrations
 _FETCH_FINGERPRINT = "a" * 64
 _TTS_FINGERPRINT = "b" * 64
 _SOLO_FINGERPRINT = "c" * 64
+_RENDER_FINGERPRINT = "d" * 64
 _TEST_PIPELINE_ID = "test-pipeline"
 _SOLO_PIPELINE_ID = "solo-pipeline"
 
-_FINGERPRINTS = {"fetch": _FETCH_FINGERPRINT, "tts": _TTS_FINGERPRINT, "only": _SOLO_FINGERPRINT}
+_FINGERPRINTS = {
+    "fetch": _FETCH_FINGERPRINT,
+    "tts": _TTS_FINGERPRINT,
+    "only": _SOLO_FINGERPRINT,
+    "render": _RENDER_FINGERPRINT,
+}
 
 
 class _FixedStage:
@@ -64,12 +70,20 @@ class _FixedStage:
         depends_on: tuple[str, ...] = (),
         *,
         capture: Callable[[Mapping[str, object]], None] | None = None,
+        gpu_pool: str | None = None,
     ) -> None:
         self.id = stage_id
         self.version = 1
         self.depends_on = depends_on
         self.settings_keys: tuple[str, ...] = ()
         self._capture = capture
+        # Deliberately not set at all when gpu_pool is None (the default for
+        # every existing caller), rather than set to a placeholder - _spawn's
+        # getattr(stage, "gpu_pool", _GPU_POOL) must fall through to the
+        # default for a stage that never mentions the attribute, exactly the
+        # shape every pre-Task-11 Stage implementation has.
+        if gpu_pool is not None:
+            self.gpu_pool = gpu_pool
 
     def fingerprint(self, ctx: JobContext) -> str:
         if self._capture is not None:
@@ -555,6 +569,53 @@ def test_a_claimed_job_with_nothing_ready_goes_back_to_the_queue(
     assert report.idle
     assert spawn_spy.calls == 0
     assert _job_state(db_conn, "j1") == "queued", "an unadvanceable claim must be released"
+
+
+def test_a_stage_with_a_gpu_pool_attribute_leases_from_that_pool(
+    db_conn: sqlite3.Connection, tmp_path: Path, spawn_spy: SpawnSpy
+) -> None:
+    """Task 11's ``ComposeStage`` sets ``gpu_pool = "gpu_encode"`` so a render
+    competes for encode hardware, never for the ``gpu_compute`` pool a future
+    Whisper-based ``Transcriber`` will need. ``_spawn`` must read that
+    attribute rather than always leasing ``"gpu_compute"``."""
+    store = CasStore(root=tmp_path / "cas", conn=db_conn)
+    artifacts = ArtifactStore(store, db_conn)
+    governor = Governor()
+    queue = JobQueue(db_conn)
+    pipeline_id = "encode-pipeline"
+    pipeline = Pipeline(id=pipeline_id, stages=(_FixedStage("render", gpu_pool="gpu_encode"),))
+    d = Dispatcher(db_conn, store, artifacts, governor, queue, pipelines={pipeline_id: pipeline})
+
+    leased_pools: list[str] = []
+    real_lease = governor.lease
+
+    def _spying_lease(pool: str, owner: str) -> object:
+        leased_pools.append(pool)
+        return real_lease(pool, owner)
+
+    governor.lease = _spying_lease  # type: ignore[method-assign]
+
+    project_id = _project(db_conn, slug="encode")
+    queue.enqueue("j-encode", project_id, pipeline_id)
+
+    report = d.tick()
+
+    assert report.spawned == ("render",)
+    assert leased_pools == ["gpu_encode"], "must lease gpu_encode, never the gpu_compute default"
+    assert governor.available("gpu_compute") == 1, "gpu_compute must be untouched by this spawn"
+
+
+def test_a_stage_without_a_gpu_pool_attribute_still_leases_gpu_compute(
+    dispatcher: Dispatcher, governor: Governor, queue: JobQueue, spawn_spy: SpawnSpy
+) -> None:
+    """The default path every pre-Task-11 stage relies on: no ``gpu_pool``
+    attribute at all must behave exactly as before this task's change."""
+    queue.requeue("j1", available_in_s=-1)
+
+    report = dispatcher.tick()
+
+    assert report.spawned == ("fetch",)
+    assert governor.available("gpu_encode") == 1, "gpu_encode must be untouched"
 
 
 def test_a_refused_lease_is_not_reported_as_a_spawn(

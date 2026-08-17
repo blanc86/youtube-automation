@@ -6,18 +6,25 @@ every restart, which is correct, because no lease should ever survive a
 crash. Persisting it would let a stale lease from a dead process outlive the
 process and permanently wedge a pool.
 
-Only ``gpu_compute`` is populated. The other three pools described by the
-design spec (``gpu_encode``, ``cpu_heavy``, ``net_api``) are added when the
-work that needs them exists - there is no encoder or provider to pace yet,
-and standing up three pools with nothing to test them against would just be
-dead capacity.
+``gpu_compute`` and ``gpu_encode`` are populated. The remaining two pools the
+design spec describes (``cpu_heavy``, ``net_api``) are still added when the
+work that needs them exists - there is no CPU-bound or network-rate-limited
+provider to pace yet, and standing up a pool with nothing to test it against
+would just be dead capacity. ``gpu_encode`` is different: Phase 2a's compose
+stages (``app.stages.compose.ComposeStage``) are the first work that
+genuinely contends for GPU encode hardware (NVENC/QSV/AMF) rather than GPU
+compute (a future Whisper-based ``Transcriber``, still Phase 2b), and those
+are physically different engines on the same card - a render taking the
+render engine must not be serialised behind, or block, a transcription
+taking the compute engine, which is exactly what one shared pool would do.
 
-``GPU_COMPUTE_CAPACITY`` is the hard-coded integer ``1``, never derived from
-``infra.gpu.detect()``'s reported VRAM. This exists specifically to prevent
-concurrent GPU work from exhausting 4 GB of VRAM nondeterministically -
-described in the design spec as the worst class of bug to diagnose in this
-system. Deriving capacity from a MiB figure invites a "4096 MiB, so 2 slots"
-mistake that reintroduces exactly that failure.
+``GPU_COMPUTE_CAPACITY``/``GPU_ENCODE_CAPACITY`` are both the hard-coded
+integer ``1``, never derived from ``infra.gpu.detect()``'s reported VRAM.
+This exists specifically to prevent concurrent GPU work from exhausting 4 GB
+of VRAM nondeterministically - described in the design spec as the worst
+class of bug to diagnose in this system. Deriving capacity from a MiB figure
+invites a "4096 MiB, so 2 slots" mistake that reintroduces exactly that
+failure.
 
 ``lease`` yields ``False`` on refusal rather than raising. A refusal is a
 normal scheduling outcome: the dispatcher's response to a full pool is to try
@@ -50,9 +57,11 @@ from types import TracebackType
 from ytauto.core.errors import ValidationError
 
 GPU_COMPUTE_CAPACITY: int = 1
+GPU_ENCODE_CAPACITY: int = 1
 
 _CAPACITIES: dict[str, int] = {
     "gpu_compute": GPU_COMPUTE_CAPACITY,
+    "gpu_encode": GPU_ENCODE_CAPACITY,
 }
 
 
