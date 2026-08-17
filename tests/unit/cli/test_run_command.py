@@ -20,13 +20,14 @@ and neither test ever reaches a spawn), so they exercise the genuine
 from __future__ import annotations
 
 import io
+import json
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
-from ytauto.app.scheduler.worker_protocol import Error, encode
+from ytauto.app.scheduler.worker_protocol import ArtifactLine, Error, Result, Staged, encode
 from ytauto.app.services.enqueue import story_digest_for
 from ytauto.app.services.projects import ProjectService
 from ytauto.cli.__main__ import main
@@ -135,8 +136,6 @@ def test_project_create_writes_story_to_disk_and_cas_and_records_settings(
     expected_digest = story_digest_for(story)
     assert project_row["story_digest"] == expected_digest
 
-    import json
-
     settings = json.loads(project_row["settings_json"])
     assert settings["story_digest"] == expected_digest
 
@@ -196,6 +195,106 @@ def test_project_create_rejects_a_duplicate_slug(
     assert rc == 2
     assert "dup" in capsys.readouterr().err
     assert db_conn.execute("SELECT count(*) FROM projects").fetchone()[0] == 1
+
+
+def test_project_create_rejects_a_duplicate_slug_without_corrupting_the_existing_project(
+    tmp_path: Path, db_conn: sqlite3.Connection
+) -> None:
+    """Review finding (Important #1): a duplicate-slug retry used to write
+    ``story.txt`` and stage a CAS blob *before* the uniqueness check ran, so
+    retrying with genuinely different content overwrote the existing
+    project's on-disk story and left ``story_digest`` pointing at stale
+    content. This drives the second call with *different* content from the
+    first - the original duplicate-slug test alone cannot catch the defect,
+    since it reuses identical content both times.
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    story_v1 = tmp_path / "story_v1.txt"
+    story_v1.write_text("the original story\n", encoding="utf-8")
+    argv_v1 = [
+        "--data-dir",
+        str(tmp_path),
+        "project",
+        "create",
+        "--slug",
+        "dup2",
+        "--title",
+        "Dup2",
+        "--story",
+        str(story_v1),
+    ]
+    assert main(argv_v1) == 0
+
+    on_disk = paths.projects / "dup2" / "story.txt"
+    original_text = on_disk.read_text(encoding="utf-8")
+    original_row = db_conn.execute(
+        "SELECT story_digest FROM projects WHERE slug = 'dup2'"
+    ).fetchone()
+    original_digest = original_row["story_digest"]
+
+    story_v2 = tmp_path / "story_v2.txt"
+    story_v2.write_text("a completely different story\n", encoding="utf-8")
+    argv_v2 = [
+        "--data-dir",
+        str(tmp_path),
+        "project",
+        "create",
+        "--slug",
+        "dup2",
+        "--title",
+        "Dup2 again",
+        "--story",
+        str(story_v2),
+    ]
+
+    rc = main(argv_v2)
+
+    assert rc == 2
+    assert on_disk.read_text(encoding="utf-8") == original_text, (
+        "the existing project's on-disk story must be untouched"
+    )
+    row = db_conn.execute("SELECT story_digest FROM projects WHERE slug = 'dup2'").fetchone()
+    assert row["story_digest"] == original_digest, "the DB row must be untouched"
+    assert db_conn.execute("SELECT count(*) FROM projects").fetchone()[0] == 1
+
+    cas = CasStore(root=paths.cas, conn=db_conn)
+    new_digest = story_digest_for(story_v2)
+    assert not cas.exists(new_digest), "the rejected second story must never reach the CAS"
+
+
+def test_project_create_rejects_a_non_utf8_story_file(
+    tmp_path: Path, db_conn: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review finding (Important #2): ``story_digest_for``/``create_project``
+    both document ``UnicodeDecodeError`` and ``OSError`` alongside
+    ``ValidationError``, but the CLI handler used to catch only
+    ``ValidationError`` - a non-UTF-8 story file (an ordinary Windows-1252
+    save is entirely plausible) crashed out of ``main()`` as a raw traceback
+    instead of the documented exit-2 contract.
+    """
+    story = tmp_path / "story.txt"
+    # 0x93/0x94 are Windows-1252 curly quotes; neither is a valid UTF-8 lead
+    # or continuation byte on its own, so this reliably fails utf-8 decoding.
+    story.write_bytes(b"Hello \x93World\x94\n")
+
+    rc = main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "project",
+            "create",
+            "--slug",
+            "bad-encoding",
+            "--title",
+            "Bad Encoding",
+            "--story",
+            str(story),
+        ]
+    )
+
+    assert rc == 2
+    assert capsys.readouterr().err  # some diagnostic reached the operator
+    assert db_conn.execute("SELECT count(*) FROM projects").fetchone()[0] == 0
 
 
 # -- ``ytauto run`` fakes: a single-stage pipeline, never spawned for real --
@@ -340,6 +439,135 @@ def test_run_returns_1_when_the_job_fails(
 
     assert rc == 1
     assert _job_state(db_conn, slug="doomed") == "failed"
+
+
+def test_run_retries_a_retryable_failure_through_to_success(
+    tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding (Important #3): a RETRYABLE worker error defers the job
+    via ``jobs.available_at`` (``Dispatcher._retry_stage``), which makes the
+    *next* ``tick()`` report idle immediately - nowhere near ``--max-ticks`` -
+    because nothing is currently claimable. ``run_until_idle`` stops on that
+    first idle tick, so a single call leaves the job neither ``succeeded``
+    nor ``failed``. ``_run`` must keep polling through the backoff, within
+    its wall-clock budget, rather than treating that first idle as "nothing
+    left to do".
+
+    Drives the *real* ``Dispatcher``/backoff machinery - not a fake - via a
+    Popen spy that fails once (``RETRYABLE``) and then succeeds, referencing
+    a real digest already staged (but not yet recorded) in the CAS so the
+    eventual successful ``commit_stage`` finds a genuine blob on disk.
+    ``_BASE_BACKOFF_S`` and ``_RUN_POLL_INTERVAL_S`` are both monkeypatched
+    down so the test does not have to sleep through the real (>=5s) minimum
+    backoff or the real (1s) poll interval.
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    _project(db_conn, slug="flaky")
+    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
+    monkeypatch.setattr("ytauto.app.scheduler.dispatcher._BASE_BACKOFF_S", 0.05)
+    monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.01)
+
+    fixed_job_id = "a" * 32
+    monkeypatch.setattr("uuid.uuid4", lambda: _FixedUUID(fixed_job_id))
+
+    cas = CasStore(root=paths.cas, conn=db_conn)
+    output = b"real worker output"
+    real_digest = cas.stage_file(output, kind="blob")  # staged, deliberately not recorded
+
+    retryable_line = encode(
+        Error(
+            job_id=fixed_job_id,
+            stage_id=_FAKE_STAGE_ID,
+            correlation_id="c1",
+            message="simulated transient failure",
+            kind=ErrorKind.RETRYABLE,
+        )
+    )
+    staged_line = encode(
+        Staged(
+            job_id=fixed_job_id,
+            stage_id=_FAKE_STAGE_ID,
+            correlation_id="c2",
+            digest=real_digest,
+            kind="blob",
+            size_bytes=len(output),
+        )
+    )
+    result_line = encode(
+        Result(
+            job_id=fixed_job_id,
+            stage_id=_FAKE_STAGE_ID,
+            correlation_id="c2",
+            artifacts=(ArtifactLine(name="out", kind="blob", digest=real_digest),),
+        )
+    )
+
+    calls = {"n": 0}
+
+    def _spy(argv: object, **kwargs: object) -> _FakeProcess:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FakeProcess([retryable_line])
+        return _FakeProcess([staged_line, result_line])
+
+    monkeypatch.setattr("ytauto.app.scheduler.dispatcher.Popen", _spy)
+
+    rc = main(["--data-dir", str(tmp_path), "run", "--project", "flaky", "--max-ticks", "20"])
+
+    assert rc == 0
+    assert _job_state(db_conn, slug="flaky") == "succeeded"
+    assert calls["n"] == 2, "must have spawned exactly twice: the transient failure, then success"
+
+
+def test_run_reports_a_distinct_message_when_the_retry_wait_budget_is_exhausted(
+    tmp_path: Path,
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other half of Important #3's fix: giving up on a retry backoff
+    must not be reported with the same message as running out of
+    ``--max-ticks`` while genuinely busy - "still healthy and retrying, just
+    slow" and "give up and go look at what failed" send an operator to
+    different places. A backoff (1s, monkeypatched from the real 5s minimum)
+    deliberately much longer than the wall-clock retry budget (0.05s,
+    monkeypatched from the real 600s) makes the very first
+    idle-because-deferred check already find the deadline passed, so this is
+    deterministic without an actually slow test.
+    """
+    _project(db_conn, slug="stuck-retrying")
+    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
+    monkeypatch.setattr("ytauto.app.scheduler.dispatcher._BASE_BACKOFF_S", 1.0)
+    monkeypatch.setattr("ytauto.cli.__main__._RUN_WALL_CLOCK_BUDGET_S", 0.05)
+    monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.01)
+
+    fixed_job_id = "b" * 32
+    monkeypatch.setattr("uuid.uuid4", lambda: _FixedUUID(fixed_job_id))
+
+    retryable_line = encode(
+        Error(
+            job_id=fixed_job_id,
+            stage_id=_FAKE_STAGE_ID,
+            correlation_id="c1",
+            message="simulated transient failure",
+            kind=ErrorKind.RETRYABLE,
+        )
+    )
+
+    def _spy(argv: object, **kwargs: object) -> _FakeProcess:
+        return _FakeProcess([retryable_line])  # always retryable, never resolves
+
+    monkeypatch.setattr("ytauto.app.scheduler.dispatcher.Popen", _spy)
+
+    rc = main(
+        ["--data-dir", str(tmp_path), "run", "--project", "stuck-retrying", "--max-ticks", "20"]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "retry-budget timeout" in err
+    assert "did not reach a terminal state within" not in err
+    assert _job_state(db_conn, slug="stuck-retrying") == "queued"
 
 
 def test_run_returns_1_when_max_ticks_is_exhausted_before_the_job_finishes(

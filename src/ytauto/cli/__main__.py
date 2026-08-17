@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import sqlite3
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -37,9 +38,39 @@ _DEFAULT_MAX_TICKS = 100
 seven-stage ``story_video`` pipeline needs a minimum of seven ticks (one per
 stage; ``_maybe_complete_job`` requeues the job immediately after each
 non-terminal stage commit, so no idle ticks intervene on the happy path).
-100 leaves generous headroom for a handful of transient-failure retries
-(``_MAX_STAGE_ATTEMPTS = 5`` per stage, exponential backoff) without either
-truncating a healthy run or letting a single invocation spin unboundedly."""
+100 leaves generous headroom within *one* ``run_until_idle`` call for a
+handful of stages that fail once cache-cold before succeeding on their own
+first retry - but see ``_RUN_WALL_CLOCK_BUDGET_S`` below for the budget that
+actually governs surviving a real retry backoff: ``--max-ticks`` alone
+cannot, because a deferred job makes ``tick()`` report idle on the very next
+call regardless of how many ticks remain."""
+
+_RUN_POLL_INTERVAL_S = 1.0
+"""How long ``_run`` sleeps between polls while the job is merely deferred
+(on a ``_retry_stage`` backoff), not finished and not stuck. Review finding
+(Important #3): ``run_until_idle`` stops the instant ``tick()`` reports
+idle, and a job whose ``jobs.available_at`` was pushed into the future by a
+RETRYABLE or RATE_LIMITED failure makes the *next* ``tick()`` report idle
+immediately - nowhere near exhausting ``--max-ticks`` - because nothing is
+currently claimable. Called once, ``ytauto run`` would report "did not reach
+a terminal state" for a job that was in fact healthy and simply waiting out
+its backoff. Polling at a fixed, modest interval (rather than parsing
+``jobs.available_at`` to sleep the exact remaining backoff) keeps this
+simple and correct at the cost of up to one second of added latency per
+retry - negligible next to a video render."""
+
+_RUN_WALL_CLOCK_BUDGET_S = 600.0
+"""How long ``_run`` keeps polling a deferred-but-not-terminal job before
+giving up. Backoff for one stage tops out at
+``_BASE_BACKOFF_S * 2 ** (_MAX_STAGE_ATTEMPTS - 2)`` = 5 * 2**3 = 40s between
+its last two attempts (75s total across all four waits before a fifth,
+final, terminal attempt) - so 600s leaves generous headroom for several
+stages each retrying a few times across the whole seven-stage pipeline,
+without letting one invocation of ``ytauto run`` block an operator's
+terminal indefinitely. Distinct from ``--max-ticks``, which bounds *ticks
+spent doing real work*; this bounds *wall-clock time spent waiting for more
+work to become available* - the two failure modes get two different
+diagnostic messages (see ``_run``)."""
 
 
 def _add_broll_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -106,6 +137,14 @@ def _project_create(paths: AppPaths, args: argparse.Namespace) -> int:
     own directory, and recording both the digest and the on-disk path in
     settings - lives in ``app.services.enqueue.create_project``; see its
     docstring.
+
+    ``create_project``'s own docstring documents ``OSError`` and
+    ``UnicodeDecodeError`` alongside ``ValidationError`` - a non-UTF-8 story
+    file (an ordinary Windows-1252 save is entirely plausible) or an
+    unreadable/unwritable path are both bad input in exactly the same sense
+    a missing story file is, and all three must report the documented exit-2
+    contract rather than letting an undocumented exception type slip past
+    this ``except`` clause and crash out of ``main()`` as a raw traceback.
     """
     paths.ensure()
     conn = connect(paths.db_file)
@@ -122,7 +161,7 @@ def _project_create(paths: AppPaths, args: argparse.Namespace) -> int:
                 title=args.title,
                 story_path=args.story,
             )
-        except ValidationError as exc:
+        except (ValidationError, OSError, UnicodeDecodeError) as exc:
             print(f"ytauto project create: {exc}", file=sys.stderr)
             return 2
     finally:
@@ -154,8 +193,32 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
     Exit codes: 0 once the enqueued job reaches ``succeeded``; 2 if
     ``--project`` names no project - bad input, checked before anything is
     enqueued; 1 for every other way this can fail to end in success - the
-    job reaches ``failed``, it has not reached a terminal state once
-    ``--max-ticks`` runs out, or the dispatcher itself raises.
+    job reaches ``failed``, it burns through ``--max-ticks`` while genuinely
+    busy, it is still waiting out a retry backoff once
+    ``_RUN_WALL_CLOCK_BUDGET_S`` elapses, or the dispatcher itself raises.
+    The last three are reported with different stderr messages (see below) -
+    sharing one exit code is fine within this brief's ``{0,1,2}`` contract,
+    but "ran out of tick budget", "still retrying after N seconds" and "the
+    render actually failed" send an operator to different places and must
+    not read the same.
+
+    **Retries need more than one ``run_until_idle`` call.** ``tick()``
+    reports idle whenever nothing is *currently* claimable, and a job a
+    RETRYABLE or RATE_LIMITED worker failure just deferred
+    (``jobs.available_at`` pushed into the future by ``_retry_stage``) is
+    exactly that - not claimable *yet*, not stuck. Since ``run_until_idle``
+    stops the instant one ``tick()`` reports idle, a single call made right
+    after such a failure returns almost immediately, nowhere near
+    ``--max-ticks``, with the job neither ``succeeded`` nor ``failed`` (review
+    finding, Important #3). Calling it once and reporting whatever state the
+    job is in afterwards would misreport a healthy, still-retrying job as
+    "did not finish" indistinguishably from a genuinely stuck one. So this
+    loops: after each ``run_until_idle`` call, if the job is not yet terminal
+    *and* the call actually went idle (as opposed to running out of
+    ``--max-ticks`` while genuinely busy - ``report.idle`` tells them apart),
+    it sleeps briefly and calls again, bounded by ``_RUN_WALL_CLOCK_BUDGET_S``
+    of wall-clock time. This stays entirely inside the CLI - no change to
+    ``Dispatcher``/``tick()`` was needed or made.
 
     **Poison-job policy.** ``Dispatcher.tick()`` can raise ``ValidationError``
     for a job that has nothing to do with this invocation's own job - one
@@ -169,22 +232,24 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
     invocation just enqueued - so a stale poison job can and does intercept a
     healthy run.
 
-    The policy here is to let it propagate out of ``run_until_idle`` (called
-    once, exactly as Step 3 of this task's brief specifies - not looped by
-    hand so this command could catch and retry around it) and report it as a
-    clear, non-zero failure naming the offending row, rather than swallowing
-    it and letting the dispatcher grind through a database whose invariants a
-    bug has already broken. The alternative - catching it per-tick inside the
-    dispatcher and failing just that one job before continuing - was
-    considered and rejected: it would need a change to
-    ``app/scheduler/dispatcher.py``, which is out of this task's scope, and it
-    would turn a bug class two separate reviews flagged as fatal into
-    something this command quietly tolerates. The job ``tick()`` was
-    mid-claim on when this happens stays claimed until its lease (300 s)
-    expires and then becomes reclaimable again; a poison job left in that
-    state will surface identically on the next invocation, which is the
-    intended, visible signal to go fix the underlying data rather than a
-    crash this command should paper over.
+    The policy here is to let it propagate out of ``run_until_idle`` on
+    whichever call raises it - the retry loop above calls it more than once,
+    but never catches ``ValidationError`` around any individual call, so this
+    is unchanged from a single-call design in the one way that matters: no
+    iteration of the loop ever intervenes to fail just the offending job and
+    keep going. It is reported as a clear, non-zero failure naming the
+    offending row, rather than swallowing it and letting the dispatcher grind
+    through a database whose invariants a bug has already broken. The
+    alternative - catching it per-tick inside the dispatcher and failing just
+    that one job before continuing - was considered and rejected: it would
+    need a change to ``app/scheduler/dispatcher.py``, which is out of this
+    task's scope, and it would turn a bug class two separate reviews flagged
+    as fatal into something this command quietly tolerates. The job
+    ``tick()`` was mid-claim on when this happens stays claimed until its
+    lease (300 s) expires and then becomes reclaimable again; a poison job
+    left in that state will surface identically on the next invocation, which
+    is the intended, visible signal to go fix the underlying data rather than
+    a crash this command should paper over.
     """
     paths.ensure()
     conn = connect(paths.db_file)
@@ -202,6 +267,7 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
             return 2
 
         job_id = uuid.uuid4().hex
+        gave_up_waiting_on_backoff = False
         try:
             settings = projects.settings_for(project_id)
             pipeline = build_pipeline(_PIPELINE_ID, cas, settings)
@@ -209,7 +275,22 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
             dispatcher = Dispatcher(
                 conn, cas, artifacts, Governor(), queue, pipelines={_PIPELINE_ID: pipeline}
             )
-            dispatcher.run_until_idle(max_ticks=args.max_ticks)
+            deadline = time.monotonic() + _RUN_WALL_CLOCK_BUDGET_S
+            while True:
+                report = dispatcher.run_until_idle(max_ticks=args.max_ticks)
+                state = _job_state(conn, job_id)
+                if state in (JobState.SUCCEEDED.value, JobState.FAILED.value):
+                    break
+                if not report.idle:
+                    # --max-ticks ran out while genuinely busy - that is the
+                    # budget this flag exists to bound; stop now rather than
+                    # silently retrying past what the operator asked for.
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    gave_up_waiting_on_backoff = True
+                    break
+                time.sleep(min(_RUN_POLL_INTERVAL_S, remaining))
         except ValidationError as exc:
             print(
                 f"ytauto run: the queue stopped on an unrecoverable error: {exc}",
@@ -223,11 +304,20 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
         if state == JobState.FAILED.value:
             print(f"ytauto run: job {job_id} failed", file=sys.stderr)
             return 1
-        print(
-            f"ytauto run: job {job_id} did not reach a terminal state within "
-            f"{args.max_ticks} ticks (currently {state!r})",
-            file=sys.stderr,
-        )
+        if gave_up_waiting_on_backoff:
+            print(
+                f"ytauto run: job {job_id} is still retrying after "
+                f"{_RUN_WALL_CLOCK_BUDGET_S:.0f}s and gave up waiting (currently "
+                f"{state!r}) - this is a retry-budget timeout, not a render "
+                "failure; rerun `ytauto run --project ...` to keep draining it",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"ytauto run: job {job_id} did not reach a terminal state within "
+                f"{args.max_ticks} ticks (currently {state!r})",
+                file=sys.stderr,
+            )
         return 1
     finally:
         conn.close()

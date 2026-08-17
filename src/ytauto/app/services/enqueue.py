@@ -71,21 +71,45 @@ def create_project(
     run time (``ctx.settings["story_path"]``), and the caller's original file
     may move or be deleted long before the job that reads it ever runs.
 
+    The slug-uniqueness check runs *first*, before anything touches the CAS
+    or the filesystem - found by review: this used to write ``story.txt``
+    into ``project_dir`` (a path derived from ``slug`` alone) before
+    ``ProjectService.create`` ever checked for a collision, so retrying
+    ``project create`` against an existing slug with *different* story
+    content would overwrite that project's on-disk story and stage an
+    unreferenced CAS blob, then fail on the duplicate-slug error - leaving
+    ``projects.story_digest``/``settings["story_digest"]`` pointing at the
+    *old* digest while the file on disk held the *new*, different content.
+    That divergence is not cosmetic: ``ingest_story.fingerprint()`` reads
+    ``settings["story_digest"]`` alone, with no ``project_id`` component (by
+    design, for cross-project cache dedup), so a later run carrying the
+    stale digest could take a cache hit serving content that no longer
+    matches what a human editing ``story.txt`` believes they are running.
+    Checking uniqueness before any write closes that window: a rejected
+    ``create_project`` call now touches neither the CAS nor the filesystem.
+
+    Also reads ``story_path`` exactly once, hashing the same ``text`` it
+    then stages and writes - not once via ``story_digest_for`` and again
+    directly, which left an (admittedly narrow) window where the recorded
+    digest and the bytes actually written could theoretically diverge
+    between the two reads.
+
     Raises:
-        ValidationError: ``story_path`` does not exist or is not a regular
-            file, or ``slug`` already names another project (propagated from
-            ``ProjectService.create``).
+        ValidationError: ``slug`` already names another project, or
+            ``story_path`` does not exist or is not a regular file.
         UnicodeDecodeError: ``story_path`` is not valid UTF-8.
         OSError: the story cannot be read, or ``project_dir``/its ``story.txt``
             cannot be written.
         sqlite3.OperationalError: the write lock could not be acquired within
             ``busy_timeout``.
     """
+    if _slug_in_use(conn, slug):
+        raise ValidationError(f"slug already in use by another project: {slug!r}")
     if not story_path.is_file():
         raise ValidationError(f"story file does not exist: {story_path}")
 
-    digest = story_digest_for(story_path)
     text = story_path.read_text(encoding="utf-8")
+    digest = hash_bytes(text.encode("utf-8"))
     cas.put_bytes(text.encode("utf-8"), kind=_STORY_KIND)
 
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +120,20 @@ def create_project(
     return ProjectService(conn).create(
         slug=slug, title=title, story_digest=digest, settings=settings
     )
+
+
+def _slug_in_use(conn: sqlite3.Connection, slug: str) -> bool:
+    """Whether a project already exists under this slug.
+
+    A plain pre-check, not a substitute for ``ProjectService.create``'s own
+    unique-constraint handling: this closes the window described above
+    (writes reaching disk/CAS before the check ran) for the ordinary,
+    non-racing CLI case; the ``ProjectService.create`` call at the end of
+    ``create_project`` remains the authoritative guard against a genuine
+    concurrent collision between two processes racing on the same slug.
+    """
+    row = conn.execute("SELECT 1 FROM projects WHERE slug = ? LIMIT 1", (slug,)).fetchone()
+    return row is not None
 
 
 def resolve_project_id(conn: sqlite3.Connection, slug: str) -> str:
