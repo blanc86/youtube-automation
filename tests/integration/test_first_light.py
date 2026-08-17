@@ -301,16 +301,30 @@ def _require_edge_tts_reachable() -> None:
     its own, and a Python thread blocked in it cannot be forcibly killed if
     the connection hangs rather than fails - it would leak past this fixture
     and could block interpreter shutdown. ``subprocess.run(..., timeout=)``
-    guarantees the child is killed either way.
+    guarantees the child is killed either way - but only if its own
+    ``TimeoutExpired`` is caught here rather than left to propagate: a
+    firewall that silently black-holes packets (no RST, the common
+    corporate-network case) hits exactly the timeout path, not a nonzero
+    exit, and an uncaught ``TimeoutExpired`` would ERROR every test in this
+    module instead of SKIPPING it with the diagnosis this fixture exists to
+    give.
     """
-    result = subprocess.run(
-        [sys.executable, "-c", _PREFLIGHT_SCRIPT],
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=20,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _PREFLIGHT_SCRIPT],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.skip(
+            "edge-tts is not reachable from this environment - this is a network "
+            "problem, not a pipeline defect (preflight did not respond within 20s, "
+            "consistent with a firewall silently dropping the connection rather than "
+            "refusing it). See this module's docstring."
+        )
     if result.returncode != 0:
         pytest.skip(
             "edge-tts is not reachable from this environment - this is a network "
@@ -485,6 +499,14 @@ class FirstLightEnv:
         finally:
             conn.close()
 
+    def artifact_digest(self, stage_id: str, name: str) -> str:
+        """The content digest of one artifact ``stage_id`` produced for the
+        most recently completed job - lets a test compare two runs' actual
+        output content, not merely whether a stage was a cache hit."""
+        job_id = self._latest_job_id()
+        ref = self._artifact_ref(job_id, stage_id, name)
+        return str(ref.digest)
+
     @property
     def narration_seconds(self) -> float:
         """The narration duration the pipeline itself computed - ``timeline.json``'s
@@ -532,12 +554,21 @@ class FirstLightEnv:
         job_id = uuid.uuid4().hex
         queue.enqueue(job_id, self.project_id, _PIPELINE_ID)
 
-        for expected in _STAGE_ORDER[:idx]:
-            report = dispatcher.tick()
-            assert report.spawned == (expected,), (
-                f"expected {expected!r} to spawn next, got "
-                f"spawned={report.spawned!r} skipped={report.skipped!r} idle={report.idle!r}"
-            )
+        try:
+            for expected in _STAGE_ORDER[:idx]:
+                report = dispatcher.tick()
+                assert report.spawned == (expected,), (
+                    f"expected {expected!r} to spawn next, got "
+                    f"spawned={report.spawned!r} skipped={report.skipped!r} idle={report.idle!r}"
+                )
+        except Exception:
+            # A failure here happens before `conn` is ever handed to
+            # `self._resume_conn` (below), so nothing else would close it -
+            # cheap insurance in a test that deliberately drives real
+            # subprocesses, mirroring test_resume.py's own connection
+            # lifecycle discipline.
+            conn.close()
+            raise
 
         outcome: dict[str, TickReport] = {}
 
@@ -557,25 +588,39 @@ class FirstLightEnv:
     def kill_running_worker(self) -> None:
         """Kill the worker ``run_until_stage`` is currently blocked spawning
         - a genuine ``taskkill``/process-tree termination, never a faked
-        death."""
+        death.
+
+        ``self._resume_conn`` was opened by ``run_until_stage`` and is only
+        otherwise closed by ``fast_forward_backoff``, several calls away - if
+        any assertion here fails, nothing would close it (or reap the
+        background driver thread) without this ``try``/``except``, leaking
+        both past the test. Cheap insurance in a test that deliberately kills
+        processes.
+        """
         assert self._resume_dispatcher is not None, "call run_until_stage first"
-        owner = f"{self._resume_job_id}:{self._resume_target_stage}"
-        deadline = time.monotonic() + 20.0
-        proc = None
-        while time.monotonic() < deadline:
-            proc = self._resume_dispatcher._running.get(owner)
-            if proc is not None:
-                break
-            time.sleep(0.005)
-        assert proc is not None, f"worker for {owner!r} never appeared in _running within 20s"
+        try:
+            owner = f"{self._resume_job_id}:{self._resume_target_stage}"
+            deadline = time.monotonic() + 20.0
+            proc = None
+            while time.monotonic() < deadline:
+                proc = self._resume_dispatcher._running.get(owner)
+                if proc is not None:
+                    break
+                time.sleep(0.005)
+            assert proc is not None, f"worker for {owner!r} never appeared in _running within 20s"
 
-        _kill_process_tree(proc.pid)
+            _kill_process_tree(proc.pid)
 
-        assert self._resume_driver is not None
-        self._resume_driver.join(timeout=60)
-        assert not self._resume_driver.is_alive(), (
-            "dispatcher.tick() never returned after the worker was killed"
-        )
+            assert self._resume_driver is not None
+            self._resume_driver.join(timeout=60)
+            assert not self._resume_driver.is_alive(), (
+                "dispatcher.tick() never returned after the worker was killed"
+            )
+        except Exception:
+            if self._resume_conn is not None:
+                self._resume_conn.close()
+                self._resume_conn = None
+            raise
 
     def fast_forward_backoff(self) -> None:
         """Clear the killed stage's retry backoff so the job is immediately
@@ -655,6 +700,28 @@ def first_light_env(
             for key, value in _DEFAULT_SETTINGS.items():
                 projects.set_setting(project_id, key, value)
             projects.set_setting(project_id, "broll_manifest_digest", str(manifest_digest))
+
+            # Fail fast, by name, if the installed `ytauto.stages` entry
+            # points do not cover the real seven-stage topology - exactly
+            # the stale-editable-install trap this task's own report
+            # describes (a truncated install let a job "succeed" having run
+            # only 2 of 7 stages, since build_pipeline only ever sees what
+            # importlib.metadata advertises). Every one of criteria 1, 2, 3
+            # and 4a would eventually fail on that truncation too, but each
+            # as a confusing downstream assertion far from the real cause;
+            # criterion 4b would not fail at all, since it only references
+            # ingest_story/synthesize_speech, both of which survive a 2-of-7
+            # truncation and behave correctly in isolation. This check runs
+            # for every criterion, before any of them starts real work.
+            cas_for_check = CasStore(root=paths.cas, conn=conn)
+            pipeline = build_pipeline(_PIPELINE_ID, cas_for_check, {})
+            registered = {stage.id for stage in pipeline.stages}
+            assert registered == set(_STAGE_ORDER), (
+                "the installed 'ytauto.stages' entry points do not match the "
+                f"real pipeline topology - registered {sorted(registered)}, "
+                f"expected {sorted(_STAGE_ORDER)}. Run "
+                '`pip install -e ".[dev]"` to refresh a stale editable install.'
+            )
         finally:
             conn.close()
 
@@ -731,11 +798,25 @@ def test_killing_a_worker_mid_render_resumes_at_that_stage(
 def test_changing_the_caption_colour_rerenders_only_the_compose_stages(
     first_light_env: Callable[..., FirstLightEnv],
 ) -> None:
+    """``"accent_colour"`` is ``render_ass``'s real ``caption_style`` field
+    (``core/captions/ass.py``'s ``_style_field(style, "accent_colour", ...)``
+    - confirmed by reading it, not assumed). An earlier version of this test
+    used ``"accent"``, a key ``render_ass`` never reads: ``_as_style`` places
+    no restriction on unknown keys, so that version still proved cache
+    invalidation (the settings *dict* changed, so the fingerprint changed)
+    but never proved a colour change reaches the rendered output - it just
+    moved a cache key. The digest comparison below is what closes that gap:
+    it fails if the two ``.ass`` blobs are byte-identical, which they would
+    be if the setting were silently inert.
+    """
     env = first_light_env(story="The train never stopped.", clips=4)
     env.run()
-    env.set_setting("caption_style", {"accent": "&H000000FF"})
+    before = env.artifact_digest("compose_landscape", "captions.ass")
+    env.set_setting("caption_style", {"accent_colour": "&H000000FF"})
     report = env.run_again()
     assert set(report.spawned) == {"compose_landscape", "compose_vertical"}
+    after = env.artifact_digest("compose_landscape", "captions.ass")
+    assert before != after, "the caption colour change never reached the rendered .ass"
 
 
 @pytest.mark.integration
