@@ -60,17 +60,29 @@ simple and correct at the cost of up to one second of added latency per
 retry - negligible next to a video render."""
 
 _RUN_WALL_CLOCK_BUDGET_S = 600.0
-"""How long ``_run`` keeps polling a deferred-but-not-terminal job before
-giving up. Backoff for one stage tops out at
+"""How long ``_run`` will keep waiting through a *continuous stretch with no
+progress* before giving up on a deferred-but-not-terminal job. This is a
+budget on idle waiting, not on the invocation's total elapsed time: it is
+measured from the most recent tick that actually did something (a cache-hit
+skip or a spawn, even one that itself re-deferred via a RETRYABLE/
+RATE_LIMITED failure), not from when ``_run`` started. A real
+``story_video`` run can legitimately spend several minutes doing genuine
+work (TTS, B-roll selection, two ffmpeg composes) before it ever needs a
+retry - counting that busy time against this budget would report a healthy,
+merely slow run as a timeout, which is exactly the bug an earlier version of
+this fix had (review round 3) before ``waiting_since`` was made to reset on
+every busy tick.
+
+Backoff for one stage tops out at
 ``_BASE_BACKOFF_S * 2 ** (_MAX_STAGE_ATTEMPTS - 2)`` = 5 * 2**3 = 40s between
 its last two attempts (75s total across all four waits before a fifth,
-final, terminal attempt) - so 600s leaves generous headroom for several
-stages each retrying a few times across the whole seven-stage pipeline,
-without letting one invocation of ``ytauto run`` block an operator's
-terminal indefinitely. Distinct from ``--max-ticks``, which bounds *ticks
-spent doing real work*; this bounds *wall-clock time spent waiting for more
-work to become available* - the two failure modes get two different
-diagnostic messages (see ``_run``)."""
+final, terminal attempt) - so 600s of *continuous* silence leaves generous
+headroom for one stage to exhaust its own retries without ``ytauto run``
+blocking an operator's terminal indefinitely, while never penalising time
+spent on work that is actually happening. Distinct from ``--max-ticks``,
+which bounds *ticks spent doing real work in one ``run_until_idle`` call*;
+this bounds *wall-clock time spent waiting with zero progress* - the two
+failure modes get two different diagnostic messages (see ``_run``)."""
 
 
 def _add_broll_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -198,7 +210,7 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
     ``_RUN_WALL_CLOCK_BUDGET_S`` elapses, or the dispatcher itself raises.
     The last three are reported with different stderr messages (see below) -
     sharing one exit code is fine within this brief's ``{0,1,2}`` contract,
-    but "ran out of tick budget", "still retrying after N seconds" and "the
+    but "ran out of tick budget", "made no progress for N seconds" and "the
     render actually failed" send an operator to different places and must
     not read the same.
 
@@ -216,9 +228,17 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
     loops: after each ``run_until_idle`` call, if the job is not yet terminal
     *and* the call actually went idle (as opposed to running out of
     ``--max-ticks`` while genuinely busy - ``report.idle`` tells them apart),
-    it sleeps briefly and calls again, bounded by ``_RUN_WALL_CLOCK_BUDGET_S``
-    of wall-clock time. This stays entirely inside the CLI - no change to
-    ``Dispatcher``/``tick()`` was needed or made.
+    it sleeps briefly and calls again. The wait is bounded by
+    ``_RUN_WALL_CLOCK_BUDGET_S``, but that budget measures a *continuous
+    stretch with no progress* (tracked as ``waiting_since``, reset whenever a
+    round's ``report.skipped``/``report.spawned`` is non-empty - real work
+    happened, even if that attempt itself re-deferred), never the
+    invocation's total elapsed time. Anchoring it to invocation start instead
+    was tried and rejected (review round 3): a real multi-minute render doing
+    genuine work would then get charged against the same budget as time spent
+    idle-waiting, and could report a false timeout on its first retry purely
+    because the busy phase before it ran long. This stays entirely inside the
+    CLI - no change to ``Dispatcher``/``tick()`` was needed or made.
 
     **Poison-job policy.** ``Dispatcher.tick()`` can raise ``ValidationError``
     for a job that has nothing to do with this invocation's own job - one
@@ -275,7 +295,7 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
             dispatcher = Dispatcher(
                 conn, cas, artifacts, Governor(), queue, pipelines={_PIPELINE_ID: pipeline}
             )
-            deadline = time.monotonic() + _RUN_WALL_CLOCK_BUDGET_S
+            waiting_since: float | None = None
             while True:
                 report = dispatcher.run_until_idle(max_ticks=args.max_ticks)
                 state = _job_state(conn, job_id)
@@ -286,11 +306,23 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
                     # budget this flag exists to bound; stop now rather than
                     # silently retrying past what the operator asked for.
                     break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                now = time.monotonic()
+                # A tick that actually did something this round - a cache-hit
+                # skip, or a spawn (even one that ultimately re-deferred via a
+                # RETRYABLE/RATE_LIMITED failure) - is a busy tick, not an idle
+                # one, even though run_until_idle's *last* tick this round
+                # found nothing claimable and so reported idle=True overall.
+                # Real work happened, so the waiting clock restarts from now
+                # rather than accumulating against however long this whole
+                # invocation has been running - see _RUN_WALL_CLOCK_BUDGET_S.
+                made_progress = bool(report.skipped or report.spawned)
+                if made_progress or waiting_since is None:
+                    waiting_since = now
+                elapsed_waiting = now - waiting_since
+                if elapsed_waiting >= _RUN_WALL_CLOCK_BUDGET_S:
                     gave_up_waiting_on_backoff = True
                     break
-                time.sleep(min(_RUN_POLL_INTERVAL_S, remaining))
+                time.sleep(min(_RUN_POLL_INTERVAL_S, _RUN_WALL_CLOCK_BUDGET_S - elapsed_waiting))
         except ValidationError as exc:
             print(
                 f"ytauto run: the queue stopped on an unrecoverable error: {exc}",
@@ -306,10 +338,13 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
             return 1
         if gave_up_waiting_on_backoff:
             print(
-                f"ytauto run: job {job_id} is still retrying after "
-                f"{_RUN_WALL_CLOCK_BUDGET_S:.0f}s and gave up waiting (currently "
-                f"{state!r}) - this is a retry-budget timeout, not a render "
-                "failure; rerun `ytauto run --project ...` to keep draining it",
+                f"ytauto run: job {job_id} made no progress for "
+                f"{_RUN_WALL_CLOCK_BUDGET_S:.0f}s and this invocation gave up "
+                f"waiting (currently {state!r}) - this is a retry-budget "
+                "timeout, not a render failure. The job itself is untouched "
+                "and will resume on its own once its retry backoff elapses; "
+                "running `ytauto run` again now enqueues a SEPARATE new job "
+                "for this project rather than resuming this one",
                 file=sys.stderr,
             )
         else:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
@@ -527,17 +528,24 @@ def test_run_reports_a_distinct_message_when_the_retry_wait_budget_is_exhausted(
 ) -> None:
     """The other half of Important #3's fix: giving up on a retry backoff
     must not be reported with the same message as running out of
-    ``--max-ticks`` while genuinely busy - "still healthy and retrying, just
-    slow" and "give up and go look at what failed" send an operator to
-    different places. A backoff (1s, monkeypatched from the real 5s minimum)
-    deliberately much longer than the wall-clock retry budget (0.05s,
-    monkeypatched from the real 600s) makes the very first
-    idle-because-deferred check already find the deadline passed, so this is
-    deterministic without an actually slow test.
+    ``--max-ticks`` while genuinely busy - "made no progress, still healthy"
+    and "give up and go look at what failed" send an operator to different
+    places.
+
+    Review round 3 caught that the wall-clock budget must measure a
+    *continuous stretch with no progress*, not elapsed time since the whole
+    invocation started - a round that spawns a worker (even one that
+    immediately re-defers) resets the clock (``waiting_since``), because real
+    work happened. So reproducing a genuine timeout needs a backoff (5s, the
+    real minimum, left unpatched) long enough relative to the tiny wall-clock
+    budget (0.05s, monkeypatched from the real 600s) that every poll *after*
+    the one spawn+defer finds the job simply not yet due - zero progress each
+    of those rounds - until the budget is exhausted. The fake worker is
+    therefore invoked exactly once: the 5s backoff never elapses within this
+    test's short wall-clock lifetime, so nothing ever spawns a second time.
     """
     _project(db_conn, slug="stuck-retrying")
     monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
-    monkeypatch.setattr("ytauto.app.scheduler.dispatcher._BASE_BACKOFF_S", 1.0)
     monkeypatch.setattr("ytauto.cli.__main__._RUN_WALL_CLOCK_BUDGET_S", 0.05)
     monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.01)
 
@@ -554,8 +562,11 @@ def test_run_reports_a_distinct_message_when_the_retry_wait_budget_is_exhausted(
         )
     )
 
+    calls = {"n": 0}
+
     def _spy(argv: object, **kwargs: object) -> _FakeProcess:
-        return _FakeProcess([retryable_line])  # always retryable, never resolves
+        calls["n"] += 1
+        return _FakeProcess([retryable_line])
 
     monkeypatch.setattr("ytauto.app.scheduler.dispatcher.Popen", _spy)
 
@@ -565,9 +576,162 @@ def test_run_reports_a_distinct_message_when_the_retry_wait_budget_is_exhausted(
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "retry-budget timeout" in err
+    assert "made no progress" in err
     assert "did not reach a terminal state within" not in err
+    # Review finding: the message must say what a rerun actually does (starts
+    # a SEPARATE new job) rather than implying it resumes the deferred one -
+    # "keep draining it" was the misleading phrasing this replaced.
+    assert "SEPARATE new job" in err
+    assert "keep draining it" not in err
+    assert calls["n"] == 1, "the real 5s backoff must not have elapsed during this test"
     assert _job_state(db_conn, slug="stuck-retrying") == "queued"
+
+
+def test_run_does_not_time_out_a_retry_that_follows_a_long_busy_phase(
+    tmp_path: Path,
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 3's central finding: anchoring the wall-clock budget to
+    invocation start (rather than to the most recent progress) meant a real,
+    healthy render that legitimately spends longer than the budget doing
+    genuine work - TTS, B-roll selection, ffmpeg composes - would report a
+    false "gave up waiting" timeout on its very first retry, having waited
+    *zero* actual idle seconds for anything.
+
+    Reproduced with a three-stage busy phase whose ``fingerprint()`` each
+    sleeps for real (0.1s x 3 = ~0.3s total - a stand-in for slow but
+    legitimate work; each is still a cache hit, so no subprocess is spawned),
+    chained via ``depends_on`` ahead of the real stage that then fails once
+    (RETRYABLE) before succeeding on retry. ``_RUN_WALL_CLOCK_BUDGET_S`` is
+    monkeypatched to 0.15s - deliberately *shorter* than the busy phase alone.
+    Under the pre-fix "anchor to invocation start" code this reliably timed
+    out on the very first idle check (the busy phase's own real sleep time
+    already exceeded the budget before any actual backoff-waiting began);
+    under the fix, real progress (the three cache-hit skips, and the spawn
+    itself) resets the waiting clock, so the run must still recover.
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    _project(db_conn, slug="slow-but-healthy")
+
+    busy_stage_ids = ("busy1", "busy2", "busy3")
+    fingerprints = {sid: f"{sid[-1]}" * 64 for sid in busy_stage_ids}
+    fingerprints[_FAKE_STAGE_ID] = _FIXED_FINGERPRINT
+    _BUSY_SLEEP_S = 0.1
+
+    class _BusyStage:
+        """A stage whose fingerprint() sleeps for real - a stand-in for the
+        wall-clock time a genuine stage's own work takes, without spawning a
+        real subprocess (it is always a cache hit; see the pre-recorded
+        artifacts below)."""
+
+        def __init__(self, stage_id: str, depends_on: tuple[str, ...]) -> None:
+            self.id = stage_id
+            self.version = 1
+            self.depends_on = depends_on
+            self.settings_keys: tuple[str, ...] = ()
+            self.gpu_pool = "gpu_compute"
+
+        def fingerprint(self, ctx: JobContext) -> str:
+            time.sleep(_BUSY_SLEEP_S)
+            return fingerprints[self.id]
+
+        def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
+            raise NotImplementedError("cache-hit only")
+
+    class _FixedStageAfterBusy(_FixedStage):
+        depends_on = ("busy3",)
+
+    def _busy_then_retry_pipeline(
+        pipeline_id: str, cas: CasStore, settings: Mapping[str, object]
+    ) -> Pipeline:
+        return Pipeline(
+            id=pipeline_id,
+            stages=(
+                _BusyStage("busy1", ()),
+                _BusyStage("busy2", ("busy1",)),
+                _BusyStage("busy3", ("busy2",)),
+                _FixedStageAfterBusy(),
+            ),
+        )
+
+    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _busy_then_retry_pipeline)
+    # Shorter than the ~0.3s busy phase alone - the whole point of the test.
+    monkeypatch.setattr("ytauto.cli.__main__._RUN_WALL_CLOCK_BUDGET_S", 0.15)
+    monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.02)
+    monkeypatch.setattr("ytauto.app.scheduler.dispatcher._BASE_BACKOFF_S", 0.05)
+
+    fixed_job_id = "c" * 32
+    monkeypatch.setattr("uuid.uuid4", lambda: _FixedUUID(fixed_job_id))
+
+    # Pre-record cache hits for the three busy stages so each is a real,
+    # slow-but-non-spawning round trip through tick() - genuine "made
+    # progress" ticks with no worker subprocess involved.
+    cas = CasStore(root=paths.cas, conn=db_conn)
+    artifacts = ArtifactStore(cas, db_conn)
+    for sid in busy_stage_ids:
+        blob = f"{sid}-cached-output".encode()
+        digest = cas.put_bytes(blob, kind="blob")
+        artifacts.record(
+            fingerprints[sid], sid, [ArtifactRef(name="out", kind="blob", digest=digest)]
+        )
+
+    real_output = b"real worker output"
+    real_digest = cas.stage_file(real_output, kind="blob")
+
+    retryable_line = encode(
+        Error(
+            job_id=fixed_job_id,
+            stage_id=_FAKE_STAGE_ID,
+            correlation_id="c1",
+            message="simulated transient failure",
+            kind=ErrorKind.RETRYABLE,
+        )
+    )
+    staged_line = encode(
+        Staged(
+            job_id=fixed_job_id,
+            stage_id=_FAKE_STAGE_ID,
+            correlation_id="c2",
+            digest=real_digest,
+            kind="blob",
+            size_bytes=len(real_output),
+        )
+    )
+    result_line = encode(
+        Result(
+            job_id=fixed_job_id,
+            stage_id=_FAKE_STAGE_ID,
+            correlation_id="c2",
+            artifacts=(ArtifactLine(name="out", kind="blob", digest=real_digest),),
+        )
+    )
+
+    calls = {"n": 0}
+
+    def _spy(argv: object, **kwargs: object) -> _FakeProcess:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FakeProcess([retryable_line])
+        return _FakeProcess([staged_line, result_line])
+
+    monkeypatch.setattr("ytauto.app.scheduler.dispatcher.Popen", _spy)
+
+    rc = main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "run",
+            "--project",
+            "slow-but-healthy",
+            "--max-ticks",
+            "20",
+        ]
+    )
+
+    assert rc == 0, "a retry immediately after a long busy phase must still recover, not time out"
+    assert _job_state(db_conn, slug="slow-but-healthy") == "succeeded"
+    assert calls["n"] == 2
 
 
 def test_run_returns_1_when_max_ticks_is_exhausted_before_the_job_finishes(
