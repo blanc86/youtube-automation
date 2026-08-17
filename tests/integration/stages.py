@@ -39,6 +39,7 @@ class StderrFlooder:
     version = 1
     depends_on: tuple[str, ...] = ()
     settings_keys: tuple[str, ...] = ()
+    gpu_pool = "gpu_compute"
 
     def __init__(self, cas: CasStore) -> None:
         self._cas = cas
@@ -72,6 +73,7 @@ class FixedFingerprint:
     version = 1
     depends_on: tuple[str, ...] = ()
     settings_keys: tuple[str, ...] = ()
+    gpu_pool = "gpu_compute"
 
     FINGERPRINT = "a" * 64
 
@@ -106,6 +108,7 @@ class Unfingerprintable:
     version = 1
     depends_on: tuple[str, ...] = ()
     settings_keys: tuple[str, ...] = ()
+    gpu_pool = "gpu_compute"
 
     def __init__(self, cas: CasStore) -> None:
         self._cas = cas

@@ -47,6 +47,7 @@ class _RecordingStage:
         self.version = 1
         self.depends_on: tuple[str, ...] = ()
         self.settings_keys: tuple[str, ...] = ()
+        self.gpu_pool = "gpu_compute"
         self.cas = cas
         self.settings = settings
 

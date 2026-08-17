@@ -71,7 +71,7 @@ from pathlib import Path
 from subprocess import Popen
 from typing import IO
 
-from ytauto.app.scheduler.governor import Governor
+from ytauto.app.scheduler.governor import KNOWN_POOLS, Governor
 from ytauto.app.scheduler.queue import ClaimedJob, JobQueue
 from ytauto.app.scheduler.runner import gather_inputs
 from ytauto.app.scheduler.worker_protocol import (
@@ -100,9 +100,6 @@ _DEFAULT_RETRY_AFTER_S = 60.0
 _BASE_BACKOFF_S = 5.0
 _MAX_BACKOFF_S = 3600.0
 _MAX_STAGE_ATTEMPTS = 5
-_GPU_POOL = "gpu_compute"
-"""The default lease pool ``_spawn`` uses for any ``Stage`` that does not
-declare its own ``gpu_pool`` class attribute - see ``_spawn``'s docstring."""
 
 
 @dataclass(frozen=True)
@@ -770,17 +767,21 @@ class Dispatcher:
         """Acquire a GPU lease, spawn a worker, and block until it reports a
         terminal message. Returns whether a worker was started.
 
-        Every spawn takes a lease from *some* GPU pool - ``gpu_compute`` by
-        default, conservative for a stage that does not actually need the
-        GPU, since nothing in the ``Stage`` Protocol otherwise carries a
-        capability descriptor to decide differently. A stage that does need
-        a specific pool says so with its own optional ``gpu_pool`` class
-        attribute (``app.stages.compose.ComposeStage`` sets it to
-        ``"gpu_encode"`` - Phase 2a's compose stages are the first work that
-        contends for encode hardware rather than compute); ``getattr`` with
-        ``_GPU_POOL`` as the default is what lets every ``Stage`` implementation
-        that predates this stay silent on the question and keep leasing
-        ``gpu_compute`` exactly as before.
+        Every spawn takes a lease from *some* GPU pool - ``stage.gpu_pool``,
+        a required ``Stage`` Protocol member (``"gpu_compute"`` for the
+        common case; ``"gpu_encode"`` for ``app.stages.compose.ComposeStage``,
+        Phase 2a's first work that contends for encode hardware rather than
+        compute). Read directly, never through ``getattr`` with a fallback:
+        an earlier version of this method defaulted a missing attribute to
+        ``gpu_compute``, which meant a typo in a stage's own ``gpu_pool``
+        degraded silently, with no type error and no test failure. Requiring
+        the attribute on the Protocol turns that into a mypy error at every
+        call site that constructs a concrete ``Stage``, which is the entire
+        point (Task 11's review) - see ``core.pipeline.stage.Stage.gpu_pool``'s
+        own docstring for the full account. Validated against
+        ``governor.KNOWN_POOLS`` here, before ever reaching
+        ``Governor.lease``, so a bad value names the offending stage rather
+        than surfacing as a bare "unknown pool" with no attribution.
 
         A refused lease defers to a later tick rather than blocking - but the
         job has to go back on the queue for that later tick to exist at all,
@@ -790,10 +791,17 @@ class Dispatcher:
         lessable pool.
 
         Raises:
+            ValidationError: ``stage.gpu_pool`` names a pool
+                ``app.scheduler.governor`` does not know about.
             OSError: the worker subprocess cannot be started.
         """
         owner = f"{claimed.job_id}:{stage.id}"
-        pool = getattr(stage, "gpu_pool", _GPU_POOL)
+        pool = stage.gpu_pool
+        if pool not in KNOWN_POOLS:
+            raise ValidationError(
+                f"stage {stage.id!r} declares gpu_pool={pool!r}, which is not a pool "
+                f"the governor knows about (known: {sorted(KNOWN_POOLS)})"
+            )
         lease = self._governor.lease(pool, owner)
         granted = lease.__enter__()
         if not granted:

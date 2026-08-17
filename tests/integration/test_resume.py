@@ -132,6 +132,7 @@ class FetchStage:
     version = 1
     depends_on: tuple[str, ...] = ()
     settings_keys: tuple[str, ...] = ()
+    gpu_pool = "gpu_compute"
 
     def __init__(self, cas: CasStore) -> None:
         self._cas = cas
@@ -163,6 +164,7 @@ class TtsStage:
     version = 1
     depends_on: tuple[str, ...] = ("fetch",)
     settings_keys: tuple[str, ...] = ()
+    gpu_pool = "gpu_compute"
 
     def __init__(self, cas: CasStore) -> None:
         self._cas = cas
@@ -202,6 +204,7 @@ class RenderStage:
     version = 1
     depends_on: tuple[str, ...] = ("tts",)
     settings_keys: tuple[str, ...] = ()
+    gpu_pool = "gpu_compute"
 
     def __init__(self, cas: CasStore) -> None:
         self._cas = cas

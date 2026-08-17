@@ -61,6 +61,7 @@ class _FakeStage:
         # nothing here reads settings_keys; it is declared because a Stage
         # that omits it no longer satisfies the protocol at all.
         self.settings_keys: tuple[str, ...] = ()
+        self.gpu_pool = "gpu_compute"
         self._produces = tuple(produces)
         self._raises = raises
         self._cas = cas

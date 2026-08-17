@@ -111,6 +111,30 @@ class Stage(Protocol):
     which is the projection every stage is expected to fingerprint through.
     """
 
+    gpu_pool: str
+    """Which ``app.scheduler.governor.Governor`` lease pool a spawn of this
+    stage draws from (``"gpu_compute"`` for the common case; ``"gpu_encode"``
+    for a stage that encodes video, such as ``app.stages.compose.ComposeStage``).
+
+    This is the one member of ``Stage`` that describes a scheduling concern
+    rather than the stage's own domain behaviour - a genuine tension with
+    ``core``'s otherwise scheduling-agnostic shape, accepted deliberately
+    (Task 11's review) because the alternative was worse: ``Dispatcher._spawn``
+    used to read this off a ``getattr(stage, "gpu_pool", "gpu_compute")``
+    with no static or runtime signal at all, so a typo in a stage's own
+    ``gpu_pool`` (``"gpu_pol"``, say) silently and permanently degraded to
+    ``gpu_compute`` - no type error, no test failure, defeating the whole
+    point of a stage declaring a separate pool. Declaring it here, required,
+    means mypy rejects any concrete ``Stage`` that omits it, and
+    ``isinstance(x, Stage)`` (``@runtime_checkable``) rejects one at runtime
+    too - see ``core.pipeline.test_stage``'s conformance tests. Every stage
+    that does not encode video sets it to the plain string ``"gpu_compute"``,
+    not to some shared constant imported from ``app.scheduler.governor`` -
+    ``core`` may not import ``app`` or ``infra`` at all, so the pool name
+    has to be a literal here even though ``governor.py`` is where it is
+    ultimately spent. ``Dispatcher._spawn`` is the sole reader.
+    """
+
     @property
     def id(self) -> str:
         """Stable identifier, unique within a pipeline."""

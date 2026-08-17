@@ -63,6 +63,17 @@ class Transcribe:
     nothing here varies with a caption colour, a voice, or any other setting.
     The ``Stage`` Protocol declares no default for this, so it must be stated
     explicitly rather than left implicit."""
+    gpu_pool = "gpu_compute"
+    """Set to the plain default pool despite this stage's own module
+    docstring noting it "takes no GPU lease" - that describes real GPU
+    *work*, not the governor's own bookkeeping. Every spawn has always taken
+    a ``gpu_compute`` lease regardless of whether the stage needs the GPU
+    (``Dispatcher._spawn``'s long-standing, deliberately conservative
+    behaviour - see its own docstring), so this is not a new lease this
+    stage did not have before; it is a required, explicit literal for
+    exactly the lease it already took. A dedicated "no lease at all" pool is
+    a scheduler-level change, out of this task's scope - see this task's
+    report."""
 
     def __init__(self, *, cas: CasStore, transcriber: Transcriber) -> None:
         self._cas = cas

@@ -99,6 +99,7 @@ def test_a_conforming_class_satisfies_the_protocol() -> None:
         version = 1
         depends_on: tuple[str, ...] = ()
         settings_keys: tuple[str, ...] = ()
+        gpu_pool = "gpu_compute"
 
         def fingerprint(self, ctx: JobContext) -> str:
             return "f" * 64
@@ -115,6 +116,7 @@ def test_a_class_missing_run_does_not_satisfy_the_protocol() -> None:
         version = 1
         depends_on: tuple[str, ...] = ()
         settings_keys: tuple[str, ...] = ()
+        gpu_pool = "gpu_compute"
 
         def fingerprint(self, ctx: JobContext) -> str:
             return "f" * 64
@@ -129,12 +131,45 @@ def test_a_class_that_declares_no_settings_keys_does_not_satisfy_the_protocol() 
     ``AttributeError`` deep inside ``stage_fingerprint`` at run time - in a
     worker subprocess, mid-job. A stage that reads no settings says so
     explicitly with ``()``.
+
+    ``gpu_pool`` is declared here (unlike ``settings_keys``) so this test's
+    failure is attributable to the one field it is actually about, not
+    confounded by a second missing member - see
+    ``test_a_class_that_declares_no_gpu_pool_does_not_satisfy_the_protocol``
+    for the mirror-image test isolating ``gpu_pool`` instead.
     """
 
     class Undeclared:
         id = "undeclared"
         version = 1
         depends_on: tuple[str, ...] = ()
+        gpu_pool = "gpu_compute"
+
+        def fingerprint(self, ctx: JobContext) -> str:
+            return "f" * 64
+
+        def run(self, ctx: JobContext, emit: object) -> StageResult:
+            return StageResult(artifacts=())
+
+    assert not isinstance(Undeclared(), Stage)
+
+
+def test_a_class_that_declares_no_gpu_pool_does_not_satisfy_the_protocol() -> None:
+    """``gpu_pool`` (Task 11's review) is required for exactly the same
+    reason ``settings_keys`` is: a stage that omitted it used to fall
+    through to a silent ``getattr(..., "gpu_compute")`` default inside
+    ``Dispatcher._spawn`` - no type error, no test failure, a typo
+    (``gpu_pol``) indistinguishable from a deliberate choice. Declaring it
+    required here is what makes ``isinstance(x, Stage)`` catch the omission,
+    mirroring the mypy-level enforcement at every concrete ``Stage``
+    construction site.
+    """
+
+    class Undeclared:
+        id = "undeclared"
+        version = 1
+        depends_on: tuple[str, ...] = ()
+        settings_keys: tuple[str, ...] = ()
 
         def fingerprint(self, ctx: JobContext) -> str:
             return "f" * 64

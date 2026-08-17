@@ -13,6 +13,7 @@ class FakeStage:
         self.version = 1
         self.depends_on = depends_on
         self.settings_keys: tuple[str, ...] = ()
+        self.gpu_pool = "gpu_compute"
 
     def fingerprint(self, ctx: JobContext) -> str:
         return "f" * 64

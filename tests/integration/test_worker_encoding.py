@@ -56,6 +56,7 @@ class ChattyStage:
     version = 1
     depends_on: tuple[str, ...] = ()
     settings_keys: tuple[str, ...] = ()
+    gpu_pool = "gpu_compute"
 
     def fingerprint(self, ctx: JobContext) -> str:
         return "d" * 64

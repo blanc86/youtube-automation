@@ -64,6 +64,13 @@ _CAPACITIES: dict[str, int] = {
     "gpu_encode": GPU_ENCODE_CAPACITY,
 }
 
+KNOWN_POOLS: frozenset[str] = frozenset(_CAPACITIES)
+"""Every pool name a ``Governor`` will accept. Public so ``Dispatcher._spawn``
+can validate a stage's own ``gpu_pool`` at the point it reads it - naming the
+offending stage in the error - rather than relying on ``Governor.lease``'s
+own ``unknown pool`` ``ValidationError``, which fires just as reliably but
+with no stage context attached."""
+
 
 class _Lease(AbstractContextManager[bool]):
     """One outstanding request for a slot in a pool, returned by ``Governor.lease``.

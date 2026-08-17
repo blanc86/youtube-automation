@@ -65,6 +65,10 @@ class SynthesizeSpeech:
     version = 1
     depends_on: tuple[str, ...] = ("ingest_story",)
     settings_keys: tuple[str, ...] = ("voice", "rate")
+    gpu_pool = "gpu_compute"
+    """No GPU work at all; the plain default pool - see
+    ``core.pipeline.stage.Stage.gpu_pool``'s own docstring for why this is a
+    required, explicit literal rather than an implicit fallback."""
 
     def __init__(self, *, cas: CasStore, synthesizer: SpeechSynthesizer) -> None:
         self._cas = cas

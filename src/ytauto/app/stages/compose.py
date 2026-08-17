@@ -44,20 +44,21 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
 from ytauto.app.stage_support import stage_fingerprint
 from ytauto.core.captions.ass import render_ass
-from ytauto.core.errors import ErrorKind, ProviderError
+from ytauto.core.errors import ConfigurationError, ErrorKind, ProviderError
 from ytauto.core.models.artifact import ArtifactRef
 from ytauto.core.models.content_hash import ContentHash
 from ytauto.core.pipeline.stage import JobContext, ProgressFn, StageResult
 from ytauto.core.pipeline.timeline import CaptionGroup, Timeline
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.ffmpeg.compose import ComposeClip, compose_args
-from ytauto.infra.ffmpeg.locator import FfmpegBinaries, locate
-from ytauto.infra.ffmpeg.probe import probe
+from ytauto.infra.ffmpeg.locator import locate
+from ytauto.infra.ffmpeg.probe import FfmpegCapabilities, probe
 
 PROVIDER_ID = "ffmpeg"
 """Literal, fed to ``stage_fingerprint`` and to every ``ProviderError`` this
@@ -79,10 +80,29 @@ _FONT_SIZE_DIVISOR = 20
 ``font_size`` decision: roughly 5% of frame height on either canvas, so
 captions read the same visual size on both. Landscape (1080 tall) gets 54;
 vertical (1920 tall) gets 96 - which happens to equal ``render_ass``'s own
-``_DEFAULT_FONT_SIZE``, not by leaning on that default (this value is always
-passed explicitly, every call, regardless of what a caller's
-``caption_style`` supplies) but because 96 was already sized correctly for
-the vertical canvas alone - it was only ever wrong for landscape."""
+``_DEFAULT_FONT_SIZE``, but not by leaning on that default: this value is
+always the one ``style.setdefault("font_size", ...)`` falls back to in
+``run()`` when ``caption_style`` does not name one of its own - never
+render_ass's internal 96, which is wrong for the 1080-tall landscape canvas.
+An operator-supplied ``caption_style["font_size"]`` still wins over this
+default (Task 11's review, Important #5): overwriting it unconditionally
+made ``font_size`` a declared ``settings_keys`` member the fingerprint
+depended on while the code guaranteed it never actually changed the
+rendered output - a real cache-key/behaviour mismatch, not merely
+inelegant."""
+
+_FALLBACK_ENCODER = "libx264"
+"""Retried once, automatically, when the primary encoder was chosen via
+``encoder == "auto"`` and it was a hardware one that then failed at ffmpeg
+run time - a driver mismatch, VRAM exhaustion, or (on a consumer card like
+this project's own RTX 3050) NVENC's concurrent-session limit already held
+by another process. ``FfmpegCapabilities.best_h264_encoder`` only proves an
+encoder is *listed*; it says nothing about whether the hardware will accept
+a real encode this run, which is a materially different question this
+constant exists to answer defensively. Never applied when the operator named
+an encoder explicitly (``encoder != "auto"``) - retrying past an explicit
+choice would silently override it, and libx264's own output is not what
+they asked for."""
 
 _FFMPEG_STDERR_LOG = "ffmpeg-stderr.log"
 """Where this stage writes ffmpeg's captured stderr on a failed compose, and
@@ -205,13 +225,14 @@ class ComposeStage:
     depends_on: tuple[str, ...] = ("plan_timeline", "select_broll", "synthesize_speech")
     settings_keys: tuple[str, ...] = ("broll_manifest_digest", "caption_style", "encoder")
     gpu_pool = "gpu_encode"
-    """Read by ``Dispatcher._spawn`` in place of the default ``gpu_compute``
-    pool (``getattr(stage, "gpu_pool", _GPU_POOL)``) - this stage encodes
-    video, it never runs a compute model like Whisper, so it competes for a
-    separate lease pool rather than one a future ASR-based ``Transcriber``
-    would also need. A refused ``gpu_encode`` lease is a normal requeue, not
-    a failure - ``Dispatcher._spawn`` already handles that generically for
-    any pool."""
+    """Read directly by ``Dispatcher._spawn`` (a required ``Stage`` Protocol
+    member, per Task 11's review - see ``core.pipeline.stage.Stage.gpu_pool``
+    for the full account) in place of the default ``gpu_compute`` - this
+    stage encodes video, it never runs a compute model like Whisper, so it
+    competes for a separate lease pool rather than one a future ASR-based
+    ``Transcriber`` would also need. A refused ``gpu_encode`` lease is a
+    normal requeue, not a failure - ``Dispatcher._spawn`` already handles
+    that generically for any pool."""
 
     def __init__(
         self,
@@ -279,7 +300,7 @@ class ComposeStage:
             )
         return clips
 
-    def _resolve_encoder(self, encoder_setting: str, ffmpeg_binaries: FfmpegBinaries) -> str:
+    def _resolve_encoder(self, encoder_setting: str, capabilities: FfmpegCapabilities) -> str:
         """Turn the ``encoder`` project setting into a real, available encoder name.
 
         ``"auto"`` (the ordinary case) defers to
@@ -293,11 +314,18 @@ class ComposeStage:
         ``settings_keys``: whichever branch runs, a changed value is a
         changed rendered file and must invalidate the cache.
 
+        This only proves the chosen encoder is *listed* by ``ffmpeg
+        -encoders`` - it says nothing about whether the hardware will accept
+        a real encode this run (a driver mismatch, VRAM exhaustion, or a
+        consumer card's NVENC session limit already held by another process
+        all pass this check and then fail at ``run()``'s actual ffmpeg
+        invocation). ``run()`` is what retries with ``_FALLBACK_ENCODER`` on
+        that runtime failure; this method only ever answers "is it listed".
+
         Raises:
             ProviderError: FATAL, if an explicit override names an encoder
                 this ffmpeg build does not expose.
         """
-        capabilities = probe(ffmpeg_binaries)
         if encoder_setting == "auto":
             return capabilities.best_h264_encoder()
         if encoder_setting in capabilities.encoders:
@@ -310,15 +338,47 @@ class ComposeStage:
             kind=ErrorKind.FATAL,
         )
 
-    def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
-        """Read the three upstream artifacts and the manifest, render
-        captions, run ffmpeg once, and stage the master video plus the
-        ``.ass`` it burned in.
+    def _run_ffmpeg(
+        self, ffmpeg: Path, args: list[str], cwd: Path
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one ffmpeg invocation, stderr and stdout both captured.
+
+        ``subprocess.run`` with captured output, never a manual ``Popen`` -
+        this project has already shipped one leaked-pipe bug, and
+        ``ResourceWarning``/``PytestUnraisableExceptionWarning`` are promoted
+        to errors specifically to catch it happening again (see
+        ``infra.broll._run_normalise``, which states the same rule).
 
         Raises:
+            subprocess.TimeoutExpired: the encode did not finish within
+                ``_ENCODE_TIMEOUT_S``.
+            OSError: ``ffmpeg`` cannot be executed.
+        """
+        return subprocess.run(
+            [str(ffmpeg), *args],
+            cwd=cwd,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_ENCODE_TIMEOUT_S,
+            check=False,
+        )
+
+    def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
+        """Read the three upstream artifacts and the manifest, render
+        captions, run ffmpeg once (retrying at most once, on a hardware
+        encoder's own runtime failure - see ``_FALLBACK_ENCODER``), and stage
+        the master video plus the ``.ass`` it burned in.
+
+        Raises:
+            ConfigurationError: this ffmpeg build has no ``ass`` filter
+                (libass) at all - checked up front, before any of the CAS
+                reads below, so a build that can never burn captions fails
+                immediately rather than after doing real work.
             ProviderError: FATAL, from ``_resolve_clips`` (a manifest/segments
                 mismatch), ``_resolve_encoder`` (an unavailable explicit
-                encoder override), or a non-zero ffmpeg exit - see
+                encoder override), or a non-zero ffmpeg exit (after the one
+                automatic fallback retry, where applicable) - see
                 ``_FFMPEG_STDERR_LOG``'s own docstring for why the log path
                 named in that last message is not literally Task 1's
                 ``stderr.attempt-N.log``.
@@ -329,6 +389,15 @@ class ComposeStage:
                 specially.
             TypeError: a settings value is present but the wrong type.
         """
+        binaries = locate()
+        capabilities = probe(binaries)
+        if not capabilities.has_subtitle_burn_in():
+            raise ConfigurationError(
+                f"{binaries.ffmpeg} (version {binaries.version}) has no 'ass' filter "
+                "(libass); this build cannot burn in captions at all - install a build "
+                "with libass support"
+            )
+
         segments_ref = ctx.input("select_broll", "segments.json")
         segments: list[Mapping[str, object]] = json.loads(self._cas.read_bytes(segments_ref.digest))
 
@@ -346,52 +415,96 @@ class ComposeStage:
         clips = self._resolve_clips(segments, manifest_raw)
 
         style = dict(_as_style(ctx.settings["caption_style"]))
-        # Always overridden, never merely defaulted-if-absent: this task's
-        # first bound decision is that font_size must never rely on
-        # render_ass's own canvas-agnostic default, for either canvas, on
-        # every render - not only when a caller's caption_style happens to
-        # omit it. See _FONT_SIZE_DIVISOR's own docstring.
-        style["font_size"] = self._height // _FONT_SIZE_DIVISOR
+        # setdefault, not an unconditional overwrite: font_size must never
+        # rely on render_ass's own canvas-agnostic default (this task's first
+        # bound decision), but an operator-supplied caption_style["font_size"]
+        # must still win - see _FONT_SIZE_DIVISOR's own docstring and Task
+        # 11's review, Important #5.
+        style.setdefault("font_size", self._height // _FONT_SIZE_DIVISOR)
         ass_text = render_ass(timeline, width=self._width, height=self._height, style=style)
 
         ctx.workdir.mkdir(parents=True, exist_ok=True)
         ass_bytes = ass_text.encode("utf-8")
         (ctx.workdir / _ASS_FILENAME).write_bytes(ass_bytes)
-        ass_digest = self._cas.stage_file(ass_bytes, kind="text")
+        # Not staged into the CAS yet - see below, after ffmpeg's own
+        # success is confirmed. This workdir copy is the one ffmpeg itself
+        # needs to read (cwd=ctx.workdir, bare filename - the Windows
+        # drive-letter guard); it has nothing to do with the CAS blob.
 
         encoder_setting = _as_encoder_setting(ctx.settings["encoder"])
-        binaries = locate()
-        encoder = self._resolve_encoder(encoder_setting, binaries)
+        encoder = self._resolve_encoder(encoder_setting, capabilities)
 
         out_path = ctx.workdir / self._artifact_name
-        args = compose_args(
-            clips=clips,
-            ass_path=Path(_ASS_FILENAME),
-            audio_path=audio_path,
-            out_path=out_path,
-            width=self._width,
-            height=self._height,
-            encoder=encoder,
-        )
-        result = subprocess.run(
-            [str(binaries.ffmpeg), *args],
-            cwd=ctx.workdir,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_ENCODE_TIMEOUT_S,
-            check=False,
-        )
+
+        def _args_for(chosen_encoder: str) -> list[str]:
+            return compose_args(
+                clips=clips,
+                ass_path=Path(_ASS_FILENAME),
+                audio_path=audio_path,
+                out_path=out_path,
+                width=self._width,
+                height=self._height,
+                encoder=chosen_encoder,
+            )
+
+        used_encoder = encoder
+        result = self._run_ffmpeg(binaries.ffmpeg, _args_for(encoder), ctx.workdir)
+        diagnostic = result.stderr
+
+        # One automatic retry, hardware-encoder-to-libx264, only when the
+        # encoder was auto-selected: FfmpegCapabilities.best_h264_encoder
+        # only proves an encoder is *listed*, never that the hardware will
+        # accept a real encode this run (a driver mismatch, VRAM exhaustion,
+        # or - on this project's own RTX 3050 - NVENC's concurrent-session
+        # limit already held by another process all pass that check and fail
+        # here instead). Never applied to an operator's explicit choice -
+        # that would silently override it.
+        if result.returncode != 0 and encoder_setting == "auto" and encoder != _FALLBACK_ENCODER:
+            print(
+                f"ffmpeg exited {result.returncode} with encoder {encoder!r}; "
+                f"retrying once with {_FALLBACK_ENCODER!r}",
+                file=sys.stderr,
+            )
+            fallback_result = self._run_ffmpeg(
+                binaries.ffmpeg, _args_for(_FALLBACK_ENCODER), ctx.workdir
+            )
+            diagnostic = (
+                f"primary encoder {encoder!r} failed (exit {result.returncode}):\n"
+                f"{result.stderr}\n\n"
+                f"fallback encoder {_FALLBACK_ENCODER!r} "
+                f"{'succeeded' if fallback_result.returncode == 0 else 'also failed'} "
+                f"(exit {fallback_result.returncode}):\n{fallback_result.stderr}"
+            )
+            result = fallback_result
+            used_encoder = _FALLBACK_ENCODER
+
         if result.returncode != 0:
             log_path = ctx.workdir / _FFMPEG_STDERR_LOG
-            log_path.write_text(result.stderr, encoding="utf-8")
+            log_path.write_text(diagnostic, encoding="utf-8")
+            # Echoed to this worker's own stderr too, not only the
+            # self-owned log file: Task 1 redirects the whole worker
+            # process's stderr to ctx.workdir/stderr.attempt-N.log, and
+            # capture_output=True above otherwise diverts ffmpeg's real
+            # diagnostic away from that stream entirely - the dispatcher's
+            # own docstring anticipated exactly this ("ffmpeg - Phase 2a's
+            # first real stderr writer"). The two logs are complementary,
+            # not redundant: this one is guaranteed correctly named (see
+            # _FFMPEG_STDERR_LOG's docstring), that one is where an operator
+            # already watching a live worker's stderr will see it first.
+            print(diagnostic, file=sys.stderr)
             raise ProviderError(
-                f"ffmpeg exited {result.returncode} composing {self._artifact_name}; "
-                f"see {log_path} for the full diagnostic",
+                f"ffmpeg exited {result.returncode} composing {self._artifact_name} "
+                f"(encoder {used_encoder!r}); see {log_path} for the full diagnostic",
                 provider_id=PROVIDER_ID,
                 kind=ErrorKind.FATAL,
             )
 
+        # Staged into the CAS only now that ffmpeg has actually succeeded -
+        # staging it earlier left an orphaned blob file (no cas_objects row,
+        # so the evictor - which walks DB rows, not the filesystem - could
+        # never reclaim it) on every FATAL failure between the stage and
+        # here (Task 11's review, Minor).
+        ass_digest = self._cas.stage_file(ass_bytes, kind="text")
         video_digest = self._cas.stage_file(out_path.read_bytes(), kind="video")
 
         return StageResult(

@@ -51,6 +51,48 @@ def test_each_segment_is_trimmed_at_its_own_in_point() -> None:
     assert args[args.index("-t") + 1] == "3.0"
 
 
+def test_segment_k_gets_segment_k_s_in_point_not_the_first_segment_s() -> None:
+    """The exact off-by-one the brief cared most about (Task 11 review,
+    Important #1). The single-clip test above can only ever find the
+    *first* "-ss" via ``args.index(...)``, so nothing in the suite
+    distinguishes "each clip trimmed at its own in-point" from "every clip
+    trimmed at the first clip's" - the code is correct, but was unpinned.
+
+    Three clips at distinct in-points and durations, parsed into
+    ``(-ss, -t, -i)`` triples in order and matched against their own clip -
+    the stronger assertion the brief's own note already called for, rather
+    than a positional ``.index()`` lookup.
+    """
+    clips = [
+        _c("a.mp4", 1.0, 2.0),
+        _c("b.mp4", 5.5, 3.25),
+        _c("c.mp4", 10.0, 1.5),
+    ]
+    args = compose_args(
+        clips=clips,
+        ass_path=Path("c.ass"),
+        audio_path=Path("n.mp3"),
+        out_path=Path("o.mp4"),
+        width=1920,
+        height=1080,
+        encoder="h264_nvenc",
+    )
+
+    triples: list[tuple[str, str, str]] = []
+    i = args.index("-ss")
+    while i < len(args) and args[i] == "-ss":
+        assert args[i + 2] == "-t"
+        assert args[i + 4] == "-i"
+        triples.append((args[i + 1], args[i + 3], args[i + 5]))
+        i += 6
+
+    assert triples == [
+        ("1.0", "2.0", "a.mp4"),
+        ("5.5", "3.25", "b.mp4"),
+        ("10.0", "1.5", "c.mp4"),
+    ], "each clip must be trimmed at its own in-point/duration, in its own order"
+
+
 def test_the_ass_path_is_relative_so_a_windows_drive_letter_cannot_break_the_filter() -> None:
     """ffmpeg filter syntax treats ':' as an argument separator, so 'C:\\x' breaks the graph."""
     args = compose_args(

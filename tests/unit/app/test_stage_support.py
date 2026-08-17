@@ -28,6 +28,7 @@ class _FakeStage:
         self.version = version
         self.depends_on: tuple[str, ...] = ()
         self.settings_keys = settings_keys
+        self.gpu_pool = "gpu_compute"
 
     def fingerprint(self, ctx: JobContext) -> str:
         return stage_fingerprint(self, ctx, provider_id="edge-tts", provider_version="1")

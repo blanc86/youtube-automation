@@ -70,20 +70,19 @@ class _FixedStage:
         depends_on: tuple[str, ...] = (),
         *,
         capture: Callable[[Mapping[str, object]], None] | None = None,
-        gpu_pool: str | None = None,
+        gpu_pool: str = "gpu_compute",
     ) -> None:
         self.id = stage_id
         self.version = 1
         self.depends_on = depends_on
         self.settings_keys: tuple[str, ...] = ()
         self._capture = capture
-        # Deliberately not set at all when gpu_pool is None (the default for
-        # every existing caller), rather than set to a placeholder - _spawn's
-        # getattr(stage, "gpu_pool", _GPU_POOL) must fall through to the
-        # default for a stage that never mentions the attribute, exactly the
-        # shape every pre-Task-11 Stage implementation has.
-        if gpu_pool is not None:
-            self.gpu_pool = gpu_pool
+        # gpu_pool is a required Stage Protocol member (Task 11's review),
+        # read directly by _spawn with no getattr fallback - so every double
+        # must always carry one. Defaults to "gpu_compute", matching every
+        # pre-Task-11 stage; a test that cares about a different pool passes
+        # gpu_pool= explicitly.
+        self.gpu_pool = gpu_pool
 
     def fingerprint(self, ctx: JobContext) -> str:
         if self._capture is not None:
@@ -605,17 +604,41 @@ def test_a_stage_with_a_gpu_pool_attribute_leases_from_that_pool(
     assert governor.available("gpu_compute") == 1, "gpu_compute must be untouched by this spawn"
 
 
-def test_a_stage_without_a_gpu_pool_attribute_still_leases_gpu_compute(
+def test_a_stage_with_the_default_gpu_pool_leases_gpu_compute(
     dispatcher: Dispatcher, governor: Governor, queue: JobQueue, spawn_spy: SpawnSpy
 ) -> None:
-    """The default path every pre-Task-11 stage relies on: no ``gpu_pool``
-    attribute at all must behave exactly as before this task's change."""
+    """The path every pre-Task-11 stage relies on: ``_FixedStage``'s default
+    ``gpu_pool="gpu_compute"`` (mirroring every real stage's own explicit
+    ``gpu_pool = "gpu_compute"``) must behave exactly as before this task's
+    Protocol change made the attribute required."""
     queue.requeue("j1", available_in_s=-1)
 
     report = dispatcher.tick()
 
     assert report.spawned == ("fetch",)
     assert governor.available("gpu_encode") == 1, "gpu_encode must be untouched"
+
+
+def test_a_stage_declaring_an_unknown_gpu_pool_fails_loudly_and_names_the_stage(
+    db_conn: sqlite3.Connection, tmp_path: Path, spawn_spy: SpawnSpy
+) -> None:
+    """A typo in a stage's own ``gpu_pool`` (``"gpu_pol"``, say) must not
+    silently degrade to anything - it must fail loudly, naming the stage
+    that got it wrong, before ever reaching ``Governor.lease``."""
+    store = CasStore(root=tmp_path / "cas", conn=db_conn)
+    artifacts = ArtifactStore(store, db_conn)
+    governor = Governor()
+    queue = JobQueue(db_conn)
+    pipeline_id = "bad-pool-pipeline"
+    pipeline = Pipeline(id=pipeline_id, stages=(_FixedStage("render", gpu_pool="gpu_pol"),))
+    d = Dispatcher(db_conn, store, artifacts, governor, queue, pipelines={pipeline_id: pipeline})
+    project_id = _project(db_conn, slug="bad-pool")
+    queue.enqueue("j-bad-pool", project_id, pipeline_id)
+
+    with pytest.raises(ValidationError, match="render.*gpu_pol"):
+        d.tick()
+
+    assert spawn_spy.calls == 0, "no worker may start while the pool is invalid"
 
 
 def test_a_refused_lease_is_not_reported_as_a_spawn(
