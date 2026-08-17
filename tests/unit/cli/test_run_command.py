@@ -449,7 +449,13 @@ def test_run_rejects_a_project_whose_settings_are_invalid_before_enqueueing_anyt
     """
     _project(db_conn, tmp_path, slug="misconfigured", settings={"words_per_group_max": 0})
 
-    rc = main(["--data-dir", str(tmp_path), "run", "--project", "misconfigured"])
+    # --max-ticks 0 so that if the validation ever regresses, this test fails
+    # on its own assertions rather than by driving the real story_video
+    # pipeline - which would spawn genuine worker subprocesses and reach the
+    # network from what is meant to be a hermetic unit test.
+    rc = main(
+        ["--data-dir", str(tmp_path), "run", "--project", "misconfigured", "--max-ticks", "0"]
+    )
 
     assert rc == 2
     assert "words_per_group_max" in capsys.readouterr().err
