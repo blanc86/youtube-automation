@@ -106,9 +106,32 @@ def test_the_seeded_template_is_itself_valid(
 def test_a_zero_words_per_group_max_is_rejected_by_name() -> None:
     """Silently yields one-word captions for the whole video - the stage that
     consumes it decides the entire edit, so a silent misconfiguration there
-    is a wrong video with nothing to point at."""
+    is a wrong video with nothing to point at.
+
+    *** This assertion is OVER-DETERMINED against ``DEFAULT_SETTINGS`` and
+    cannot, on its own, pin the lower-bound check. *** Guard-pinning it found
+    that out: deleting ``words_per_group_max``'s own ``< 1`` branch entirely
+    leaves this test still passing, because the template's
+    ``words_per_group_min`` is 3, so the *inversion* check (``0 < 3``) fires
+    instead and raises naming the same key. Two independent rules cover this
+    one input. Recorded here rather than papered over, per Phase 1a Sec 2.3
+    and Task 14's precedent; the test below is the one that isolates the
+    lower bound."""
     with pytest.raises(ValidationError, match="words_per_group_max"):
         validate_settings({**DEFAULT_SETTINGS, "words_per_group_max": 0})
+
+
+def test_a_zero_words_per_group_max_is_rejected_even_with_no_minimum_set() -> None:
+    """The assertion that isolates the lower-bound check from the inversion
+    check: with no ``words_per_group_min`` present at all, nothing else can
+    reject this input. Guard-pinned - deleting the ``< 1`` branch fails this
+    with DID NOT RAISE, while leaving the test above green.
+
+    Not a contrived shape, either: ``validate_settings`` checks whichever keys
+    are present precisely so it can validate a partial mapping, and a
+    hand-edited ``settings_json`` is exactly where a partial one shows up."""
+    with pytest.raises(ValidationError, match="words_per_group_max"):
+        validate_settings({"words_per_group_max": 0})
 
 
 def test_an_inverted_words_per_group_range_is_rejected_by_name() -> None:
