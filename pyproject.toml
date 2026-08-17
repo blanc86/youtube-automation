@@ -32,6 +32,7 @@ ytauto = "ytauto.cli.__main__:main"
 "story_video:plan_timeline" = "ytauto.app.stages.plan_timeline:make_stage"
 "story_video:select_broll" = "ytauto.providers.visual.library:make_stage"
 "story_video:compose_landscape" = "ytauto.app.stages.compose:make_compose_landscape"
+"story_video:compose_vertical" = "ytauto.app.stages.compose:make_compose_vertical"
 
 [tool.setuptools.packages.find]
 where = ["src"]

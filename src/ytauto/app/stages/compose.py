@@ -21,9 +21,10 @@ and staging the result.
 dimensions, stage id, output artifact name, and which manifest digest field
 names its canvas as constructor arguments - identical behaviour, different
 literals - so ``compose_landscape`` and ``compose_vertical`` (Task 12) share
-every line of this module rather than duplicating it. Only
-``make_compose_landscape`` is wired to an entry point here; Task 12 adds its
-own factory binding the vertical canvas's arguments.
+every line of this module rather than duplicating it. Both
+``make_compose_landscape`` and ``make_compose_vertical`` are wired to entry
+points (``pyproject.toml``'s ``[project.entry-points."ytauto.stages"]``);
+neither needed any change to ``ComposeStage`` itself.
 
 **``ProviderError``, not ``RenderError``, for a failed ffmpeg exit.**
 ``core.errors.RenderError`` exists and is already used by
@@ -540,4 +541,32 @@ def make_compose_landscape(*, cas: CasStore, settings: Mapping[str, object]) -> 
         height=_LANDSCAPE_HEIGHT,
         artifact_name=_LANDSCAPE_ARTIFACT,
         digest_field="normalised_landscape_digest",
+    )
+
+
+_VERTICAL_WIDTH = 1080
+_VERTICAL_HEIGHT = 1920
+_VERTICAL_ARTIFACT = "master_1080x1920.mp4"
+
+
+def make_compose_vertical(*, cas: CasStore, settings: Mapping[str, object]) -> ComposeStage:
+    """Entry point ``story_video:compose_vertical`` (Task 12).
+
+    Identical to ``make_compose_landscape`` in every respect but the
+    literals: Shorts' 1080x1920 portrait canvas, its own output artifact
+    name, and ``normalised_vertical_digest`` as the manifest field
+    ``ComposeStage._resolve_clips`` reads clip digests from - see that
+    method's own docstring for why this indirection exists, and
+    ``ComposeStage``'s module docstring for why one class serves both
+    canvases rather than two near-duplicates. ``settings`` is accepted and
+    unused for the same reason ``make_compose_landscape`` accepts and
+    ignores it.
+    """
+    return ComposeStage(
+        cas=cas,
+        stage_id="compose_vertical",
+        width=_VERTICAL_WIDTH,
+        height=_VERTICAL_HEIGHT,
+        artifact_name=_VERTICAL_ARTIFACT,
+        digest_field="normalised_vertical_digest",
     )

@@ -30,9 +30,10 @@ from typing import Any
 
 import pytest
 
-from ytauto.app.stages.compose import make_compose_landscape
+from ytauto.app.stages.compose import make_compose_landscape, make_compose_vertical
 from ytauto.core.errors import ErrorKind, ProviderError
 from ytauto.core.models.artifact import ArtifactRef
+from ytauto.core.models.content_hash import hash_bytes
 from ytauto.core.pipeline.stage import JobContext
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
@@ -360,3 +361,161 @@ def test_a_missing_clip_id_in_the_manifest_is_a_fatal_provider_error(
 
     assert exc_info.value.kind is ErrorKind.FATAL
     assert "missing-clip" in str(exc_info.value)
+
+
+def test_the_vertical_master_uses_the_vertical_normalised_clips(
+    tmp_path: Path, cas: CasStore, ffmpeg_binaries: FfmpegBinaries
+) -> None:
+    """Resolving ``clip_id`` here would still render at 1080x1920 even if the
+    stage read ``normalised_landscape_digest`` instead: ``compose_args``
+    always applies its own defensive scale/pad chain to whatever source path
+    it is given (``infra.ffmpeg.compose.ComposeClip``'s own docstring), so a
+    landscape source would come out letterboxed rather than fail. A dimension
+    assertion alone cannot tell the two apart.
+
+    This test pins the manifest field directly instead: the manifest's
+    ``normalised_landscape_digest`` entry is a well-formed digest that was
+    never staged into the CAS (``hash_bytes`` of some bytes nobody wrote),
+    while ``normalised_vertical_digest`` points at a real clip. A stage that
+    (bug) resolved against the landscape field would hand ffmpeg a path to a
+    file that does not exist and fail with a ``ProviderError``; a stage that
+    correctly resolves ``normalised_vertical_digest`` renders normally.
+    """
+    narration_seconds = 1.0
+    clip = _lavfi_video_clip(
+        tmp_path, ffmpeg_binaries, name="clip_vertical", size="1080x1920", seconds=2.0
+    )
+    narration = _lavfi_narration(tmp_path, ffmpeg_binaries, seconds=narration_seconds)
+
+    vertical_digest = cas.put_file(clip, kind="video")
+    bogus_landscape_digest = hash_bytes(b"never staged - compose_vertical must not read this")
+
+    manifest_digest = cas.put_bytes(
+        json.dumps(
+            [
+                {
+                    "clip_id": "clip-a",
+                    "duration_s": 2.0,
+                    "source_width": 1080,
+                    "source_height": 1920,
+                    "normalised_landscape_digest": str(bogus_landscape_digest),
+                    "normalised_vertical_digest": str(vertical_digest),
+                }
+            ]
+        ).encode("utf-8"),
+        kind="broll_manifest",
+    )
+    segments_digest = cas.put_bytes(
+        _segments_json(["clip-a"], segment_seconds=narration_seconds), kind="json"
+    )
+    timeline_digest = cas.put_bytes(_timeline_json(narration_seconds), kind="json")
+    narration_digest = cas.put_file(narration, kind="audio")
+
+    ctx = JobContext(
+        job_id="it-compose-vertical",
+        project_id="it-project",
+        settings={
+            "broll_manifest_digest": str(manifest_digest),
+            "caption_style": {},
+            "encoder": "auto",
+        },
+        inputs={
+            "plan_timeline": (
+                ArtifactRef(name="timeline.json", kind="json", digest=timeline_digest),
+            ),
+            "select_broll": (
+                ArtifactRef(name="segments.json", kind="json", digest=segments_digest),
+            ),
+            "synthesize_speech": (
+                ArtifactRef(name="narration.mp3", kind="audio", digest=narration_digest),
+            ),
+        },
+        workdir=tmp_path / "work",
+    )
+
+    stage = make_compose_vertical(cas=cas, settings={})
+    result = stage.run(ctx, lambda fraction, note: None)
+
+    out = cas.path_for(result.artifact("master_1080x1920.mp4").digest)
+    assert probe_dimensions(out, ffprobe=ffmpeg_binaries.ffprobe) == (1080, 1920)
+
+
+def test_both_canvases_render_from_one_select_broll_result(
+    tmp_path: Path, cas: CasStore, ffmpeg_binaries: FfmpegBinaries
+) -> None:
+    """One manifest, one segments.json, one timeline.json, one narration -
+    exactly what select_broll/plan_timeline produce once per project, never
+    once per canvas - feed both compose_landscape and compose_vertical
+    unchanged. The two canvases must still diverge downstream:
+    ``render_ass`` writes ``width``/``height`` as ``PlayResX``/``PlayResY``
+    and derives ``font_size`` from ``height`` (``_FONT_SIZE_DIVISOR``), so the
+    two rendered ``.ass`` blobs must have different digests. Equal digests
+    here would mean the canvas never reached the caption writer, and every
+    vertical caption would be burned in at the landscape font size and
+    PlayRes.
+    """
+    narration_seconds = 1.0
+    clip = _lavfi_video_clip(
+        tmp_path, ffmpeg_binaries, name="clip_shared", size="1920x1080", seconds=2.0
+    )
+    narration = _lavfi_narration(tmp_path, ffmpeg_binaries, seconds=narration_seconds)
+
+    clip_digest = cas.put_file(clip, kind="video")
+    manifest_digest = cas.put_bytes(_manifest_json({"clip-a": clip_digest}), kind="broll_manifest")
+    segments_digest = cas.put_bytes(
+        _segments_json(["clip-a"], segment_seconds=narration_seconds), kind="json"
+    )
+    timeline_digest = cas.put_bytes(_timeline_json(narration_seconds), kind="json")
+    narration_digest = cas.put_file(narration, kind="audio")
+
+    def _ctx(job_id: str) -> JobContext:
+        return JobContext(
+            job_id=job_id,
+            project_id="it-project",
+            settings={
+                "broll_manifest_digest": str(manifest_digest),
+                "caption_style": {},
+                "encoder": "auto",
+            },
+            inputs={
+                "plan_timeline": (
+                    ArtifactRef(name="timeline.json", kind="json", digest=timeline_digest),
+                ),
+                "select_broll": (
+                    ArtifactRef(name="segments.json", kind="json", digest=segments_digest),
+                ),
+                "synthesize_speech": (
+                    ArtifactRef(name="narration.mp3", kind="audio", digest=narration_digest),
+                ),
+            },
+            # Distinct workdirs: both stages write a same-named
+            # master/captions.ass pair into ctx.workdir, and running them
+            # sequentially against one shared directory would let the second
+            # stage's files silently overwrite the first's before either is
+            # staged into the CAS.
+            workdir=tmp_path / job_id,
+        )
+
+    land = make_compose_landscape(cas=cas, settings={}).run(_ctx("it-land"), lambda f, n: None)
+    vert = make_compose_vertical(cas=cas, settings={}).run(_ctx("it-vert"), lambda f, n: None)
+
+    # Digest inequality alone is not a sufficient pin: font_size is also
+    # derived from height (_FONT_SIZE_DIVISOR) independently of the
+    # width/height render_ass is actually called with, so a bug that hands
+    # render_ass the wrong canvas but leaves font_size alone would still
+    # produce two different digests here and hide behind this assertion
+    # alone (confirmed by deliberately hardcoding compose.py's render_ass
+    # call to width=1920, height=1080 for both stages while running this
+    # test suite - the digest-only assertion below still passed). The
+    # PlayResX/PlayResY checks are what actually pin "each canvas reached
+    # the caption writer with its own dimensions".
+    land_ass = cas.read_bytes(land.artifact("captions.ass").digest).decode("utf-8")
+    vert_ass = cas.read_bytes(vert.artifact("captions.ass").digest).decode("utf-8")
+    assert "PlayResX: 1920" in land_ass
+    assert "PlayResY: 1080" in land_ass
+    assert "PlayResX: 1080" in vert_ass
+    assert "PlayResY: 1920" in vert_ass
+
+    assert land.artifact("captions.ass").digest != vert.artifact("captions.ass").digest, (
+        "each canvas needs its own PlayResX/Y"
+    )
