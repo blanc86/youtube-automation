@@ -371,6 +371,31 @@ class ComposeStage:
         encoder's own runtime failure - see ``_FALLBACK_ENCODER``), and stage
         the master video plus the ``.ass`` it burned in.
 
+        **The master is moved into the CAS, not copied, and nothing else in
+        the workdir is touched.** ffmpeg has to write its output to a real
+        path, and that path is ``ctx.workdir``; before this, the render was
+        then read into memory in full and staged with ``stage_file``, leaving
+        the whole master sitting in ``<data>/assets/work/<job>/<stage>/``
+        forever. Nothing in ``src/`` ever removed that tree, and ``Evictor``
+        walks ``cas_root`` and ``cas_objects`` only - so the largest files
+        this application produces, two per render, sat entirely outside the
+        40 GiB ceiling. At a couple of renders an hour that grows without
+        bound. ``stage_path(..., move=True)`` makes storing and cleanup one
+        step, and as a bonus never materialises the file in RAM.
+
+        Deleting only the staged media file was chosen over deleting the
+        workdir at stage completion, and over deleting it when the *job*
+        reaches a terminal state. The workdir is also where the diagnostics
+        live: ``ffmpeg-stderr.log`` written just above, and Task 1's
+        per-attempt ``stderr.attempt-N.log`` written by the dispatcher around
+        this stage. Clearing the directory on stage completion would race
+        those; clearing it on job completion would take the FAILED case too,
+        which is precisely the case whose logs someone needs. This delete
+        only ever runs after ffmpeg *succeeded* and the bytes are safely
+        content-addressed, so a failed render keeps everything - including
+        the partial output ffmpeg left behind. What remains after a success
+        is kilobytes of text, which is a bound, not a leak.
+
         Raises:
             ConfigurationError: this ffmpeg build has no ``ass`` filter
                 (libass) at all - checked up front, before any of the CAS
@@ -506,7 +531,11 @@ class ComposeStage:
         # never reclaim it) on every FATAL failure between the stage and
         # here (Task 11's review, Minor).
         ass_digest = self._cas.stage_file(ass_bytes, kind="text")
-        video_digest = self._cas.stage_file(out_path.read_bytes(), kind="video")
+        # move=True: the master goes INTO the CAS rather than being copied
+        # into it, so the workdir does not keep a full-size duplicate. See
+        # this method's docstring for why only this file is removed and the
+        # rest of the workdir is deliberately left alone.
+        video_digest = self._cas.stage_path(out_path, kind="video", move=True)
 
         return StageResult(
             artifacts=(

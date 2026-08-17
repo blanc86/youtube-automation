@@ -15,8 +15,7 @@ from ytauto.app.registry import build_pipeline
 from ytauto.app.scheduler.dispatcher import Dispatcher
 from ytauto.app.scheduler.governor import Governor
 from ytauto.app.scheduler.queue import JobQueue
-from ytauto.app.services.enqueue import create_project, resolve_project_id
-from ytauto.app.services.projects import ProjectService
+from ytauto.app.services.enqueue import create_project, refresh_run_settings, resolve_project_id
 from ytauto.cli.doctor import exit_code, format_report, run_checks
 from ytauto.core.errors import ConfigurationError, ValidationError
 from ytauto.core.models.job import JobState
@@ -189,7 +188,11 @@ def _add_run_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
         "--max-ticks",
         type=int,
         default=_DEFAULT_MAX_TICKS,
-        help=f"stop after this many dispatcher ticks (default: {_DEFAULT_MAX_TICKS})",
+        help=(
+            "stop after this many dispatcher ticks in any one poll round - a "
+            "per-round budget, not a cumulative limit on the whole invocation "
+            f"(default: {_DEFAULT_MAX_TICKS})"
+        ),
     )
 
 
@@ -202,9 +205,23 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
     """Enqueue one job against ``--project`` and drain the queue. Returns the
     process exit code.
 
+    **Two settings are re-derived before anything is enqueued.**
+    ``refresh_run_settings`` (see its own docstring for the full account)
+    recomputes ``story_digest`` from whatever is on disk at
+    ``settings["story_path"]`` right now, and rewrites the B-roll manifest to
+    bind ``broll_manifest_digest`` to the library's current state. Both are
+    derived values that go stale on their own: a story is edited in place by
+    design, and the B-roll library is global and mutable. Doing it here, in
+    the one place that turns a project into a job, is what makes an edited
+    story invalidate the cache instead of being silently ignored - and what
+    means a project created by ``ytauto project create`` is runnable with no
+    further configuration, which it was not before (there is still no
+    ``ytauto project set-setting`` verb).
+
     Exit codes: 0 once the enqueued job reaches ``succeeded``; 2 if
-    ``--project`` names no project - bad input, checked before anything is
-    enqueued; 1 for every other way this can fail to end in success - the
+    ``--project`` names no project, or the project's settings are missing or
+    malformed - all bad input, checked before anything is enqueued; 1 for
+    every other way this can fail to end in success - the
     job reaches ``failed``, it burns through ``--max-ticks`` while genuinely
     busy, it is still waiting out a retry backoff once
     ``_RUN_WALL_CLOCK_BUDGET_S`` elapses, or the dispatcher itself raises.
@@ -278,18 +295,17 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
         cas = CasStore(root=paths.cas, conn=conn)
         artifacts = ArtifactStore(cas, conn)
         queue = JobQueue(conn)
-        projects = ProjectService(conn)
 
         try:
             project_id = resolve_project_id(conn, args.slug)
-        except ValidationError as exc:
+            settings = refresh_run_settings(conn, cas, project_id)
+        except (ValidationError, OSError, UnicodeDecodeError) as exc:
             print(f"ytauto run: {exc}", file=sys.stderr)
             return 2
 
         job_id = uuid.uuid4().hex
         gave_up_waiting_on_backoff = False
         try:
-            settings = projects.settings_for(project_id)
             pipeline = build_pipeline(_PIPELINE_ID, cas, settings)
             queue.enqueue(job_id, project_id, _PIPELINE_ID)
             dispatcher = Dispatcher(

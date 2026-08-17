@@ -49,8 +49,15 @@ from ytauto.infra.cas.store import CasStore
 
 PROVIDER_ID = "edge-tts"
 PROVIDER_VERSION = "1"
-"""Bump when ``EdgeTtsSynthesizer.synthesize``'s behaviour changes - see the
-module docstring for why the stage does not read this off ``capabilities``."""
+"""Bump when ``EdgeTtsSynthesizer.synthesize``'s behaviour changes - and bump
+``app.stages.synthesize_speech.PROVIDER_VERSION`` in the same commit.
+
+This constant reaches ``capabilities`` and nothing else; only the stage-side
+literal reaches ``stage_fingerprint`` (see the module docstring for why the
+stage does not read this off ``capabilities``). Bumped alone it therefore
+invalidates nothing, which is why
+``test_the_capability_version_matches_the_stage_side_constant`` pins the two
+equal - bumping either alone fails the gate."""
 
 _TICKS_PER_SECOND = 10_000_000
 """edge-tts reports ``offset``/``duration`` in 100-nanosecond ticks; dividing

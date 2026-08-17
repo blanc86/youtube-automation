@@ -66,8 +66,8 @@ class _FakeRun:
     silently reusing the last outcome. On ``returncode == 0`` a placeholder
     file is written to the invocation's own output path (``argv[-1]``,
     always ``str(out_path)`` per ``compose_args``'s own contract) so
-    ``ComposeStage.run``'s later ``out_path.read_bytes()`` has something
-    real to read.
+    ``ComposeStage.run``'s later ``stage_path(out_path, move=True)`` has a
+    real file to move into the CAS.
     """
 
     def __init__(self, outcomes: Sequence[tuple[int, str]]) -> None:
@@ -382,3 +382,59 @@ def test_the_ass_blob_is_not_staged_into_the_cas_on_a_failed_render(
     assert "text" not in staged_kinds, (
         "captions.ass (kind='text') must not be staged into the CAS before ffmpeg succeeds"
     )
+
+
+# -- whole-branch review, Important #4: no full-size duplicate outside the CAS --
+
+
+def test_the_master_is_moved_into_the_cas_not_left_behind_in_the_workdir(
+    tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ffmpeg has to write to a real path, and that path is ``ctx.workdir``.
+    Before this fix the render was then read into memory in full and staged
+    with ``stage_file``, leaving the whole master in
+    ``<data>/assets/work/<job>/<stage>/`` forever - nothing in ``src/`` ever
+    removed that tree, and ``Evictor`` walks ``cas_root``/``cas_objects``
+    only, so the two largest files per render sat entirely outside the 40 GiB
+    ceiling.
+
+    The ``.ass`` is deliberately still there: it is small, and the workdir is
+    where the diagnostics live (see ``run``'s docstring on why the directory
+    itself is never cleared here).
+    """
+    _patch_ffmpeg_discovery(monkeypatch)
+    cas, ctx = _env(tmp_path, db_conn)
+    stage = make_compose_landscape(cas=cas, settings={})
+    monkeypatch.setattr(ComposeStage, "_run_ffmpeg", _FakeRun([(0, "")]))
+
+    result = stage.run(ctx, _NOOP_EMIT)
+
+    master = result.artifact("master_1920x1080.mp4")
+    assert cas.exists(master.digest), "the master must be in the CAS"
+    assert not (ctx.workdir / "master_1920x1080.mp4").exists(), (
+        "the workdir must not keep a full-size duplicate of the master"
+    )
+    assert (ctx.workdir / "captions.ass").is_file(), (
+        "the small workdir files must survive - only the staged media is removed"
+    )
+
+
+def test_a_failed_render_keeps_everything_in_the_workdir_for_diagnosis(
+    tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason the cleanup is one file on the success path rather than a
+    directory wipe. A failed render is exactly the case whose ``ffmpeg-stderr.log``
+    someone needs, and whose partial output may be the evidence of *how* it
+    failed - so the failure path removes nothing at all.
+    """
+    _patch_ffmpeg_discovery(monkeypatch)
+    cas, ctx = _env(tmp_path, db_conn, encoder="libx264")
+    stage = make_compose_landscape(cas=cas, settings={})
+    monkeypatch.setattr(ComposeStage, "_run_ffmpeg", _FakeRun([(1, "boom")]))
+
+    with pytest.raises(ProviderError):
+        stage.run(ctx, _NOOP_EMIT)
+
+    assert (ctx.workdir / "ffmpeg-stderr.log").is_file()
+    assert "boom" in (ctx.workdir / "ffmpeg-stderr.log").read_text(encoding="utf-8")
+    assert (ctx.workdir / "captions.ass").is_file()

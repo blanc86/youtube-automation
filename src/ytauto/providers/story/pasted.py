@@ -36,13 +36,21 @@ from ytauto.core.ports.capability import CapabilityDescriptor, CostModel, Latenc
 from ytauto.infra.cas.store import CasStore
 
 PROVIDER_VERSION = "1"
-"""Bump when ``PastedStorySource.fetch``'s behaviour changes.
+"""Bump when ``PastedStorySource.fetch``'s behaviour changes - and bump
+``app.stages.ingest_story.PROVIDER_VERSION`` in the same commit.
 
-Fed to ``stage_fingerprint`` (via ``IngestStory.fingerprint``, which reads it
-off ``capabilities.version``) as ``provider_version``. A behaviour change
-that did not bump this would let artifacts staged under the old behaviour
-masquerade as this version's output - the same hazard ``Stage.version``
-guards against for the stage itself, one layer down at the provider.
+This constant reaches ``capabilities`` and nothing else. It used to also
+reach ``stage_fingerprint``, because ``IngestStory.fingerprint`` read
+``self._source.capabilities.version``; the whole-branch review made that
+stage match the rest of the pipeline, which carries literals (see
+``ingest_story.py`` for why). So a behaviour change bumped here alone now
+invalidates nothing at all, which is exactly the trap the review found this
+docstring setting: it tells a provider author to bump a number that, on its
+own, does nothing. ``test_the_capability_version_matches_the_stage_side_constant``
+below closes it - the two constants are asserted equal, so bumping either
+alone fails the gate, and a provider author who follows this docstring
+literally gets a failing test naming the other constant rather than silent
+stale output.
 """
 
 

@@ -301,8 +301,35 @@ class BrollLibrary:
         digest feeds a fingerprint downstream (e.g. ``select_broll``'s), with
         no visible cause.
 
+        **The manifest is retained, and the manifest it replaces released.**
+        Found by the whole-branch review, and the same bug class as ``add``'s
+        missing clip retains: ``put_bytes`` records the row at ``refcount =
+        0`` and stops. The manifest is not a stage artifact, so
+        ``commit_stage``'s retain never sees it; nothing calls ``touch()`` on
+        it either, so its ``last_accessed_at`` never advances past the moment
+        it was written and it sorts *first* in ``iter_evictable``'s LRU order.
+        The moment ``Evictor.run()`` gets a production caller, the very first
+        blob deleted would be the one ``select_broll`` and both compose
+        stages all read. Retaining removes it from ``iter_evictable``
+        entirely, which is the stronger fix than merely touching it.
+
+        Exactly one manifest is pinned at a time. Every manifest currently
+        pinned is read *inside* the write transaction, the new one is
+        retained, and each of those previous pins is then released - so a
+        rewrite that changes the manifest hands the pin over atomically, and
+        a rewrite that produces byte-identical output (an unchanged library,
+        which is every ``ytauto run`` against a library nobody has touched)
+        nets out to no change at all rather than ratcheting the refcount up
+        on every invocation. The old manifest drops to zero and becomes
+        ordinarily evictable, which is correct: nothing reads it once
+        ``refresh_run_settings`` has rebound ``broll_manifest_digest``.
+
         Raises:
+            ValidationError: a previously-pinned manifest digest names no
+                stored object (from ``CasStore.release``).
             sqlite3.Error: the query fails.
+            sqlite3.OperationalError: the write lock could not be acquired
+                within ``busy_timeout``.
             OSError: the manifest cannot be staged into the CAS.
         """
         rows = self._conn.execute(
@@ -325,4 +352,18 @@ class BrollLibrary:
             for row in rows
         ]
         payload = json.dumps(entries, indent=2).encode("utf-8")
-        return self._cas.put_bytes(payload, kind=_MANIFEST_KIND)
+        with transaction(self._conn, immediate=True):
+            # Read before the retain below, so a rewrite producing the same
+            # bytes finds its own existing pin here and nets out to no change.
+            previously_pinned = [
+                ContentHash(row["hash"])
+                for row in self._conn.execute(
+                    "SELECT hash FROM cas_objects WHERE kind = ? AND refcount > 0",
+                    (_MANIFEST_KIND,),
+                ).fetchall()
+            ]
+            digest = self._cas.put_bytes(payload, kind=_MANIFEST_KIND)
+            self._cas.retain(digest)
+            for previous in previously_pinned:
+                self._cas.release(previous)
+        return digest

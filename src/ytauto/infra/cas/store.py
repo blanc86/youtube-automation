@@ -93,6 +93,49 @@ class CasStore:
             tmp.replace(target)
         return digest
 
+    def stage_path(self, src: Path, *, kind: str, move: bool = False) -> ContentHash:
+        """Move or copy an existing file into the store. Filesystem only.
+
+        The path-based sibling of ``stage_file``, and worker-safe for the
+        same reason: no SQLite statement is executed, so a worker subprocess
+        may call it and report the digest back to the parent, which writes
+        the row via ``record_blob``. ``kind`` is accepted for symmetry and
+        carries no meaning at the filesystem layer.
+
+        Exists because ``stage_file`` takes ``bytes``: the only way for a
+        stage that produced a *file* to store it was
+        ``stage_file(path.read_bytes())``, which pulls the whole thing into
+        memory and leaves the original where it was. For a compose stage's
+        master video that is a full-size render read into RAM and then
+        duplicated outside the CAS - the second half of which the evictor
+        cannot see at all, since it walks ``cas_objects`` rows and the CAS
+        directory, never a stage's workdir. ``move=True`` makes staging and
+        cleanup one step, so the duplicate cannot outlive the copy.
+
+        Raises:
+            ValidationError: ``src`` does not exist or is not a regular file.
+            OSError: ``src`` cannot be read, or the copy/move/replace fails.
+        """
+        if not src.is_file():
+            raise ValidationError(f"source file does not exist: {src}")
+        digest = hash_file(src)
+        target = self.path_for(digest)
+        if target.is_file():
+            # Already stored: the move still has to consume its source, or a
+            # caller relying on move=True to clean up would silently keep the
+            # duplicate exactly when the content deduplicated.
+            if move:
+                src.unlink()
+            return digest
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._staging_path(target)
+        if move:
+            shutil.move(str(src), tmp)
+        else:
+            shutil.copyfile(src, tmp)
+        tmp.replace(target)
+        return digest
+
     def record_blob(self, digest: ContentHash, *, kind: str, size_bytes: int) -> None:
         """Record the row for an already-staged file. Idempotent.
 
@@ -150,29 +193,21 @@ class CasStore:
     def put_file(self, src: Path, *, kind: str, move: bool = False) -> ContentHash:
         """Store a file's contents. With ``move=True`` the source is consumed.
 
+        Implemented as ``stage_path`` followed by ``record_blob``, exactly as
+        ``put_bytes`` is ``stage_file`` followed by ``record_blob`` - kept as
+        a single call for the many callers that are not workers and have no
+        reason to split staging from recording. The size is read off the
+        stored object rather than off ``src``, which is the same number and
+        is still readable after a ``move``.
+
         Raises:
             ValidationError: ``src`` does not exist or is not a regular file.
             OSError: ``src`` cannot be read, or the copy/move/replace fails.
             sqlite3.OperationalError: the write lock could not be acquired
                 within ``busy_timeout``.
         """
-        if not src.is_file():
-            raise ValidationError(f"source file does not exist: {src}")
-        digest = hash_file(src)
-        target = self.path_for(digest)
-        size = src.stat().st_size
-        if target.is_file():
-            if move:
-                src.unlink()
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._staging_path(target)
-            if move:
-                shutil.move(str(src), tmp)
-            else:
-                shutil.copyfile(src, tmp)
-            tmp.replace(target)
-        self.record_blob(digest, kind=kind, size_bytes=size)
+        digest = self.stage_path(src, kind=kind, move=move)
+        self.record_blob(digest, kind=kind, size_bytes=self.path_for(digest).stat().st_size)
         return digest
 
     def read_bytes(self, digest: ContentHash) -> bytes:

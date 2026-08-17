@@ -41,8 +41,16 @@ from ytauto.infra.cas.store import CasStore
 PROVIDER_ID = "library"
 PROVIDER_VERSION = "1"
 """Bump when ``LibraryVisualStrategy.plan``'s selection behaviour changes -
-see the module docstring for why the stage does not read this off
-``capabilities``."""
+and bump ``app.stages.select_broll.PROVIDER_VERSION`` in the same commit.
+
+This constant reaches ``capabilities`` and nothing else; only the stage-side
+literal reaches ``stage_fingerprint`` (see the module docstring for why the
+stage does not read this off ``capabilities``). Bumped alone it therefore
+invalidates nothing - change ``plan``'s algorithm, bump this dutifully, and
+every project keeps its cached ``segments.json`` from the old algorithm. That
+is the concrete case the whole-branch review named, which is why
+``test_the_capability_version_matches_the_stage_side_constant`` pins the two
+equal: bumping either alone fails the gate."""
 
 
 class LibraryVisualStrategy:

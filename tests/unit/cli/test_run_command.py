@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 from ytauto.app.scheduler.worker_protocol import ArtifactLine, Error, Result, Staged, encode
-from ytauto.app.services.enqueue import story_digest_for
+from ytauto.app.services.enqueue import DEFAULT_SETTINGS, story_digest_for
 from ytauto.app.services.projects import ProjectService
 from ytauto.cli.__main__ import main
 from ytauto.core.errors import ErrorKind
@@ -68,10 +68,39 @@ def db_conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _project(
-    conn: sqlite3.Connection, *, slug: str, settings: dict[str, object] | None = None
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    *,
+    slug: str,
+    settings: dict[str, object] | None = None,
 ) -> str:
+    """A project ``ytauto run`` will actually accept.
+
+    This used to create a row with ``settings={}``, which ``run`` tolerated
+    only because nothing checked. The whole-branch review's Critical 1 fix
+    makes ``run`` re-derive and then validate a project's settings before it
+    enqueues anything (``refresh_run_settings``), so a project now needs a
+    real story file on disk at ``story_path`` and the full
+    ``DEFAULT_SETTINGS`` template - exactly what ``ytauto project create``
+    now seeds. Building that here rather than calling ``create_project``
+    keeps these tests free to invent slugs without also inventing a
+    ``--data-dir`` layout, while still exercising the real precondition.
+
+    ``broll_manifest_digest`` is deliberately *not* seeded: ``run`` derives
+    it from the B-roll library on every invocation, so seeding one here would
+    hide a regression in that derivation.
+    """
+    story = tmp_path / f"{slug}-story.txt"
+    story.write_text(f"a story for {slug}\n", encoding="utf-8")
+    merged: dict[str, object] = {
+        **DEFAULT_SETTINGS,
+        "story_digest": story_digest_for(story),
+        "story_path": str(story),
+    }
+    if settings is not None:
+        merged.update(settings)
     return ProjectService(conn).create(
-        slug=slug, title=slug, story_digest=None, settings={} if settings is None else settings
+        slug=slug, title=slug, story_digest=merged["story_digest"], settings=merged
     )
 
 
@@ -387,7 +416,7 @@ def test_run_enqueues_one_job_and_drains_it(
     tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = AppPaths.resolve(override=tmp_path)
-    _project(db_conn, slug="ghost-train")
+    _project(db_conn, tmp_path, slug="ghost-train")
     _preseed_cache_hit(paths, db_conn)
     monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
 
@@ -407,6 +436,54 @@ def test_run_on_an_unknown_slug_exits_nonzero_without_enqueueing(
     assert "absent" in capsys.readouterr().err
 
 
+def test_run_rejects_a_project_whose_settings_are_invalid_before_enqueueing_anything(
+    tmp_path: Path, db_conn: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Whole-branch review, Critical 1's second half. With no ``ytauto project
+    set-setting`` verb, hand-editing ``projects.settings_json`` is the only
+    way to configure a project, so an inverted bound is the expected path
+    rather than an exotic one. It must be exit 2 (bad input, like an unknown
+    slug) with the offending key named, and nothing enqueued - not a job that
+    runs four stages and then dies FATAL on a `TypeError` deep inside
+    ``plan_timeline``.
+    """
+    _project(db_conn, tmp_path, slug="misconfigured", settings={"words_per_group_max": 0})
+
+    rc = main(["--data-dir", str(tmp_path), "run", "--project", "misconfigured"])
+
+    assert rc == 2
+    assert "words_per_group_max" in capsys.readouterr().err
+    assert db_conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_run_rebinds_the_story_digest_and_the_broll_manifest_digest_before_enqueueing(
+    tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whole-branch review, Critical 2 (first half) and Critical 1 (the key no
+    CLI verb could set), proven through ``main()`` rather than only against
+    ``refresh_run_settings`` directly.
+
+    The project is seeded with a *stale* ``story_digest`` and no
+    ``broll_manifest_digest`` at all - the state ``ytauto project create``
+    leaves behind plus an edit. After one ``ytauto run``, the digest must
+    match the file on disk (or an edited story is silently ignored, since
+    ``ingest_story`` fingerprints the digest and reads the path) and the
+    manifest digest must be present (or every compose stage dies on
+    ``KeyError``).
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    project_id = _project(db_conn, tmp_path, slug="edited", settings={"story_digest": "0" * 64})
+    _preseed_cache_hit(paths, db_conn)
+    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
+
+    assert main(["--data-dir", str(tmp_path), "run", "--project", "edited"]) == 0
+
+    settings = ProjectService(db_conn).settings_for(project_id)
+    assert settings["story_digest"] == story_digest_for(tmp_path / "edited-story.txt")
+    assert settings["story_digest"] != "0" * 64
+    assert isinstance(settings["broll_manifest_digest"], str)
+
+
 def test_run_returns_1_when_the_job_fails(
     tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -415,7 +492,7 @@ def test_run_returns_1_when_the_job_fails(
     this time, so ``tick()`` must actually spawn (the monkeypatched ``Popen``)
     and pump a terminal message.
     """
-    _project(db_conn, slug="doomed")
+    _project(db_conn, tmp_path, slug="doomed")
     monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
 
     fixed_job_id = "f" * 32
@@ -463,7 +540,7 @@ def test_run_retries_a_retryable_failure_through_to_success(
     backoff or the real (1s) poll interval.
     """
     paths = AppPaths.resolve(override=tmp_path)
-    _project(db_conn, slug="flaky")
+    _project(db_conn, tmp_path, slug="flaky")
     monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
     monkeypatch.setattr("ytauto.app.scheduler.dispatcher._BASE_BACKOFF_S", 0.05)
     monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.01)
@@ -544,7 +621,7 @@ def test_run_reports_a_distinct_message_when_the_retry_wait_budget_is_exhausted(
     therefore invoked exactly once: the 5s backoff never elapses within this
     test's short wall-clock lifetime, so nothing ever spawns a second time.
     """
-    _project(db_conn, slug="stuck-retrying")
+    _project(db_conn, tmp_path, slug="stuck-retrying")
     monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
     monkeypatch.setattr("ytauto.cli.__main__._RUN_WALL_CLOCK_BUDGET_S", 0.05)
     monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.01)
@@ -612,7 +689,7 @@ def test_run_does_not_time_out_a_retry_that_follows_a_long_busy_phase(
     itself) resets the waiting clock, so the run must still recover.
     """
     paths = AppPaths.resolve(override=tmp_path)
-    _project(db_conn, slug="slow-but-healthy")
+    _project(db_conn, tmp_path, slug="slow-but-healthy")
 
     busy_stage_ids = ("busy1", "busy2", "busy3")
     fingerprints = {sid: f"{sid[-1]}" * 64 for sid in busy_stage_ids}
@@ -744,7 +821,7 @@ def test_run_returns_1_when_max_ticks_is_exhausted_before_the_job_finishes(
     construct the real ``story_video`` pipeline (Step 3's contract), but with
     zero ticks nothing about it is ever exercised past construction.
     """
-    _project(db_conn, slug="stalled")
+    _project(db_conn, tmp_path, slug="stalled")
 
     rc = main(["--data-dir", str(tmp_path), "run", "--project", "stalled", "--max-ticks", "0"])
 
@@ -765,7 +842,7 @@ def test_run_reports_failure_rather_than_success_when_a_poison_job_blocks_the_qu
     healthy invocation fail loudly rather than silently report success while
     skipping past it.
     """
-    _project(db_conn, slug="good")
+    _project(db_conn, tmp_path, slug="good")
     now = utc_now_iso()
     with transaction(db_conn):
         db_conn.execute(

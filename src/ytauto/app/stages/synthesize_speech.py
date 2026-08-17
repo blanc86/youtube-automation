@@ -49,12 +49,20 @@ this is not read off ``self._synth.capabilities.provider_id``."""
 
 PROVIDER_VERSION = "1"
 """Bump when this stage's *use* of the synthesizer port changes shape (for
-example, a new field read out of ``Narration``) - independent of
-``providers/tts/edge.py``'s own ``PROVIDER_VERSION``, which tracks
-``EdgeTtsSynthesizer.synthesize``'s own behaviour. The two happen to share a
-value today; nothing keeps them in sync, by design - literal constants exist
-here precisely so this module never has to import the provider that owns the
-other one."""
+example, a new field read out of ``Narration``), **or** when
+``EdgeTtsSynthesizer.synthesize``'s own behaviour changes - and bump
+``providers/tts/edge.py``'s ``PROVIDER_VERSION`` in the same commit.
+
+This constant used to be documented as independent of the provider's, with
+"nothing keeps them in sync, by design". The whole-branch review showed that
+design was one-sided: only *this* literal reaches ``stage_fingerprint``, and
+the provider's own constant feeds nothing but ``capabilities``, which no
+fingerprint reads. So a provider author changing ``synthesize``'s behaviour
+and dutifully bumping the constant its docstring told them to bump got no
+cache invalidation whatsoever - stale narration served forever. The literal
+stays here (see the module docstring for the cross-process argument, which is
+unaffected), but ``tests/unit/providers/test_edge_tts.py`` now asserts the two
+are equal, so bumping either one alone fails the gate."""
 
 
 class SynthesizeSpeech:

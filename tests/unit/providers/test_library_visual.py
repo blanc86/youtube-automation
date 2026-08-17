@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from ytauto.app.stages import select_broll as select_broll_stage
 from ytauto.app.stages.select_broll import SelectBroll
 from ytauto.core.errors import ErrorKind, ProviderError
 from ytauto.core.models.visual import VisualCandidate
@@ -32,7 +33,11 @@ from ytauto.core.ports.providers import VisualStrategy
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
-from ytauto.providers.visual.library import LibraryVisualStrategy, make_stage
+from ytauto.providers.visual.library import (
+    PROVIDER_VERSION,
+    LibraryVisualStrategy,
+    make_stage,
+)
 
 _DEFAULT_SEGMENT_SECONDS = 5.0
 _DEFAULT_CLIP_SECONDS = 30.0
@@ -340,3 +345,20 @@ def test_make_stage_ignores_settings_it_has_no_use_for(tmp_path: Path) -> None:
         assert stage.id == "select_broll"
     finally:
         conn.close()
+
+
+def test_the_capability_version_matches_the_stage_side_constant() -> None:
+    """This provider's ``PROVIDER_VERSION`` docstring says to bump it when
+    ``plan``'s behaviour changes - but only the stage's own literal
+    reaches ``stage_fingerprint``, so a bump here alone invalidates nothing
+    and the next run serves stale artifacts from cache. Pinning the two equal
+    turns that silent staleness into a failing gate: bump either constant and
+    this test names the other.
+
+    ``provider_id`` is pinned for the same reason one step further out - it is
+    the other half of the identity pair the fingerprint hashes, and a provider
+    renamed on one side only would silently share cache entries across two
+    different providers."""
+    assert LibraryVisualStrategy.capabilities.version == PROVIDER_VERSION
+    assert PROVIDER_VERSION == select_broll_stage.PROVIDER_VERSION
+    assert LibraryVisualStrategy.capabilities.provider_id == select_broll_stage.PROVIDER_ID

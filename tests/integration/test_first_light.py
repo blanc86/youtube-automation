@@ -881,3 +881,116 @@ def test_changing_the_voice_does_not_rerun_ingest_story(
     report = env.run_again()
     assert "ingest_story" not in report.spawned
     assert "synthesize_speech" in report.spawned
+
+
+# -- whole-branch review, Critical 1: the CLI alone must produce a runnable project --
+
+
+@pytest.mark.integration
+def test_a_cli_created_project_runs_with_no_hand_seeded_settings(tmp_path: Path) -> None:
+    """The test whose absence let Critical 1 ship.
+
+    Every other criterion in this module goes through ``first_light_env``,
+    which seeds nine settings keys by hand via ``ProjectService.set_setting``
+    and computes ``broll_manifest_digest`` itself - the same primitives a
+    future ``ytauto project set-setting`` would call, but not primitives any
+    CLI verb actually exposes today. That harness proved the pipeline works;
+    it could not, and did not, prove that a *user* could get to it. A
+    reviewer reproduced the gap at this branch's HEAD:
+
+        $ ytauto project create --slug probe --title Probe --story story.txt
+        created project 'probe' (3f12...)
+        $ ytauto run --project probe --max-ticks 20
+        ytauto run: job e02e... failed        (exit 1)
+        jobs.last_error = "KeyError: 'voice'"
+
+    ``create_project`` wrote exactly ``{story_digest, story_path}``; the
+    pipeline reads nine more keys plus ``broll_manifest_digest``, every one a
+    bare ``ctx.settings[...]`` subscript, so the second stage died FATAL. And
+    ``broll_manifest_digest`` was not merely unset but *unobtainable*:
+    ``_broll_add`` discards ``write_manifest()``'s return value, so no
+    sequence of CLI commands could have produced it.
+
+    So this test deliberately uses **no** ``set_setting`` call, no
+    ``ProjectService``, and no direct ``BrollLibrary`` access - only
+    ``ytauto broll add``, ``ytauto project create`` and ``ytauto run``. If
+    that sequence ever stops producing two playable masters, this fails.
+    ``FirstLightEnv`` is constructed directly afterwards purely as an
+    artifact *reader* (it needs no fixture state for that), so this test does
+    not reimplement CAS artifact resolution.
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    binaries = _binaries()
+
+    for i in range(2):
+        clip = _make_broll_clip(tmp_path, binaries.ffmpeg, index=i)
+        assert (
+            main(
+                [
+                    "--data-dir",
+                    str(tmp_path),
+                    "broll",
+                    "add",
+                    str(clip),
+                    "--source-url",
+                    f"lavfi://synthetic-clip-{i}",
+                    "--licence",
+                    "public-domain-synthetic",
+                ]
+            )
+            == 0
+        ), f"ytauto broll add failed for synthetic clip {i}"
+
+    story_path = tmp_path / "story.txt"
+    story_path.write_text("The train never stopped.", encoding="utf-8")
+    slug = "cli-only"
+    assert (
+        main(
+            [
+                "--data-dir",
+                str(tmp_path),
+                "project",
+                "create",
+                "--slug",
+                slug,
+                "--title",
+                "CLI Only",
+                "--story",
+                str(story_path),
+            ]
+        )
+        == 0
+    ), "ytauto project create failed"
+
+    conn = _open(paths)
+    try:
+        # The same stale-editable-install guard first_light_env makes, for the
+        # same reason: build_pipeline's membership is whatever the entry-point
+        # table advertises, so a truncated install "succeeds" having run some
+        # prefix of the pipeline, and every assertion below would then fail
+        # far from the real cause.
+        pipeline = build_pipeline(_PIPELINE_ID, CasStore(root=paths.cas, conn=conn), {})
+        registered = {stage.id for stage in pipeline.stages}
+        assert registered == set(_STAGE_ORDER), (
+            "the installed 'ytauto.stages' entry points do not match the real "
+            f"pipeline topology - registered {sorted(registered)}. Run "
+            '`pip install -e ".[dev]"` to refresh a stale editable install.'
+        )
+        project_id = resolve_project_id(conn, slug)
+    finally:
+        conn.close()
+
+    rc = main(["--data-dir", str(tmp_path), "run", "--project", slug])
+    assert rc == 0, (
+        f"ytauto run exited {rc} for a project created by ytauto project create "
+        f"with no further configuration; see {paths.logs / 'ytauto.jsonl'}"
+    )
+
+    env = FirstLightEnv(paths, slug, project_id)
+    for name, dims in (
+        ("master_1920x1080.mp4", (1920, 1080)),
+        ("master_1080x1920.mp4", (1080, 1920)),
+    ):
+        path = env.artifact_path(name)
+        assert probe_dimensions(path) == dims
+        assert probe_has_audio(path)

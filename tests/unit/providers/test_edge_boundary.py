@@ -21,6 +21,7 @@ from typing import cast
 
 import pytest
 
+from ytauto.app.stages import transcribe as transcribe_stage
 from ytauto.app.stages.transcribe import Transcribe
 from ytauto.core.errors import ErrorKind, ProviderError
 from ytauto.core.models.artifact import ArtifactRef
@@ -31,7 +32,11 @@ from ytauto.core.ports.providers import Transcriber
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
-from ytauto.providers.transcribe.edge_boundary import EdgeBoundaryTranscriber, make_stage
+from ytauto.providers.transcribe.edge_boundary import (
+    PROVIDER_VERSION,
+    EdgeBoundaryTranscriber,
+    make_stage,
+)
 
 
 class _PoisonAudio:
@@ -176,3 +181,20 @@ def test_make_stage_ignores_settings_it_has_no_use_for(tmp_path: Path) -> None:
         assert stage.id == "transcribe"
     finally:
         conn.close()
+
+
+def test_the_capability_version_matches_the_stage_side_constant() -> None:
+    """This provider's ``PROVIDER_VERSION`` docstring says to bump it when
+    ``transcribe``'s behaviour changes - but only the stage's own literal
+    reaches ``stage_fingerprint``, so a bump here alone invalidates nothing
+    and the next run serves stale artifacts from cache. Pinning the two equal
+    turns that silent staleness into a failing gate: bump either constant and
+    this test names the other.
+
+    ``provider_id`` is pinned for the same reason one step further out - it is
+    the other half of the identity pair the fingerprint hashes, and a provider
+    renamed on one side only would silently share cache entries across two
+    different providers."""
+    assert EdgeBoundaryTranscriber.capabilities.version == PROVIDER_VERSION
+    assert PROVIDER_VERSION == transcribe_stage.PROVIDER_VERSION
+    assert EdgeBoundaryTranscriber.capabilities.provider_id == transcribe_stage.PROVIDER_ID

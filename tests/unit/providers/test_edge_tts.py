@@ -41,6 +41,7 @@ from typing import Any
 import edge_tts
 import pytest
 
+from ytauto.app.stages import synthesize_speech as synthesize_speech_stage
 from ytauto.app.stages.synthesize_speech import SynthesizeSpeech
 from ytauto.core.errors import ErrorKind, ProviderError
 from ytauto.core.models.artifact import ArtifactRef
@@ -51,7 +52,12 @@ from ytauto.core.ports.providers import SpeechSynthesizer
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
-from ytauto.providers.tts.edge import EdgeTtsSynthesizer, _consume, make_stage
+from ytauto.providers.tts.edge import (
+    PROVIDER_VERSION,
+    EdgeTtsSynthesizer,
+    _consume,
+    make_stage,
+)
 
 # ---------------------------------------------------------------------------
 # The fake-stream-factory seam. `_consume` takes a zero-arg callable that
@@ -289,3 +295,20 @@ def test_make_stage_defaults_rate_when_the_project_has_not_set_one(
         assert captured["rate"] == "+0%"
     finally:
         conn.close()
+
+
+def test_the_capability_version_matches_the_stage_side_constant() -> None:
+    """This provider's ``PROVIDER_VERSION`` docstring says to bump it when
+    ``synthesize``'s behaviour changes - but only the stage's own literal
+    reaches ``stage_fingerprint``, so a bump here alone invalidates nothing
+    and the next run serves stale artifacts from cache. Pinning the two equal
+    turns that silent staleness into a failing gate: bump either constant and
+    this test names the other.
+
+    ``provider_id`` is pinned for the same reason one step further out - it is
+    the other half of the identity pair the fingerprint hashes, and a provider
+    renamed on one side only would silently share cache entries across two
+    different providers."""
+    assert EdgeTtsSynthesizer.capabilities.version == PROVIDER_VERSION
+    assert PROVIDER_VERSION == synthesize_speech_stage.PROVIDER_VERSION
+    assert EdgeTtsSynthesizer.capabilities.provider_id == synthesize_speech_stage.PROVIDER_ID

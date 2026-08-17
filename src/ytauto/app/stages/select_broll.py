@@ -43,11 +43,16 @@ PROVIDER_ID = "library"
 this is not read off ``self._visual_strategy.capabilities.provider_id``."""
 
 PROVIDER_VERSION = "1"
-"""Bump when this stage's *use* of the ``VisualStrategy`` port changes shape -
-independent of ``providers/visual/library.py``'s own ``PROVIDER_VERSION``,
-which tracks ``LibraryVisualStrategy.plan``'s own selection behaviour. The two
-happen to share a value today; nothing keeps them in sync, by design - see
-``transcribe.py``'s identical split."""
+"""Bump when this stage's *use* of the ``VisualStrategy`` port changes shape,
+**or** when ``LibraryVisualStrategy.plan``'s selection behaviour changes - and
+bump ``providers/visual/library.py``'s ``PROVIDER_VERSION`` in the same
+commit. The two are asserted equal by
+``tests/unit/providers/test_library_visual.py``, so bumping either alone fails
+the gate: only this literal reaches ``stage_fingerprint``, and the provider's
+own constant feeds nothing but ``capabilities``, which no fingerprint reads -
+so changing the selection algorithm and bumping only the provider's constant
+would have kept serving the old edit from cache. See ``transcribe.py``'s
+identical split."""
 
 
 def _as_int(value: object) -> int:

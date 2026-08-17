@@ -38,9 +38,15 @@ from ytauto.infra.cas.store import CasStore
 
 PROVIDER_ID = "edge-boundary"
 PROVIDER_VERSION = "1"
-"""Bump when ``EdgeBoundaryTranscriber.transcribe``'s behaviour changes - see
-the module docstring for why the stage does not read this off
-``capabilities``."""
+"""Bump when ``EdgeBoundaryTranscriber.transcribe``'s behaviour changes - and
+bump ``app.stages.transcribe.PROVIDER_VERSION`` in the same commit.
+
+This constant reaches ``capabilities`` and nothing else; only the stage-side
+literal reaches ``stage_fingerprint`` (see the module docstring for why the
+stage does not read this off ``capabilities``). Bumped alone it therefore
+invalidates nothing, which is why
+``test_the_capability_version_matches_the_stage_side_constant`` pins the two
+equal - bumping either alone fails the gate."""
 
 
 class EdgeBoundaryTranscriber:

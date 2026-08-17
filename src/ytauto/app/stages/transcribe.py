@@ -43,11 +43,14 @@ PROVIDER_ID = "edge-boundary"
 this is not read off ``self._transcriber.capabilities.provider_id``."""
 
 PROVIDER_VERSION = "1"
-"""Bump when this stage's *use* of the ``Transcriber`` port changes shape -
-independent of ``providers/transcribe/edge_boundary.py``'s own
-``PROVIDER_VERSION``, which tracks ``EdgeBoundaryTranscriber.transcribe``'s
-own behaviour. The two happen to share a value today; nothing keeps them in
-sync, by design - see ``synthesize_speech.py``'s identical split."""
+"""Bump when this stage's *use* of the ``Transcriber`` port changes shape,
+**or** when ``EdgeBoundaryTranscriber.transcribe``'s own behaviour changes -
+and bump ``providers/transcribe/edge_boundary.py``'s ``PROVIDER_VERSION`` in
+the same commit. The two are asserted equal by
+``tests/unit/providers/test_edge_boundary.py``, so bumping either alone fails
+the gate: only this literal reaches ``stage_fingerprint``, and the provider's
+own constant feeds nothing but ``capabilities``, which no fingerprint reads.
+See ``synthesize_speech.py``'s identical split for the full account."""
 
 
 class Transcribe:

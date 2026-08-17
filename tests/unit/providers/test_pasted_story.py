@@ -17,15 +17,34 @@ from pathlib import Path
 
 import pytest
 
+from ytauto.app.stages import ingest_story
 from ytauto.app.stages.ingest_story import IngestStory
 from ytauto.core.errors import ErrorKind, ProviderError
+from ytauto.core.models.content_hash import hash_bytes
 from ytauto.core.pipeline.stage import JobContext
 from ytauto.core.ports.capability import CostModel
 from ytauto.core.ports.providers import StorySource
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
-from ytauto.providers.story.pasted import PastedStorySource, make_stage
+from ytauto.providers.story.pasted import PROVIDER_VERSION, PastedStorySource, make_stage
+
+
+def test_the_capability_version_matches_the_stage_side_constant() -> None:
+    """The provider's ``PROVIDER_VERSION`` docstring says to bump it when
+    ``fetch``'s behaviour changes - but only ``ingest_story``'s own literal
+    reaches ``stage_fingerprint``, so a bump here alone invalidates nothing
+    and the next run serves the old ``story.txt`` from cache. Pinning the two
+    equal turns that silent staleness into a failing gate: bump either
+    constant and this test names the other.
+
+    ``provider_id`` is pinned for the same reason one step further out - it
+    is the other half of the identity pair the fingerprint hashes, and a
+    provider renamed on one side only would silently share cache entries
+    across two different providers."""
+    assert PastedStorySource.capabilities.version == PROVIDER_VERSION
+    assert PROVIDER_VERSION == ingest_story.PROVIDER_VERSION
+    assert PastedStorySource.capabilities.provider_id == ingest_story.PROVIDER_ID
 
 
 def test_a_pasted_story_is_read_verbatim(tmp_path: Path) -> None:
@@ -87,7 +106,12 @@ def test_make_stage_wires_a_pastedstorysource_into_ingest_story(tmp_path: Path) 
         ctx = JobContext(
             job_id="j1",
             project_id="p1",
-            settings={"story_path": str(story_path), "story_digest": "a" * 64},
+            settings={
+                "story_path": str(story_path),
+                # The real digest: IngestStory.run refuses to stage content
+                # that does not hash to story_digest.
+                "story_digest": str(hash_bytes(b"hello\n")),
+            },
             inputs={},
             workdir=tmp_path,
         )

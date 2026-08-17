@@ -435,3 +435,58 @@ def test_write_manifest_breaks_added_at_ties_by_id_for_a_stable_digest(
     entries = json.loads(cas.read_bytes(digest))
 
     assert [e["clip_id"] for e in entries] == ["aaa-earlier-id", "zzz-later-id"]
+
+
+# -- whole-branch review, Important #3: the manifest blob must be retained ----
+
+
+def test_write_manifest_retains_what_it_writes(db_conn: sqlite3.Connection, cas: CasStore) -> None:
+    """``put_bytes`` records the row at ``refcount = 0`` and stops. The
+    manifest is not a stage artifact, so ``commit_stage``'s retain never sees
+    it, and nothing calls ``touch()`` on it either - so it never moves in
+    ``iter_evictable``'s LRU order and would be the *first* blob deleted the
+    moment ``Evictor.run()`` gets a production caller. It is the blob
+    ``select_broll`` and both compose stages all read."""
+    digest = BrollLibrary(db_conn, cas).write_manifest()
+
+    assert cas.refcount(digest) == 1
+    assert digest not in [candidate for candidate, _size in cas.iter_evictable()]
+
+
+def test_write_manifest_releases_the_manifest_it_replaces(
+    db_conn: sqlite3.Connection,
+    cas: CasStore,
+    source_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exactly one manifest is pinned at a time: the superseded one drops to
+    zero and becomes ordinarily evictable, which is correct - nothing reads
+    it once ``refresh_run_settings`` has rebound ``broll_manifest_digest``."""
+    _patch_ffmpeg(monkeypatch, tmp_path)
+    library = BrollLibrary(db_conn, cas)
+
+    first = library.write_manifest()
+    library.add(source_file, source_url="local", licence="CC0")
+    second = library.write_manifest()
+
+    assert first != second, "the library changed, so the manifest must have too"
+    assert cas.refcount(second) == 1
+    assert cas.refcount(first) == 0
+
+
+def test_rewriting_an_unchanged_manifest_leaves_the_refcount_at_one(
+    db_conn: sqlite3.Connection, cas: CasStore
+) -> None:
+    """``ytauto run`` rewrites the manifest on every invocation, so an
+    unchanged library must net out to no change rather than ratcheting the
+    refcount up once per run - a pin that only ever grows can never be
+    released, which is a leak of a different shape."""
+    library = BrollLibrary(db_conn, cas)
+
+    first = library.write_manifest()
+    second = library.write_manifest()
+    third = library.write_manifest()
+
+    assert first == second == third, "an unchanged library must produce identical bytes"
+    assert cas.refcount(third) == 1
