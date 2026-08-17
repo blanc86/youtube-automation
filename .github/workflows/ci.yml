@@ -16,6 +16,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Phase 2a's integration suite shells out to real ffmpeg/ffprobe
+      # (compose, probe, locator.locate() - which requires the pair). Phase
+      # 1b's suite never touched a real binary, so this step did not exist
+      # before; setup-ffmpeg installs a maintained static build (with
+      # ffprobe alongside it) and puts both on PATH for the gate step below.
+      # Pinned to the v3.1 release tag rather than a floating branch/major
+      # tag. ffmpeg-version is left at its default ("release" = latest
+      # stable ffmpeg): the action's own docs note pinning an exact ffmpeg
+      # version is "only fully supported on Windows", so forcing one here
+      # would be unreliable on the macos-latest leg.
+      - uses: FedericoCarboni/setup-ffmpeg@v3.1
+        id: setup-ffmpeg
       - run: pip install -e ".[dev]"
       # One step, invoking the same gate developers run locally. Listing the
       # gates here separately let CI drift from the script - it was missing

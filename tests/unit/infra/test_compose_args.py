@@ -124,16 +124,27 @@ def test_the_output_is_cut_to_the_narration_length() -> None:
 # -- coverage beyond the brief's four: the two guards compose_args raises on ------
 
 
-def test_an_absolute_ass_path_is_refused_outright() -> None:
+def test_an_absolute_ass_path_is_refused_outright(tmp_path: Path) -> None:
     """The defensive twin of the relative-path test above: compose_args does
     not merely happen to produce a colon-free graph when handed a relative
     path, it refuses an absolute one outright, so a caller that regresses
     this (passes ctx.workdir / "captions.ass" instead of a bare filename)
-    fails loudly here rather than producing a silently broken filter graph."""
+    fails loudly here rather than producing a silently broken filter graph.
+
+    ``tmp_path / "captions.ass"`` rather than a literal ``Path("C:/work/...")``:
+    the guard being tested is ``Path.is_absolute()``, and a hardcoded
+    Windows-style string is only absolute *on Windows* -
+    ``PureWindowsPath("C:/work/captions.ass").is_absolute()`` is ``True`` but
+    ``PurePosixPath("C:/work/captions.ass").is_absolute()`` is ``False``, so on
+    POSIX that string is an ordinary relative filename and the guard correctly
+    does not fire, failing this test with ``DID NOT RAISE`` for a reason that
+    has nothing to do with ``compose_args``. ``tmp_path`` is absolute on every
+    platform pytest runs on, so this test now exercises the same property the
+    production guard actually checks, everywhere."""
     with pytest.raises(ValueError, match="relative"):
         compose_args(
             clips=[_c("a.mp4", 0, 3)],
-            ass_path=Path("C:/work/captions.ass"),
+            ass_path=tmp_path / "captions.ass",
             audio_path=Path("n.mp3"),
             out_path=Path("o.mp4"),
             width=1920,
