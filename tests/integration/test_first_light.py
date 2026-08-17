@@ -444,6 +444,27 @@ class FirstLightEnv:
         was killed, or errored. See the module docstring."""
         return self.spawns.count(stage_id)
 
+    def resumed_job_stage_status(self, stage_id: str) -> str | None:
+        """``job_stages.status`` for ``stage_id`` on the *specific* job
+        ``run_until_stage`` enqueued and ``kill_running_worker`` killed a
+        stage of - never "whichever job is latest", since ``env.run()``'s
+        resume also enqueues and fully drains a brand-new job of its own
+        (see criterion 3's own comment on why ``spawn_count`` alone cannot
+        distinguish "resumed correctly" from "resumed via a cache hit after
+        a status corruption"). Reads resume tracking directly, independent
+        of whether a cache hit would also have kept the spawn count
+        unchanged."""
+        assert self._resume_job_id is not None, "call run_until_stage first"
+        conn = _open(self.paths)
+        try:
+            row = conn.execute(
+                "SELECT status FROM job_stages WHERE job_id = ? AND stage_id = ?",
+                (self._resume_job_id, stage_id),
+            ).fetchone()
+            return str(row["status"]) if row is not None else None
+        finally:
+            conn.close()
+
     def set_setting(self, key: str, value: object) -> None:
         conn = _open(self.paths)
         try:
@@ -782,6 +803,31 @@ def test_rerunning_the_same_job_spawns_no_workers(
 def test_killing_a_worker_mid_render_resumes_at_that_stage(
     first_light_env: Callable[..., FirstLightEnv],
 ) -> None:
+    """``spawn_count("synthesize_speech") == 1`` is over-determined by two
+    independent mechanisms, either of which alone suffices to keep it at 1:
+    resume tracking (a `succeeded` stage is excluded from `ready_stages` and
+    never reconsidered) and, separately, the fingerprint cache (even if
+    reconsidered, `tick()` would recompute the same fingerprint, find it
+    already recorded, and mark it `skipped` without spawning). Two mutations
+    were tried against `spawn_count` alone and neither could isolate resume
+    tracking from the cache - breaking resume tracking (`_DONE_STAGE_STATUSES`
+    narrowed, or `_reset_stage`'s WHERE clause widened to touch every stage
+    of the job, not just the killed one) leaves the cache to silently absorb
+    the corruption, so the spawn count never moves. This is Phase 1a Sec 2.3's
+    documented exception: a guard that cannot be falsified by the available
+    mutations pins the *observable* behaviour ("a completed stage does not
+    re-run"), not the specific mechanism, and that must be recorded here
+    rather than mistaken for a pin on resume tracking specifically.
+
+    The ``resumed_job_stage_status`` assertion below is what DOES isolate
+    resume tracking: it reads ``job_stages.status`` directly rather than
+    counting spawns, so a stage whose status was corrupted to `pending` and
+    self-healed via a cache hit shows up as `skipped`, not `succeeded` - a
+    real, mutation-falsifiable difference `spawn_count` cannot see. Guard-pinned
+    against the same `_reset_stage` mutation described above: with the WHERE
+    clause widened, this assertion fails (`'skipped' != 'succeeded'`) even
+    though `spawn_count("synthesize_speech")` stays at 1.
+    """
     env = first_light_env(story="The train never stopped.", clips=4)
     env.run_until_stage("compose_landscape")
     env.kill_running_worker()
@@ -789,6 +835,11 @@ def test_killing_a_worker_mid_render_resumes_at_that_stage(
     assert env.run() == 0
     assert env.spawn_count("synthesize_speech") == 1, "a completed stage must not re-run"
     assert env.spawn_count("compose_landscape") == 2
+    assert env.resumed_job_stage_status("synthesize_speech") == "succeeded", (
+        "resume tracking must leave an already-completed stage's own status "
+        "untouched - a cache hit alone would also keep spawn_count from "
+        "moving, so this is what actually distinguishes the two"
+    )
 
 
 # -- criterion 4: selective invalidation -------------------------------------
