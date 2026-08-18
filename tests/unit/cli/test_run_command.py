@@ -871,3 +871,256 @@ def test_run_reports_failure_rather_than_success_when_a_poison_job_blocks_the_qu
     assert poison_state["state"] == "running"
     # "good" was never even claimed - it must not be reported as succeeded.
     assert _job_state(db_conn, slug="good") == "queued"
+
+
+# -- ``ytauto run`` exports the rendered masters --------------------------
+#
+# ``_export_masters`` (ytauto.cli.__main__) is keyed by each compose stage's
+# own ``job_stages.fingerprint`` - never by scanning ``artifacts`` for any
+# row whose name ends in ``.mp4`` - so the fakes below use the real
+# ``compose_landscape``/``compose_vertical`` stage ids and the real
+# ``master_1920x1080.mp4``/``master_1080x1920.mp4`` artifact names, even
+# though (like every other fake pipeline in this file) they never run real
+# ffmpeg.
+
+_LANDSCAPE_STAGE_ID = "compose_landscape"
+_VERTICAL_STAGE_ID = "compose_vertical"
+_LANDSCAPE_ARTIFACT = "master_1920x1080.mp4"
+_VERTICAL_ARTIFACT = "master_1080x1920.mp4"
+_LANDSCAPE_FINGERPRINT = "1" * 64
+_VERTICAL_FINGERPRINT = "2" * 64
+
+
+class _FixedMasterStage:
+    """A minimal Stage double under a real compose stage id and a fixed
+    fingerprint - the export path's tests need the id to match
+    ``_MASTER_STAGE_IDS``, unlike ``_FixedStage``'s made-up ``"only"``.
+    """
+
+    def __init__(self, stage_id: str, fingerprint: str) -> None:
+        self.id = stage_id
+        self.version = 1
+        self.depends_on: tuple[str, ...] = ()
+        self.settings_keys: tuple[str, ...] = ()
+        self.gpu_pool = "gpu_encode"
+        self._fingerprint = fingerprint
+
+    def fingerprint(self, ctx: JobContext) -> str:
+        return self._fingerprint
+
+    def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
+        raise NotImplementedError("not exercised directly: every export test pre-seeds a cache hit")
+
+
+def _master_pipeline(pipeline_id: str, cas: CasStore, settings: Mapping[str, object]) -> Pipeline:
+    return Pipeline(
+        id=pipeline_id,
+        stages=(
+            _FixedMasterStage(_LANDSCAPE_STAGE_ID, _LANDSCAPE_FINGERPRINT),
+            _FixedMasterStage(_VERTICAL_STAGE_ID, _VERTICAL_FINGERPRINT),
+        ),
+    )
+
+
+def _preseed_master_cache_hits(
+    paths: AppPaths,
+    conn: sqlite3.Connection,
+    *,
+    landscape_fingerprint: str = _LANDSCAPE_FINGERPRINT,
+    vertical_fingerprint: str = _VERTICAL_FINGERPRINT,
+    landscape_content: bytes = b"fake landscape master bytes",
+    vertical_content: bytes = b"fake vertical master bytes",
+) -> None:
+    """Record both compose stages as cache hits, so ``tick()`` never spawns a
+    worker for either - the fingerprint probe alone finds them."""
+    cas = CasStore(root=paths.cas, conn=conn)
+    artifacts = ArtifactStore(cas, conn)
+    for fingerprint, stage_id, name, content in (
+        (landscape_fingerprint, _LANDSCAPE_STAGE_ID, _LANDSCAPE_ARTIFACT, landscape_content),
+        (vertical_fingerprint, _VERTICAL_STAGE_ID, _VERTICAL_ARTIFACT, vertical_content),
+    ):
+        digest = cas.put_bytes(content, kind="video")
+        artifacts.record(
+            fingerprint, stage_id, [ArtifactRef(name=name, kind="video", digest=digest)]
+        )
+
+
+def test_run_exports_both_masters_and_prints_the_export_directory_last(
+    tmp_path: Path,
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The core contract: on success, both masters land in
+    ``exports/<slug>/`` under their real artifact names, and the export
+    directory is the last thing printed - the one piece of information the
+    brief exists to surface (`ytauto run` used to give no way to find the
+    rendered files at all).
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    _project(db_conn, tmp_path, slug="lighthouse")
+    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _master_pipeline)
+    _preseed_master_cache_hits(paths, db_conn)
+
+    rc = main(["--data-dir", str(tmp_path), "run", "--project", "lighthouse", "--max-ticks", "20"])
+
+    assert rc == 0
+    export_dir = paths.exports / "lighthouse"
+    assert (export_dir / _LANDSCAPE_ARTIFACT).read_bytes() == b"fake landscape master bytes"
+    assert (export_dir / _VERTICAL_ARTIFACT).read_bytes() == b"fake vertical master bytes"
+
+    out_lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert out_lines, "ytauto run printed nothing on success"
+    assert str(export_dir) in out_lines[-1], (
+        "the export directory must be named on the LAST line ytauto run prints"
+    )
+
+
+def test_run_exports_masters_on_a_fully_cached_rerun(
+    tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision 2 of the brief: a second ``ytauto run`` that skips every
+    stage (both compose stages are cache hits again, so nothing is spawned)
+    must still produce the export files. This is the case a naive
+    implementation - one that exports only when the dispatcher actually
+    spawned a worker for a stage - gets wrong, because the artifacts already
+    exist and it looks like a no-op.
+
+    Guard-pinned below (Step: mutate ``_run`` to export only when
+    ``report.spawned`` is non-empty for the *whole run*) - predicted to fail
+    this test specifically because the second invocation never spawns
+    anything, so the mutated code would skip exporting and the re-created
+    files would never reappear.
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    _project(db_conn, tmp_path, slug="cached")
+    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _master_pipeline)
+    _preseed_master_cache_hits(paths, db_conn)
+
+    assert (
+        main(["--data-dir", str(tmp_path), "run", "--project", "cached", "--max-ticks", "20"]) == 0
+    )
+    export_dir = paths.exports / "cached"
+    assert (export_dir / _LANDSCAPE_ARTIFACT).is_file()
+    assert (export_dir / _VERTICAL_ARTIFACT).is_file()
+
+    # Simulate the operator having moved or deleted their copies - the second
+    # `ytauto run`'s own export step, not some leftover from the first call,
+    # must be what restores them.
+    for f in export_dir.iterdir():
+        f.unlink()
+    assert not any(export_dir.iterdir())
+
+    # A brand new job, but every stage is a cache hit against the same
+    # fingerprints - no worker is ever spawned this time.
+    rc = main(["--data-dir", str(tmp_path), "run", "--project", "cached", "--max-ticks", "20"])
+
+    assert rc == 0
+    assert (export_dir / _LANDSCAPE_ARTIFACT).is_file(), "a fully-cached re-run must still export"
+    assert (export_dir / _VERTICAL_ARTIFACT).is_file(), "a fully-cached re-run must still export"
+
+
+def test_run_exports_nothing_when_the_job_fails(
+    tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision 1: a FATAL failure must leave no export directory (or an
+    empty one) rather than stale files that look like a real render.
+    """
+    _project(db_conn, tmp_path, slug="ruined")
+    monkeypatch.setattr(
+        "ytauto.cli.__main__.build_pipeline",
+        lambda pipeline_id, cas, settings: Pipeline(
+            id=pipeline_id,
+            stages=(_FixedMasterStage(_LANDSCAPE_STAGE_ID, _LANDSCAPE_FINGERPRINT),),
+        ),
+    )
+    fixed_job_id = "d" * 32
+    monkeypatch.setattr("uuid.uuid4", lambda: _FixedUUID(fixed_job_id))
+    error_line = encode(
+        Error(
+            job_id=fixed_job_id,
+            stage_id=_LANDSCAPE_STAGE_ID,
+            correlation_id="c1",
+            message="simulated fatal provider failure",
+            kind=ErrorKind.FATAL,
+        )
+    )
+    monkeypatch.setattr(
+        "ytauto.app.scheduler.dispatcher.Popen", lambda argv, **kwargs: _FakeProcess([error_line])
+    )
+
+    rc = main(["--data-dir", str(tmp_path), "run", "--project", "ruined", "--max-ticks", "20"])
+
+    assert rc == 1
+    assert _job_state(db_conn, slug="ruined") == "failed"
+    paths = AppPaths.resolve(override=tmp_path)
+    export_dir = paths.exports / "ruined"
+    assert not export_dir.exists() or not any(export_dir.iterdir())
+
+
+def test_run_does_not_contaminate_a_second_projects_exports(
+    tmp_path: Path, db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision 6: resolution goes through THIS job's own
+    ``job_stages.fingerprint``, never a name-only scan of ``artifacts`` -
+    which is shared, fingerprint-keyed storage across every project. Two
+    projects whose compose stages happen to share artifact names
+    (``master_1920x1080.mp4``/``master_1080x1920.mp4`` always do - every
+    project's masters are named identically) but different fingerprints and
+    different bytes must each get their own content in their own export
+    directory.
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    _project(db_conn, tmp_path, slug="alpha")
+    _project(db_conn, tmp_path, slug="beta")
+
+    fp_alpha_land, fp_alpha_vert = "a" * 64, "b" * 64
+    fp_beta_land, fp_beta_vert = "c" * 64, "d" * 64
+
+    def _pipeline_for(land_fp: str, vert_fp: str) -> object:
+        def _factory(pipeline_id: str, cas: CasStore, settings: Mapping[str, object]) -> Pipeline:
+            return Pipeline(
+                id=pipeline_id,
+                stages=(
+                    _FixedMasterStage(_LANDSCAPE_STAGE_ID, land_fp),
+                    _FixedMasterStage(_VERTICAL_STAGE_ID, vert_fp),
+                ),
+            )
+
+        return _factory
+
+    _preseed_master_cache_hits(
+        paths,
+        db_conn,
+        landscape_fingerprint=fp_alpha_land,
+        vertical_fingerprint=fp_alpha_vert,
+        landscape_content=b"alpha landscape bytes",
+        vertical_content=b"alpha vertical bytes",
+    )
+    _preseed_master_cache_hits(
+        paths,
+        db_conn,
+        landscape_fingerprint=fp_beta_land,
+        vertical_fingerprint=fp_beta_vert,
+        landscape_content=b"beta landscape bytes",
+        vertical_content=b"beta vertical bytes",
+    )
+
+    monkeypatch.setattr(
+        "ytauto.cli.__main__.build_pipeline", _pipeline_for(fp_alpha_land, fp_alpha_vert)
+    )
+    assert (
+        main(["--data-dir", str(tmp_path), "run", "--project", "alpha", "--max-ticks", "20"]) == 0
+    )
+
+    monkeypatch.setattr(
+        "ytauto.cli.__main__.build_pipeline", _pipeline_for(fp_beta_land, fp_beta_vert)
+    )
+    assert main(["--data-dir", str(tmp_path), "run", "--project", "beta", "--max-ticks", "20"]) == 0
+
+    alpha_dir = paths.exports / "alpha"
+    beta_dir = paths.exports / "beta"
+    assert (alpha_dir / _LANDSCAPE_ARTIFACT).read_bytes() == b"alpha landscape bytes"
+    assert (alpha_dir / _VERTICAL_ARTIFACT).read_bytes() == b"alpha vertical bytes"
+    assert (beta_dir / _LANDSCAPE_ARTIFACT).read_bytes() == b"beta landscape bytes"
+    assert (beta_dir / _VERTICAL_ARTIFACT).read_bytes() == b"beta vertical bytes"

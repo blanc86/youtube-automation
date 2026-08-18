@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import shutil
 import sqlite3
 import sys
 import time
@@ -18,7 +19,7 @@ from ytauto.app.scheduler.queue import JobQueue
 from ytauto.app.services.enqueue import create_project, refresh_run_settings, resolve_project_id
 from ytauto.cli.doctor import exit_code, format_report, run_checks
 from ytauto.core.errors import ConfigurationError, ValidationError
-from ytauto.core.models.job import JobState
+from ytauto.core.models.job import JobState, StageStatus
 from ytauto.infra.artifacts import ArtifactStore
 from ytauto.infra.broll import BrollLibrary
 from ytauto.infra.cas.store import CasStore
@@ -201,6 +202,89 @@ def _job_state(conn: sqlite3.Connection, job_id: str) -> str | None:
     return str(row["state"]) if row is not None else None
 
 
+_MASTER_STAGE_IDS = ("compose_landscape", "compose_vertical")
+"""The only two stages whose output is exported. Keyed by stage id, not by
+scanning ``artifacts`` for any row whose name ends in ``.mp4`` -
+``artifacts`` is keyed by fingerprint and shared across projects by design
+(cross-project dedup), so a name-based scan could just as easily return a
+different project's masters. Going through THIS job's own
+``job_stages.fingerprint`` for exactly these two stage ids is what keeps
+exports project-scoped."""
+
+
+def _export_masters(
+    conn: sqlite3.Connection,
+    cas: CasStore,
+    artifacts: ArtifactStore,
+    *,
+    job_id: str,
+    slug: str,
+    paths: AppPaths,
+) -> Path:
+    """Copy this succeeded job's two rendered masters out of the CAS into
+    ``paths.exports / slug``, keeping their artifact names. Returns the
+    export directory. Existing files of the same name are overwritten - a
+    re-run refreshes a project's output rather than accumulating copies.
+
+    Called identically for a fresh render and for a fully-cached re-run: a
+    stage recorded ``skipped`` (cache hit) has exactly as valid a
+    ``fingerprint`` as one recorded ``succeeded`` (``StageStatus.is_done`` -
+    see ``core.models.job`` - treats them the same), and the blob it names is
+    exactly as real. The operator wants the video, not a report that no work
+    was done this time.
+
+    Only ``.mp4`` artifacts are copied. Both compose stages also record a
+    ``captions.ass`` artifact under the same name; copying it too would let
+    the second stage's copy silently clobber the first's, and it is a
+    debugging aid, not a deliverable.
+
+    Copies rather than moves or hardlinks: the CAS blob must stay intact and
+    refcounted, and the export is a convenience copy the operator may delete
+    or move freely without touching the store.
+
+    A stage id with no ``job_stages`` row at all is skipped rather than
+    treated as an error: ``ytauto run`` only ever drives one real pipeline
+    (``_PIPELINE_ID``, which always contains both compose stages), but a
+    handful of this module's own unit tests substitute a smaller fake
+    pipeline that has neither - a legitimate difference in what pipeline the
+    job ran, not a broken invariant.
+
+    Raises:
+        AssertionError: a compose stage this job DID run has a ``job_stages``
+            row that is not done, or a done row whose fingerprint's artifacts
+            are missing from the store. Either would mean the job reported
+            ``succeeded`` while an invariant the dispatcher is supposed to
+            guarantee - every stage a succeeded job actually ran is done,
+            with its artifacts intact - was already broken. Not a
+            documented, recoverable failure mode; a bug elsewhere, surfaced
+            loudly rather than silently exporting an incomplete set of files.
+    """
+    export_dir = paths.exports / slug
+    export_dir.mkdir(parents=True, exist_ok=True)
+    for stage_id in _MASTER_STAGE_IDS:
+        row = conn.execute(
+            "SELECT status, fingerprint FROM job_stages WHERE job_id = ? AND stage_id = ?",
+            (job_id, stage_id),
+        ).fetchone()
+        if row is None:
+            continue
+        if row["fingerprint"] is None or not StageStatus(row["status"]).is_done:
+            raise AssertionError(
+                f"job {job_id} succeeded but stage {stage_id!r} has a job_stages "
+                f"row that is not done (status={row['status']!r}) - cannot export"
+            )
+        found = artifacts.lookup(row["fingerprint"])
+        if found is None:
+            raise AssertionError(
+                f"job {job_id} succeeded but stage {stage_id!r}'s fingerprint "
+                f"{row['fingerprint']!r} has no recorded artifacts - cannot export"
+            )
+        for artifact in found:
+            if artifact.name.endswith(".mp4"):
+                shutil.copyfile(cas.path_for(artifact.digest), export_dir / artifact.name)
+    return export_dir
+
+
 def _run(paths: AppPaths, args: argparse.Namespace) -> int:
     """Enqueue one job against ``--project`` and drain the queue. Returns the
     process exit code.
@@ -217,6 +301,16 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
     means a project created by ``ytauto project create`` is runnable with no
     further configuration, which it was not before (there is still no
     ``ytauto project set-setting`` verb).
+
+    **On success, the two rendered masters are exported.** ``_export_masters``
+    copies them out of the content-addressed store - where they live as
+    hash-named blobs nobody could find on their own - into
+    ``paths.exports / <slug>``, and the export directory is the last thing
+    this command prints. This runs identically whether the job just rendered
+    for real or the run was a fully-cached no-op (every stage a cache hit):
+    either way the operator wants the video files, not a report that nothing
+    happened. A failed job exports nothing, so a partial or absent render
+    never leaves stale files that look like output.
 
     Exit codes: 0 once the enqueued job reaches ``succeeded``; 2 if
     ``--project`` names no project, or the project's settings are missing or
@@ -348,6 +442,10 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
 
         state = _job_state(conn, job_id)
         if state == JobState.SUCCEEDED.value:
+            export_dir = _export_masters(
+                conn, cas, artifacts, job_id=job_id, slug=args.slug, paths=paths
+            )
+            print(f"ytauto run: job {job_id} succeeded; masters exported to {export_dir}")
             return 0
         if state == JobState.FAILED.value:
             print(f"ytauto run: job {job_id} failed", file=sys.stderr)
