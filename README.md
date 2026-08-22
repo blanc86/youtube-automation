@@ -12,8 +12,9 @@ free voices, your own footage, ffmpeg on your own GPU. No API keys, no per-video
 cost. Paid providers exist only as opt-in upgrades behind the same interfaces.
 
 **Status:** Phase 2a complete. The pipeline runs end to end from the command
-line and produces watchable files. There is no web UI yet, no metadata or
-thumbnail generation, and no auto-upload — see [What's not built yet](#whats-not-built-yet).
+line — or from a local web UI (`ytauto ui`) — and produces watchable files.
+There is no metadata or thumbnail generation and no auto-upload — see
+[What's not built yet](#whats-not-built-yet).
 
 ---
 
@@ -104,6 +105,23 @@ bad input.
 
 ---
 
+## Or skip the command line
+
+```bash
+ytauto ui
+```
+
+Then open **http://127.0.0.1:8765**. Everything above is there: create a
+project by pasting a story (the slug is derived from the title), edit that
+story later, change settings including caption colours, add B-roll, and
+render — with the output folder shown when it finishes.
+
+It binds to loopback only and has no authentication, deliberately: it is a
+tool for one person on one machine. There is no `--host` flag; `--port`
+changes the port.
+
+---
+
 ## What actually happens
 
 | # | Stage | What it does |
@@ -154,9 +172,10 @@ Settings live per project. `project create` seeds working defaults:
 | `caption_style` | `{}` | Font, size, colours; empty means all defaults |
 | `encoder` | `auto` | Or name one explicitly, e.g. `libx264` |
 
-> **There is no `project set-setting` command yet.** To change a setting today
-> you edit the project's `settings_json` in the SQLite database directly. That's
-> the most visible rough edge in the current CLI.
+> **There is no `project set-setting` command yet.** To change a setting from
+> the CLI today you edit the project's `settings_json` in the SQLite database
+> directly. The web UI (`ytauto ui`) has a form for all of them, which is
+> currently the only comfortable way to do it.
 
 ---
 
@@ -176,6 +195,9 @@ ytauto project create         create a project from a story file
 ytauto run                    render one project
     --project SLUG            which project             (required)
     --max-ticks N             dispatcher budget per poll round (default 100)
+    --output-dir PATH         where to write the masters
+ytauto ui                     serve the local web UI on 127.0.0.1
+    --port N                  port to listen on         (default 8765)
 
 ytauto --data-dir PATH        use a different data directory
 ytauto --version
@@ -187,11 +209,10 @@ ytauto --version
 
 Deliberately out of scope for this phase, in rough order of likely arrival:
 
-- **A local web UI.** The engine has been kept free of any UI framework so this
-  is a deployment decision, not a rewrite.
 - **Metadata and thumbnails** — title, description, hashtags, cover image as a
   real pipeline stage.
-- **`project set-setting`**, and a `broll list`.
+- **`project set-setting`**, and a `broll list` — both exist in the web UI.
+- **Background music.** Nothing is wired for it yet, in either front end.
 - **AI-generated video** as an alternative to your own footage.
 - **Auto-upload.** Chosen against deliberately: YouTube's API allows about six
   uploads a day against a target of 20–100. The pipeline will prepare everything
@@ -214,7 +235,7 @@ The quality gate runs everything CI does:
 python scripts/check.py
 ```
 
-That's ruff, mypy, import-linter and both test suites — 634 unit tests and 22
+That's ruff, mypy, import-linter and both test suites — 687 unit tests and 22
 integration tests. The integration suite drives real ffmpeg and real speech
 synthesis, so it needs a network connection and takes a couple of minutes.
 

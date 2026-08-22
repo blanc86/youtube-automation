@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% set nav = 'projects' %}
+{% block title %}New project · ytauto{% endblock %}
+
+{% block content %}
+  <div class="page-head">
+    <h1>New project</h1>
+  </div>
+
+  <div class="split">
+    <form method="post" action="{{ url_for('create') }}" class="panel">
+      <label for="title">Title</label>
+      <input id="title" name="title" type="text" value="{{ title }}" required
+             autocomplete="off" placeholder="The Ghost Train" />
+      <p class="hint">The slug is derived from this, and made unique automatically.</p>
+
+      <label for="story">Story</label>
+      <textarea id="story" name="story" rows="24" required
+                placeholder="Paste the narration here — one beat per line, blank line between."
+                >{{ story }}</textarea>
+
+      <div class="actions">
+        <button type="submit" class="button primary">Create project</button>
+        <a class="button" href="{{ url_for('index') }}">Cancel</a>
+      </div>
+    </form>
+
+    <aside class="panel">
+      <h2>Need a script?</h2>
+      <p class="hint">
+        Copy this prompt into any chat assistant, add your plot idea at the bottom, and paste
+        the reply straight into the story box. No API key, no cost.
+      </p>
+      <button type="button" class="button" data-copy-target="script-prompt">Copy prompt</button>
+      <pre id="script-prompt" class="prompt">{{ script_prompt }}</pre>
+    </aside>
+  </div>
+{% endblock %}

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}ytauto{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="wordmark" href="{{ url_for('index') }}">ytauto</a>
+      <nav>
+        <a href="{{ url_for('index') }}" {% if nav == 'projects' %}class="current"{% endif %}>Projects</a>
+        <a href="{{ url_for('broll') }}" {% if nav == 'broll' %}class="current"{% endif %}>B-roll</a>
+      </nav>
+    </header>
+
+    <main>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+          <p class="banner banner-{{ category }}">{{ message }}</p>
+        {% endfor %}
+      {% endwith %}
+      {% if error %}<p class="banner banner-error">{{ error }}</p>{% endif %}
+
+      {% block content %}{% endblock %}
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

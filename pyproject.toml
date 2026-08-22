@@ -10,6 +10,12 @@ requires-python = ">=3.12"
 dependencies = [
     "platformdirs>=4.2",
     "edge-tts>=6.1",
+    # The local web UI (`ytauto ui`). Flask and not an async framework: every
+    # operation behind these routes is blocking (SQLite, ffmpeg, file copies),
+    # a thread-per-request server matches SQLite's one-connection-per-thread
+    # rule exactly, and Flask's test client is part of Flask - so the endpoint
+    # tests cost no second dependency. See src/ytauto/ui/app.py's docstring.
+    "flask>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +42,14 @@ ytauto = "ytauto.cli.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The UI's templates and stylesheet are not Python modules, so packages.find
+# does not see them. Without this a wheel installs ytauto.ui with no templates
+# directory and `ytauto ui` raises TemplateNotFound on its first request - a
+# failure an editable install (which serves straight from the source tree)
+# never shows.
+[tool.setuptools.package-data]
+"ytauto.ui" = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

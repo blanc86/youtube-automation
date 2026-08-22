@@ -2,7 +2,7 @@
 
 Two different hermeticity strategies are used for ``run``'s tests, and the
 split is deliberate. Tests that need a job to reach ``succeeded`` or
-``failed`` replace ``ytauto.cli.__main__.build_pipeline`` with a fake
+``failed`` replace ``ytauto.app.services.render.build_pipeline`` with a fake
 single-stage pipeline and either pre-record a cache hit or replace
 ``ytauto.app.scheduler.dispatcher.Popen`` with a spy that never spawns a real
 process - the same conventions ``tests/unit/app/test_dispatcher.py`` already
@@ -443,7 +443,7 @@ def test_run_enqueues_one_job_and_drains_it(
     paths = AppPaths.resolve(override=tmp_path)
     _project(db_conn, tmp_path, slug="ghost-train")
     _preseed_cache_hit(paths, db_conn)
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _fake_build_pipeline)
 
     rc = main(["--data-dir", str(tmp_path), "run", "--project", "ghost-train", "--max-ticks", "20"])
 
@@ -505,7 +505,7 @@ def test_run_rebinds_the_story_digest_and_the_broll_manifest_digest_before_enque
     paths = AppPaths.resolve(override=tmp_path)
     project_id = _project(db_conn, tmp_path, slug="edited", settings={"story_digest": "0" * 64})
     _preseed_cache_hit(paths, db_conn)
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _fake_build_pipeline)
 
     assert main(["--data-dir", str(tmp_path), "run", "--project", "edited"]) == 0
 
@@ -524,7 +524,7 @@ def test_run_returns_1_when_the_job_fails(
     and pump a terminal message.
     """
     _project(db_conn, tmp_path, slug="doomed")
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _fake_build_pipeline)
 
     fixed_job_id = "f" * 32
     monkeypatch.setattr("uuid.uuid4", lambda: _FixedUUID(fixed_job_id))
@@ -566,15 +566,15 @@ def test_run_retries_a_retryable_failure_through_to_success(
     Popen spy that fails once (``RETRYABLE``) and then succeeds, referencing
     a real digest already staged (but not yet recorded) in the CAS so the
     eventual successful ``commit_stage`` finds a genuine blob on disk.
-    ``_BASE_BACKOFF_S`` and ``_RUN_POLL_INTERVAL_S`` are both monkeypatched
+    ``_BASE_BACKOFF_S`` and ``_POLL_INTERVAL_S`` are both monkeypatched
     down so the test does not have to sleep through the real (>=5s) minimum
     backoff or the real (1s) poll interval.
     """
     paths = AppPaths.resolve(override=tmp_path)
     _project(db_conn, tmp_path, slug="flaky")
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _fake_build_pipeline)
     monkeypatch.setattr("ytauto.app.scheduler.dispatcher._BASE_BACKOFF_S", 0.05)
-    monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("ytauto.app.services.render._POLL_INTERVAL_S", 0.01)
 
     fixed_job_id = "a" * 32
     monkeypatch.setattr("uuid.uuid4", lambda: _FixedUUID(fixed_job_id))
@@ -653,9 +653,9 @@ def test_run_reports_a_distinct_message_when_the_retry_wait_budget_is_exhausted(
     test's short wall-clock lifetime, so nothing ever spawns a second time.
     """
     _project(db_conn, tmp_path, slug="stuck-retrying")
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _fake_build_pipeline)
-    monkeypatch.setattr("ytauto.cli.__main__._RUN_WALL_CLOCK_BUDGET_S", 0.05)
-    monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _fake_build_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render._WALL_CLOCK_BUDGET_S", 0.05)
+    monkeypatch.setattr("ytauto.app.services.render._POLL_INTERVAL_S", 0.01)
 
     fixed_job_id = "b" * 32
     monkeypatch.setattr("uuid.uuid4", lambda: _FixedUUID(fixed_job_id))
@@ -711,7 +711,7 @@ def test_run_does_not_time_out_a_retry_that_follows_a_long_busy_phase(
     sleeps for real (0.1s x 3 = ~0.3s total - a stand-in for slow but
     legitimate work; each is still a cache hit, so no subprocess is spawned),
     chained via ``depends_on`` ahead of the real stage that then fails once
-    (RETRYABLE) before succeeding on retry. ``_RUN_WALL_CLOCK_BUDGET_S`` is
+    (RETRYABLE) before succeeding on retry. ``_WALL_CLOCK_BUDGET_S`` is
     monkeypatched to 0.15s - deliberately *shorter* than the busy phase alone.
     Under the pre-fix "anchor to invocation start" code this reliably timed
     out on the very first idle check (the busy phase's own real sleep time
@@ -763,10 +763,10 @@ def test_run_does_not_time_out_a_retry_that_follows_a_long_busy_phase(
             ),
         )
 
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _busy_then_retry_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _busy_then_retry_pipeline)
     # Shorter than the ~0.3s busy phase alone - the whole point of the test.
-    monkeypatch.setattr("ytauto.cli.__main__._RUN_WALL_CLOCK_BUDGET_S", 0.15)
-    monkeypatch.setattr("ytauto.cli.__main__._RUN_POLL_INTERVAL_S", 0.02)
+    monkeypatch.setattr("ytauto.app.services.render._WALL_CLOCK_BUDGET_S", 0.15)
+    monkeypatch.setattr("ytauto.app.services.render._POLL_INTERVAL_S", 0.02)
     monkeypatch.setattr("ytauto.app.scheduler.dispatcher._BASE_BACKOFF_S", 0.05)
 
     fixed_job_id = "c" * 32
@@ -900,7 +900,7 @@ def test_run_reports_failure_rather_than_success_when_a_poison_job_blocks_the_qu
 
 # -- ``ytauto run`` exports the rendered masters --------------------------
 #
-# ``_export_masters`` (ytauto.cli.__main__) is keyed by each compose stage's
+# ``export_masters`` (ytauto.app.services.render) is keyed by each compose stage's
 # own ``job_stages.fingerprint`` - never by scanning ``artifacts`` for any
 # row whose name ends in ``.mp4`` - so the fakes below use the real
 # ``compose_landscape``/``compose_vertical`` stage ids and the real
@@ -919,7 +919,7 @@ _VERTICAL_FINGERPRINT = "2" * 64
 class _FixedMasterStage:
     """A minimal Stage double under a real compose stage id and a fixed
     fingerprint - the export path's tests need the id to match
-    ``_MASTER_STAGE_IDS``, unlike ``_FixedStage``'s made-up ``"only"``.
+    ``MASTER_STAGE_IDS``, unlike ``_FixedStage``'s made-up ``"only"``.
     """
 
     def __init__(self, stage_id: str, fingerprint: str) -> None:
@@ -984,7 +984,7 @@ def test_run_exports_both_masters_and_prints_the_export_directory_last(
     """
     paths = AppPaths.resolve(override=tmp_path)
     _project(db_conn, tmp_path, slug="lighthouse")
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _master_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _master_pipeline)
     _preseed_master_cache_hits(paths, db_conn)
 
     rc = main(["--data-dir", str(tmp_path), "run", "--project", "lighthouse", "--max-ticks", "20"])
@@ -1019,7 +1019,7 @@ def test_run_exports_masters_on_a_fully_cached_rerun(
     """
     paths = AppPaths.resolve(override=tmp_path)
     _project(db_conn, tmp_path, slug="cached")
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _master_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _master_pipeline)
     _preseed_master_cache_hits(paths, db_conn)
 
     assert (
@@ -1053,7 +1053,7 @@ def test_run_exports_nothing_when_the_job_fails(
     """
     _project(db_conn, tmp_path, slug="ruined")
     monkeypatch.setattr(
-        "ytauto.cli.__main__.build_pipeline",
+        "ytauto.app.services.render.build_pipeline",
         lambda pipeline_id, cas, settings: Pipeline(
             id=pipeline_id,
             stages=(_FixedMasterStage(_LANDSCAPE_STAGE_ID, _LANDSCAPE_FINGERPRINT),),
@@ -1131,14 +1131,14 @@ def test_run_does_not_contaminate_a_second_projects_exports(
     )
 
     monkeypatch.setattr(
-        "ytauto.cli.__main__.build_pipeline", _pipeline_for(fp_alpha_land, fp_alpha_vert)
+        "ytauto.app.services.render.build_pipeline", _pipeline_for(fp_alpha_land, fp_alpha_vert)
     )
     assert (
         main(["--data-dir", str(tmp_path), "run", "--project", "alpha", "--max-ticks", "20"]) == 0
     )
 
     monkeypatch.setattr(
-        "ytauto.cli.__main__.build_pipeline", _pipeline_for(fp_beta_land, fp_beta_vert)
+        "ytauto.app.services.render.build_pipeline", _pipeline_for(fp_beta_land, fp_beta_vert)
     )
     assert main(["--data-dir", str(tmp_path), "run", "--project", "beta", "--max-ticks", "20"]) == 0
 
@@ -1165,7 +1165,7 @@ def test_run_output_dir_flag_overrides_the_auto_detected_location(
     """
     paths = AppPaths.resolve(override=tmp_path)
     _project(db_conn, tmp_path, slug="custom-dest")
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _master_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _master_pipeline)
     _preseed_master_cache_hits(paths, db_conn)
 
     explicit_dir = tmp_path / "somewhere-else"
@@ -1200,16 +1200,16 @@ def test_run_fails_the_command_when_a_copied_master_is_truncated_on_disk(
 ) -> None:
     """The brief's core safety requirement: a truncated or missing destination
     file must fail the run rather than be reported as a successful export.
-    ``shutil.copyfile`` (as ``ytauto.cli.__main__`` calls it) is replaced with
+    ``shutil.copyfile`` (as ``ytauto.app.services.render`` calls it) is replaced with
     a double that writes only half the source bytes without raising - a
     stand-in for a disk that fills mid-write or an interrupted cloud-synced
     destination, which ``copyfile``'s own return contract would not catch on
-    its own; this is exactly why ``_export_masters`` verifies size on disk
+    its own; this is exactly why ``export_masters`` verifies size on disk
     after every copy instead of trusting a clean return.
     """
     paths = AppPaths.resolve(override=tmp_path)
     _project(db_conn, tmp_path, slug="truncated")
-    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _master_pipeline)
+    monkeypatch.setattr("ytauto.app.services.render.build_pipeline", _master_pipeline)
     _preseed_master_cache_hits(paths, db_conn)
 
     real_copyfile = shutil.copyfile
@@ -1220,7 +1220,7 @@ def test_run_fails_the_command_when_a_copied_master_is_truncated_on_disk(
         Path(dst).write_bytes(data[: len(data) // 2])
         return dst
 
-    monkeypatch.setattr("ytauto.cli.__main__.shutil.copyfile", _truncating_copyfile)
+    monkeypatch.setattr("ytauto.app.services.render.shutil.copyfile", _truncating_copyfile)
 
     rc = main(["--data-dir", str(tmp_path), "run", "--project", "truncated", "--max-ticks", "20"])
 

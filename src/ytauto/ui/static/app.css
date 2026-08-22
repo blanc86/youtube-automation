@@ -1,0 +1,444 @@
+/* ytauto local UI.
+ *
+ * Dark, because this sits next to a video editor and a white page beside a
+ * timeline is a flashbang. One accent colour (--accent), used for the primary
+ * action and for the caption preview's spoken word - the same amber the
+ * default caption style actually renders, so the preview is not a lie. No
+ * gradients, no webfonts, no icon set: everything here is a system font and a
+ * border.
+ */
+
+:root {
+  --bg: #16181c;
+  --surface: #1e2126;
+  --surface-raised: #23272d;
+  --border: #2f343c;
+  --text: #e6e8eb;
+  --muted: #949ba6;
+  --accent: #e3a04a;
+  --accent-ink: #1a1408;
+  --ok: #6fbf73;
+  --bad: #e2695f;
+
+  --radius: 6px;
+  --gap: 20px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+code,
+pre,
+.output-dir {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  font-size: 0.92em;
+}
+
+/* -- chrome -------------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 28px;
+  padding: 16px 32px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.wordmark {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.topbar nav {
+  display: flex;
+  gap: 20px;
+}
+
+.topbar nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding-bottom: 2px;
+}
+
+.topbar nav a:hover {
+  color: var(--text);
+}
+
+.topbar nav a.current {
+  color: var(--text);
+  border-bottom: 2px solid var(--accent);
+}
+
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 32px;
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--gap);
+  margin-bottom: 28px;
+}
+
+h1 {
+  font-size: 24px;
+  font-weight: 600;
+  margin: 0;
+}
+
+h2 {
+  font-size: 15px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 14px;
+}
+
+h3 {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 26px 0 12px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.page-head h1 + .muted {
+  margin: 4px 0 0;
+}
+
+/* -- panels and layout --------------------------------------------------- */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 22px 24px;
+  margin-bottom: var(--gap);
+}
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--gap);
+  align-items: start;
+}
+
+.split > .panel {
+  margin-bottom: 0;
+}
+
+@media (max-width: 900px) {
+  .split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+/* -- form controls ------------------------------------------------------- */
+
+label {
+  display: block;
+  margin: 16px 0 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.panel > label:first-of-type,
+.field-row label {
+  margin-top: 0;
+}
+
+input[type="text"],
+input[type="number"],
+select,
+textarea {
+  width: 100%;
+  padding: 9px 11px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font: inherit;
+}
+
+textarea {
+  resize: vertical;
+  line-height: 1.6;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+input[type="color"] {
+  width: 100%;
+  height: 38px;
+  padding: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.hint {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.button {
+  display: inline-block;
+  padding: 9px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--text);
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button:hover {
+  border-color: var(--muted);
+}
+
+.button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.button.primary:hover {
+  filter: brightness(1.08);
+}
+
+.button[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* -- tables -------------------------------------------------------------- */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+th {
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+td {
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+tbody tr:hover {
+  background: var(--surface-raised);
+}
+
+td a {
+  color: var(--text);
+  text-decoration: none;
+  border-bottom: 1px solid var(--border);
+}
+
+td a:hover {
+  border-bottom-color: var(--accent);
+}
+
+.truncate {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* -- status ------------------------------------------------------------- */
+
+.muted {
+  color: var(--muted);
+}
+
+.empty {
+  color: var(--muted);
+  padding: 40px 0;
+  text-align: center;
+}
+
+.empty a,
+main p a {
+  color: var(--accent);
+}
+
+.state {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.state-succeeded {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.state-failed {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.state-running {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.banner {
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  margin: 0 0 var(--gap);
+}
+
+.banner-success {
+  border-color: var(--ok);
+}
+
+.banner-error {
+  border-color: var(--bad);
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+}
+
+.status.ok {
+  color: var(--ok);
+}
+
+.status.bad {
+  color: var(--bad);
+}
+
+/* The one thing the user most needs to be able to find afterwards. */
+.output-dir {
+  margin: 10px 0 0;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--text);
+  word-break: break-all;
+  user-select: all;
+}
+
+.spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex: none;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 3s;
+  }
+}
+
+/* -- script prompt panel ------------------------------------------------- */
+
+.prompt {
+  margin: 14px 0 0;
+  padding: 16px;
+  max-height: 460px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  white-space: pre-wrap;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+/* -- caption preview ----------------------------------------------------- */
+
+.caption-preview {
+  margin: 22px 0 0;
+  padding: 20px;
+  text-align: center;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
