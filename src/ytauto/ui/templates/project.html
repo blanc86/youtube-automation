@@ -29,7 +29,7 @@
       {% endif %}
     {% else %}
       <p class="muted">Not rendered in this session.
-        {% if last_job %}Last job was <span class="state state-{{ last_job.state }}">{{ last_job.state }}</span>.{% endif %}
+        {% if last_job %}Last job: <span class="state state-{{ last_job.state }}">{{ last_job.state }}</span>.{% endif %}
       </p>
     {% endif %}
   </section>
