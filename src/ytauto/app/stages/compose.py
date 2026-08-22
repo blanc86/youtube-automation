@@ -222,7 +222,21 @@ class ComposeStage:
     ``duration_s`` from.
     """
 
-    version = 1
+    version = 2
+    """Bump whenever this stage's *rendered output* changes - including when the
+    change is in a dependency rather than in this file.
+
+    ``render_ass`` (``core.captions.ass``) is the trap: it decides how every
+    caption looks and when it appears, yet it reaches no fingerprint. Only
+    ``stage_id``, this ``version``, the provider constants, the input digests
+    and the declared ``settings_keys`` do. So a caption change with no bump
+    here is served straight from cache and the operator sees the old video
+    while believing the fix shipped - measured, not hypothetical: the
+    event-tiling fix re-ran in 1.8s and returned byte-identical masters.
+
+    v2: captions tile with no blank frames (was 6.99s blank of 21.5s) and sit
+    middle-centre rather than bottom."""
+
     depends_on: tuple[str, ...] = ("plan_timeline", "select_broll", "synthesize_speech")
     settings_keys: tuple[str, ...] = ("broll_manifest_digest", "caption_style", "encoder")
     gpu_pool = "gpu_encode"

@@ -223,6 +223,13 @@ def _render_words(
     return " ".join(rendered)
 
 
+# Changing anything below that alters the rendered .ass - timings, alignment,
+# style fields, the escaping - MUST be accompanied by a bump to
+# ``ComposeStage.version``. This module reaches no fingerprint, so without that
+# bump every existing project serves its cached video and the change is
+# invisible to the operator.
+
+
 def render_ass(timeline: Timeline, *, width: int, height: int, style: Mapping[str, object]) -> str:
     """Render ``timeline`` as a complete ASS document.
 
