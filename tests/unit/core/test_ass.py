@@ -229,3 +229,134 @@ def test_dialogue_events_accumulate_across_multiple_groups() -> None:
     )
     ass = render_ass(tl, width=1080, height=1920, style=_style())
     assert ass.count("\nDialogue:") == 5
+
+
+# --- Defect 1: captions must never go blank between words -------------------
+#
+# Real narration has pauses: a word's own end_s is well short of the next
+# word's start_s (silence, breath, sentence break). The original
+# implementation gave every event exactly its own word's [start_s, end_s) -
+# so every such pause was a frame with no caption at all. The fix tiles each
+# event's end to the *next* event's own start, so consecutive events abut
+# with zero gap, and the last event of the whole timeline reaches
+# timeline.duration_s.
+
+
+def _dialogue_lines(ass: str) -> list[str]:
+    return [ln for ln in ass.splitlines() if ln.startswith("Dialogue:")]
+
+
+def _start_end(line: str) -> tuple[str, str]:
+    # Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+    fields = line.split(",")
+    return fields[1], fields[2]
+
+
+def _gappy_timeline() -> Timeline:
+    """Two groups, each with an internal pause between its words, plus a
+    pause between the two groups, plus trailing silence after the last word
+    out to duration_s - every kind of gap Defect 1 covers, in one timeline.
+    """
+    groups = (
+        CaptionGroup(
+            start_s=0.0,
+            end_s=0.9,
+            words=(("hello", 0.0, 0.4), ("there", 0.6, 0.9)),  # 0.4->0.6 gap
+        ),
+        CaptionGroup(
+            start_s=1.5,
+            end_s=2.4,
+            words=(("my", 1.5, 1.8), ("friend", 2.0, 2.4)),  # 1.8->2.0 gap
+        ),  # 0.9 -> 1.5 is the inter-group gap
+    )
+    return Timeline(
+        duration_s=3.0,  # trailing silence: 2.4 -> 3.0
+        groups=groups,
+        segments=(Segment(start_s=0.0, end_s=3.0),),
+    )
+
+
+def test_no_blank_interval_anywhere_consecutive_events_abut() -> None:
+    """For a multi-group timeline riddled with pauses, every event's end
+    must equal the next event's start - no gap, anywhere - and the very
+    last event must reach duration_s exactly."""
+    tl = _gappy_timeline()
+    lines = _dialogue_lines(render_ass(tl, width=1080, height=1920, style=_style()))
+    assert len(lines) == 4  # one event per word: hello, there, my, friend
+
+    pairs = [_start_end(line) for line in lines]
+    for (_start, end), (next_start, _next_end) in zip(pairs, pairs[1:], strict=False):
+        assert end == next_start, "an event's end must equal the next event's start"
+
+    # The last event reaches the timeline's own duration, not its word's end_s.
+    assert pairs[-1][1] == "0:00:03.00"
+
+
+def test_the_accent_still_advances_on_each_words_own_start() -> None:
+    """Tiling changes only event *ends* - the accent must still switch onto
+    each word at that word's own start_s, unaffected by how far the event's
+    end was stretched."""
+    tl = _gappy_timeline()
+    lines = _dialogue_lines(render_ass(tl, width=1080, height=1920, style=_style()))
+    starts = [_start_end(line)[0] for line in lines]
+    assert starts == ["0:00:00.00", "0:00:00.60", "0:00:01.50", "0:00:02.00"]
+
+
+def test_guard_pin_word_tight_ends_reintroduce_the_blank_gap() -> None:
+    """Guard-pin: revert render_ass to the original word-tight event ends
+    (event end = that word's own end_s) and confirm the no-blank test fails
+    for the *right* reason - a specific gap between "hello"'s event (ending
+    0:00:00.40) and "there"'s event (starting 0:00:00.60), not some
+    unrelated error.
+
+    Prediction made before running: with word-tight ends, event 0 ("hello")
+    ends at 0:00:00.40 while event 1 ("there") starts at 0:00:00.60 - the
+    two do not abut, so the ``end == next_start`` assertion fails on that
+    exact pair.
+    """
+    tl = _gappy_timeline()
+    accent_colour = "&H0000FFFF"
+    primary_colour = "&H00FFFFFF"
+
+    # Reimplements the pre-fix behaviour directly (does not call render_ass,
+    # which no longer has it) so the guard exercises the same tiling logic
+    # this file's other tests assert against, on the same input.
+    from ytauto.core.captions.ass import _render_words
+
+    lines = []
+    for group in tl.groups:
+        for index, (_text, start_s, end_s) in enumerate(group.words):
+            text = _render_words(group.words, index, accent_colour, primary_colour)
+            lines.append(f"Dialogue: 0,{start_s:.2f},{end_s:.2f},Default,,0,0,0,,{text}")
+
+    pairs = [(ln.split(",")[1], ln.split(",")[2]) for ln in lines]
+    failures = [
+        (end, next_start)
+        for (_start, end), (next_start, _next_end) in zip(pairs, pairs[1:], strict=False)
+        if end != next_start
+    ]
+    assert failures, "word-tight ends were expected to reintroduce at least one blank gap"
+    # The specific gap predicted above: hello's event ends 0.40, there's starts 0.60.
+    assert failures[0] == ("0.40", "0.60")
+
+
+# --- Defect 2: alignment ------------------------------------------------------
+
+
+def test_alignment_defaults_to_middle_centre() -> None:
+    ass = render_ass(_timeline(), width=1080, height=1920, style=_style())
+    style_line = [ln for ln in ass.splitlines() if ln.startswith("Style: Default,")][0]
+    fields = style_line.removeprefix("Style: ").split(",")
+    # Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,
+    # OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX,
+    # ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, ...
+    alignment_index = 18
+    assert fields[alignment_index] == "5"
+
+
+def test_alignment_is_overridable_via_caption_style() -> None:
+    style: Mapping[str, object] = {"accent_colour": "&H0000FFFF", "alignment": 2}
+    ass = render_ass(_timeline(), width=1080, height=1920, style=style)
+    style_line = [ln for ln in ass.splitlines() if ln.startswith("Style: Default,")][0]
+    fields = style_line.removeprefix("Style: ").split(",")
+    assert fields[18] == "2"

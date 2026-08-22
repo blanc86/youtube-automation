@@ -201,9 +201,6 @@ Deliberately out of scope for this phase, in rough order of likely arrival:
 
 - **Trailing silence is trimmed.** The video ends where the last word ends, so a
   beat of breathing room at the end is lost.
-- **Captions blink at sentence boundaries** — roughly a 0.85 s gap where nothing
-  is on screen, because a caption group ends on the last word rather than
-  reaching the next one.
 - **One bad job can block `ytauto run`** for an unrelated project until its lease
   expires.
 
@@ -217,7 +214,7 @@ The quality gate runs everything CI does:
 python scripts/check.py
 ```
 
-That's ruff, mypy, import-linter and both test suites — 625 unit tests and 22
+That's ruff, mypy, import-linter and both test suites — 634 unit tests and 22
 integration tests. The integration suite drives real ffmpeg and real speech
 synthesis, so it needs a network connection and takes a couple of minutes.
 
