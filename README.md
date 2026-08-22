@@ -83,9 +83,14 @@ ytauto project create --slug ghost-train --title "The Ghost Train" --story story
 ```
 
 `story.txt` is a plain UTF-8 text file — whatever you want narrated. Write it
-yourself, or paste something you generated elsewhere. It's copied into the
-project directory as the human-readable source of truth, so you can reopen and
-revise it later.
+yourself, or paste something you generated elsewhere.
+
+It's copied into the project directory as the human-readable source of truth, so
+you can reopen and revise it later.
+
+**Don't want to write it yourself?** [`docs/SCRIPT-PROMPT.md`](docs/SCRIPT-PROMPT.md)
+has a ready-made prompt — paste it into any chat assistant with your plot idea and
+the reply is already in the exact shape this expects. No API key, no cost.
 
 ### 3. Render
 
