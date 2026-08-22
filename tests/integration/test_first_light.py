@@ -409,7 +409,24 @@ class FirstLightEnv:
     # -- CLI-level runs ------------------------------------------------------
 
     def _cli_run(self) -> int:
-        return main(["--data-dir", str(self.paths.root), "run", "--project", self.slug])
+        # --output-dir pins the export location under the same tmp-rooted
+        # AppPaths this whole environment already lives under. Left to
+        # auto-detect (infra.paths.resolve_output_dir), every CLI-level run
+        # in this module would create <real Videos>/ytauto (or Downloads) on
+        # whatever machine runs the suite - a real side effect a hermetic
+        # integration test must not have, and irrelevant to what this module
+        # exists to prove (the pipeline, not where the resolver looks).
+        return main(
+            [
+                "--data-dir",
+                str(self.paths.root),
+                "run",
+                "--project",
+                self.slug,
+                "--output-dir",
+                str(self.paths.root / "output"),
+            ]
+        )
 
     def run(self) -> int:
         """Invoke ``ytauto run --project <slug>`` once. Always enqueues a
@@ -980,7 +997,19 @@ def test_a_cli_created_project_runs_with_no_hand_seeded_settings(tmp_path: Path)
     finally:
         conn.close()
 
-    rc = main(["--data-dir", str(tmp_path), "run", "--project", slug])
+    # --output-dir keeps this hermetic - see FirstLightEnv._cli_run's comment
+    # for why the auto-detected Videos/Downloads location is not used here.
+    rc = main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "run",
+            "--project",
+            slug,
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
     assert rc == 0, (
         f"ytauto run exited {rc} for a project created by ytauto project create "
         f"with no further configuration; see {paths.logs / 'ytauto.jsonl'}"

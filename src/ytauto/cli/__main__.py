@@ -18,7 +18,7 @@ from ytauto.app.scheduler.governor import Governor
 from ytauto.app.scheduler.queue import JobQueue
 from ytauto.app.services.enqueue import create_project, refresh_run_settings, resolve_project_id
 from ytauto.cli.doctor import exit_code, format_report, run_checks
-from ytauto.core.errors import ConfigurationError, ValidationError
+from ytauto.core.errors import ConfigurationError, RenderError, ValidationError
 from ytauto.core.models.job import JobState, StageStatus
 from ytauto.infra.artifacts import ArtifactStore
 from ytauto.infra.broll import BrollLibrary
@@ -26,7 +26,7 @@ from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
 from ytauto.infra.logging import bind_correlation_id, configure_logging
-from ytauto.infra.paths import AppPaths
+from ytauto.infra.paths import AppPaths, ensure_writable_dir, resolve_output_dir
 
 _PIPELINE_ID = "story_video"
 """The only pipeline this CLI drives. Not exposed as a flag: Phase 2a ships
@@ -195,6 +195,15 @@ def _add_run_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
             f"(default: {_DEFAULT_MAX_TICKS})"
         ),
     )
+    run.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "write rendered masters here instead of the auto-detected Videos "
+            "(falling back to Downloads) folder"
+        ),
+    )
 
 
 def _job_state(conn: sqlite3.Connection, job_id: str) -> str | None:
@@ -219,12 +228,28 @@ def _export_masters(
     *,
     job_id: str,
     slug: str,
-    paths: AppPaths,
+    output_dir: Path,
 ) -> Path:
     """Copy this succeeded job's two rendered masters out of the CAS into
-    ``paths.exports / slug``, keeping their artifact names. Returns the
-    export directory. Existing files of the same name are overwritten - a
-    re-run refreshes a project's output rather than accumulating copies.
+    ``output_dir / slug``, keeping their artifact names. Returns the export
+    directory. Existing files of the same name are overwritten - a re-run
+    refreshes a project's output rather than accumulating copies.
+
+    ``output_dir`` is the user-facing location resolved by
+    ``infra.paths.resolve_output_dir`` (the platform's Videos folder, falling
+    back to Downloads) or an explicit ``--output-dir`` - never
+    ``AppPaths.exports``, which lives under application data and is not
+    somewhere a person looks for their own files.
+
+    **Every copy is verified before this function returns successfully.**
+    ``shutil.copyfile`` can itself return having written a short file - a
+    disk that fills up mid-write, or an interrupted network/cloud-synced
+    destination, does not reliably surface as a raised exception. So after
+    each copy, the destination's size on disk is compared against the source
+    blob's own size (``CasStore.path_for(digest).stat().st_size``); anything
+    else - missing, unreadable, or a size mismatch - raises ``RenderError``
+    naming the file, rather than letting a truncated file be reported as a
+    successful export.
 
     Called identically for a fresh render and for a fully-cached re-run: a
     stage recorded ``skipped`` (cache hit) has exactly as valid a
@@ -258,8 +283,11 @@ def _export_masters(
             with its artifacts intact - was already broken. Not a
             documented, recoverable failure mode; a bug elsewhere, surfaced
             loudly rather than silently exporting an incomplete set of files.
+        RenderError: a copied master failed verification - missing, unreadable,
+            or a size mismatch against its source blob. Names the destination
+            file and both sizes.
     """
-    export_dir = paths.exports / slug
+    export_dir = output_dir / slug
     export_dir.mkdir(parents=True, exist_ok=True)
     for stage_id in _MASTER_STAGE_IDS:
         row = conn.execute(
@@ -281,7 +309,23 @@ def _export_masters(
             )
         for artifact in found:
             if artifact.name.endswith(".mp4"):
-                shutil.copyfile(cas.path_for(artifact.digest), export_dir / artifact.name)
+                source = cas.path_for(artifact.digest)
+                source_size = source.stat().st_size
+                dest = export_dir / artifact.name
+                shutil.copyfile(source, dest)
+                try:
+                    dest_size = dest.stat().st_size
+                except OSError as exc:
+                    raise RenderError(
+                        f"export verification failed for {dest}: could not stat "
+                        f"the file just written ({exc})"
+                    ) from exc
+                if dest_size != source_size:
+                    raise RenderError(
+                        f"export verification failed for {dest}: wrote "
+                        f"{dest_size} bytes but the source is {source_size} "
+                        "bytes - the file on disk is truncated or corrupt"
+                    )
     return export_dir
 
 
@@ -302,23 +346,35 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
     further configuration, which it was not before (there is still no
     ``ytauto project set-setting`` verb).
 
+    **The output location is resolved before anything is enqueued.**
+    ``infra.paths.resolve_output_dir`` picks the user's platform Videos
+    folder (falling back to Downloads if that cannot be created or proven
+    writable), or ``--output-dir`` overrides it explicitly - either way this
+    happens before the job is enqueued, so a broken output location fails
+    fast rather than after minutes of rendering.
+
     **On success, the two rendered masters are exported.** ``_export_masters``
     copies them out of the content-addressed store - where they live as
     hash-named blobs nobody could find on their own - into
-    ``paths.exports / <slug>``, and the export directory is the last thing
-    this command prints. This runs identically whether the job just rendered
-    for real or the run was a fully-cached no-op (every stage a cache hit):
-    either way the operator wants the video files, not a report that nothing
-    happened. A failed job exports nothing, so a partial or absent render
-    never leaves stale files that look like output.
+    ``<output_dir> / <slug>``, verifies each copy actually landed at its full
+    size, and the export directory is the last thing this command prints.
+    This runs identically whether the job just rendered for real or the run
+    was a fully-cached no-op (every stage a cache hit): either way the
+    operator wants the video files, not a report that nothing happened. A
+    failed job exports nothing, so a partial or absent render never leaves
+    stale files that look like output. A verification failure (a truncated or
+    missing copy) is reported as a command failure naming the file, never as
+    success.
 
     Exit codes: 0 once the enqueued job reaches ``succeeded``; 2 if
-    ``--project`` names no project, or the project's settings are missing or
-    malformed - all bad input, checked before anything is enqueued; 1 for
-    every other way this can fail to end in success - the
-    job reaches ``failed``, it burns through ``--max-ticks`` while genuinely
-    busy, it is still waiting out a retry backoff once
-    ``_RUN_WALL_CLOCK_BUDGET_S`` elapses, or the dispatcher itself raises.
+    ``--project`` names no project, the project's settings are missing or
+    malformed, or the output location (auto-detected or ``--output-dir``)
+    could not be created or proven writable - all bad input or bad
+    environment, checked before anything is enqueued; 1 for every other way
+    this can fail to end in success - the job reaches ``failed``, it burns
+    through ``--max-ticks`` while genuinely busy, it is still waiting out a
+    retry backoff once ``_RUN_WALL_CLOCK_BUDGET_S`` elapses, the dispatcher
+    itself raises, or the successful job's masters fail export verification.
     The last three are reported with different stderr messages (see below) -
     sharing one exit code is fine within this brief's ``{0,1,2}`` contract,
     but "ran out of tick budget", "made no progress for N seconds" and "the
@@ -397,6 +453,26 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
             print(f"ytauto run: {exc}", file=sys.stderr)
             return 2
 
+        # Resolved before enqueueing anything: an unwritable output location
+        # is bad environment state exactly like an invalid project setting,
+        # and there is no point spending minutes rendering a video with
+        # nowhere to put it.
+        if args.output_dir is not None:
+            output_dir = Path(args.output_dir).expanduser().resolve()
+            if not ensure_writable_dir(output_dir):
+                print(
+                    f"ytauto run: --output-dir {output_dir} could not be created "
+                    "or is not writable",
+                    file=sys.stderr,
+                )
+                return 2
+        else:
+            try:
+                output_dir = resolve_output_dir()
+            except ConfigurationError as exc:
+                print(f"ytauto run: {exc}", file=sys.stderr)
+                return 2
+
         job_id = uuid.uuid4().hex
         gave_up_waiting_on_backoff = False
         try:
@@ -442,10 +518,14 @@ def _run(paths: AppPaths, args: argparse.Namespace) -> int:
 
         state = _job_state(conn, job_id)
         if state == JobState.SUCCEEDED.value:
-            export_dir = _export_masters(
-                conn, cas, artifacts, job_id=job_id, slug=args.slug, paths=paths
-            )
-            print(f"ytauto run: job {job_id} succeeded; masters exported to {export_dir}")
+            try:
+                export_dir = _export_masters(
+                    conn, cas, artifacts, job_id=job_id, slug=args.slug, output_dir=output_dir
+                )
+            except RenderError as exc:
+                print(f"ytauto run: {exc}", file=sys.stderr)
+                return 1
+            print(f"ytauto run: job {job_id} succeeded; masters written to {export_dir}")
             return 0
         if state == JobState.FAILED.value:
             print(f"ytauto run: job {job_id} failed", file=sys.stderr)

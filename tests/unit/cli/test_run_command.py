@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import sqlite3
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -44,6 +45,24 @@ from ytauto.infra.db.migrations import apply_migrations
 from ytauto.infra.paths import AppPaths
 
 # -- fixtures -----------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_output_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_run`` resolves an export destination via ``resolve_output_dir``
+    (the platform Videos folder, falling back to Downloads - see
+    ``infra.paths``) before enqueueing anything, for every ``ytauto run``
+    invocation, success or failure. Left unpatched, every test below that
+    calls ``main([..., "run", ...])`` would create ``<real Videos>/ytauto``
+    on the machine running the suite. These tests are about queue/dispatcher
+    wiring and the export contract, not about where a real user's Videos
+    folder lives (that is ``tests/unit/infra/test_paths.py``'s job), so this
+    autouse fixture pins the resolved directory under ``tmp_path`` instead.
+    """
+    monkeypatch.setattr(
+        "ytauto.cli.__main__.resolve_output_dir",
+        lambda **_kwargs: tmp_path / "auto-output",
+    )
 
 
 @pytest.fixture()
@@ -102,6 +121,12 @@ def _project(
     return ProjectService(conn).create(
         slug=slug, title=slug, story_digest=merged["story_digest"], settings=merged
     )
+
+
+def _auto_export_dir(tmp_path: Path, *, slug: str) -> Path:
+    """Where ``_hermetic_output_dir`` (above) makes ``ytauto run`` write a
+    project's masters, absent an explicit ``--output-dir``."""
+    return tmp_path / "auto-output" / slug
 
 
 def _job_state(conn: sqlite3.Connection, *, slug: str) -> str:
@@ -965,7 +990,7 @@ def test_run_exports_both_masters_and_prints_the_export_directory_last(
     rc = main(["--data-dir", str(tmp_path), "run", "--project", "lighthouse", "--max-ticks", "20"])
 
     assert rc == 0
-    export_dir = paths.exports / "lighthouse"
+    export_dir = _auto_export_dir(tmp_path, slug="lighthouse")
     assert (export_dir / _LANDSCAPE_ARTIFACT).read_bytes() == b"fake landscape master bytes"
     assert (export_dir / _VERTICAL_ARTIFACT).read_bytes() == b"fake vertical master bytes"
 
@@ -1000,7 +1025,7 @@ def test_run_exports_masters_on_a_fully_cached_rerun(
     assert (
         main(["--data-dir", str(tmp_path), "run", "--project", "cached", "--max-ticks", "20"]) == 0
     )
-    export_dir = paths.exports / "cached"
+    export_dir = _auto_export_dir(tmp_path, slug="cached")
     assert (export_dir / _LANDSCAPE_ARTIFACT).is_file()
     assert (export_dir / _VERTICAL_ARTIFACT).is_file()
 
@@ -1053,8 +1078,7 @@ def test_run_exports_nothing_when_the_job_fails(
 
     assert rc == 1
     assert _job_state(db_conn, slug="ruined") == "failed"
-    paths = AppPaths.resolve(override=tmp_path)
-    export_dir = paths.exports / "ruined"
+    export_dir = _auto_export_dir(tmp_path, slug="ruined")
     assert not export_dir.exists() or not any(export_dir.iterdir())
 
 
@@ -1118,9 +1142,95 @@ def test_run_does_not_contaminate_a_second_projects_exports(
     )
     assert main(["--data-dir", str(tmp_path), "run", "--project", "beta", "--max-ticks", "20"]) == 0
 
-    alpha_dir = paths.exports / "alpha"
-    beta_dir = paths.exports / "beta"
+    alpha_dir = _auto_export_dir(tmp_path, slug="alpha")
+    beta_dir = _auto_export_dir(tmp_path, slug="beta")
     assert (alpha_dir / _LANDSCAPE_ARTIFACT).read_bytes() == b"alpha landscape bytes"
     assert (alpha_dir / _VERTICAL_ARTIFACT).read_bytes() == b"alpha vertical bytes"
     assert (beta_dir / _LANDSCAPE_ARTIFACT).read_bytes() == b"beta landscape bytes"
     assert (beta_dir / _VERTICAL_ARTIFACT).read_bytes() == b"beta vertical bytes"
+
+
+# -- ``--output-dir`` and export verification ------------------------------
+
+
+def test_run_output_dir_flag_overrides_the_auto_detected_location(
+    tmp_path: Path,
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--output-dir`` bypasses ``resolve_output_dir`` (the Videos-folder /
+    Downloads-fallback auto-detection in ``infra.paths``) entirely - an
+    operator who wants the files somewhere specific, or a future caller such
+    as a Web UI, does not have to fight the auto-detected location.
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    _project(db_conn, tmp_path, slug="custom-dest")
+    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _master_pipeline)
+    _preseed_master_cache_hits(paths, db_conn)
+
+    explicit_dir = tmp_path / "somewhere-else"
+    rc = main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "run",
+            "--project",
+            "custom-dest",
+            "--max-ticks",
+            "20",
+            "--output-dir",
+            str(explicit_dir),
+        ]
+    )
+
+    assert rc == 0
+    export_dir = explicit_dir / "custom-dest"
+    assert (export_dir / _LANDSCAPE_ARTIFACT).read_bytes() == b"fake landscape master bytes"
+    assert (export_dir / _VERTICAL_ARTIFACT).read_bytes() == b"fake vertical master bytes"
+    # Must NOT have also landed in the auto-detected (fixture-patched)
+    # location - --output-dir replaces the resolution, it does not add to it.
+    assert not _auto_export_dir(tmp_path, slug="custom-dest").exists()
+
+
+def test_run_fails_the_command_when_a_copied_master_is_truncated_on_disk(
+    tmp_path: Path,
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The brief's core safety requirement: a truncated or missing destination
+    file must fail the run rather than be reported as a successful export.
+    ``shutil.copyfile`` (as ``ytauto.cli.__main__`` calls it) is replaced with
+    a double that writes only half the source bytes without raising - a
+    stand-in for a disk that fills mid-write or an interrupted cloud-synced
+    destination, which ``copyfile``'s own return contract would not catch on
+    its own; this is exactly why ``_export_masters`` verifies size on disk
+    after every copy instead of trusting a clean return.
+    """
+    paths = AppPaths.resolve(override=tmp_path)
+    _project(db_conn, tmp_path, slug="truncated")
+    monkeypatch.setattr("ytauto.cli.__main__.build_pipeline", _master_pipeline)
+    _preseed_master_cache_hits(paths, db_conn)
+
+    real_copyfile = shutil.copyfile
+
+    def _truncating_copyfile(src: object, dst: object) -> object:
+        real_copyfile(src, dst)
+        data = Path(dst).read_bytes()
+        Path(dst).write_bytes(data[: len(data) // 2])
+        return dst
+
+    monkeypatch.setattr("ytauto.cli.__main__.shutil.copyfile", _truncating_copyfile)
+
+    rc = main(["--data-dir", str(tmp_path), "run", "--project", "truncated", "--max-ticks", "20"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    # compose_landscape is the first of _MASTER_STAGE_IDS, so its copy is
+    # verified (and fails) before compose_vertical's copy is even attempted.
+    assert _LANDSCAPE_ARTIFACT in err, "the failing file must be named, not just 'export failed'"
+    assert "truncated or corrupt" in err
+    # The job itself DID reach succeeded - only the export step failed - so
+    # a caller diagnosing this from the DB sees the real job state, distinct
+    # from this command's own nonzero exit code.
+    assert _job_state(db_conn, slug="truncated") == "succeeded"
