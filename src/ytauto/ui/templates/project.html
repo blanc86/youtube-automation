@@ -14,24 +14,40 @@
     </form>
   </div>
 
-  <section class="panel" id="render-status"
-           data-poll-url="{{ url_for('task_status', task_id='TASK_ID') }}"
-           {% if render_task and render_task.state == 'running' %}data-task-id="{{ render_task.id }}"{% endif %}>
-    <h2>Render</h2>
-    {% if render_task %}
-      {% if render_task.state == 'running' %}
-        <p class="status running"><span class="spinner" aria-hidden="true"></span> Rendering — this takes 10–120 seconds.</p>
-      {% elif render_task.state == 'succeeded' %}
-        <p class="status ok">Done. Both masters are in:</p>
-        <p class="output-dir">{{ render_task.payload.output_dir }}</p>
+  <section class="panel render"
+           {% if render_task and render_task.state == 'running' %}data-state="running"{% endif %}>
+    {# The status text is replaced wholesale by app.js as a render progresses,
+       so the canvas pair lives outside it and survives. #}
+    <div class="render-body" id="render-status"
+         data-poll-url="{{ url_for('task_status', task_id='TASK_ID') }}"
+         {% if render_task and render_task.state == 'running' %}data-task-id="{{ render_task.id }}"{% endif %}>
+      <h2>Render</h2>
+      {% if render_task %}
+        {% if render_task.state == 'running' %}
+          <p class="status running"><span class="spinner" aria-hidden="true"></span> Rendering — this takes 10–120 seconds.</p>
+        {% elif render_task.state == 'succeeded' %}
+          <p class="status ok">Done. Both masters are in:</p>
+          <p class="output-dir">{{ render_task.payload.output_dir }}</p>
+        {% else %}
+          <p class="status bad">{{ render_task.detail }}</p>
+        {% endif %}
       {% else %}
-        <p class="status bad">{{ render_task.detail }}</p>
+        <p class="muted">Not rendered in this session.
+          {% if last_job %}Last job: <span class="state state-{{ last_job.state }}">{{ last_job.state }}</span>.{% endif %}
+        </p>
       {% endif %}
-    {% else %}
-      <p class="muted">Not rendered in this session.
-        {% if last_job %}Last job: <span class="state state-{{ last_job.state }}">{{ last_job.state }}</span>.{% endif %}
-      </p>
-    {% endif %}
+    </div>
+
+    <div class="canvas-pair" aria-hidden="true">
+      <div class="canvas-slot">
+        <div class="canvas canvas-landscape"></div>
+        <span>1920×1080</span>
+      </div>
+      <div class="canvas-slot">
+        <div class="canvas canvas-vertical"></div>
+        <span>1080×1920</span>
+      </div>
+    </div>
   </section>
 
   <div class="split">
@@ -99,13 +115,19 @@
       <div class="field-row">
         <div>
           <label for="primary_colour">Word colour</label>
-          <input id="primary_colour" name="primary_colour" type="color"
-                 value="{{ values.primary_colour }}" data-caption-primary />
+          <div class="swatch">
+            <input id="primary_colour" name="primary_colour" type="color"
+                   value="{{ values.primary_colour }}" data-caption-primary />
+            <output for="primary_colour">{{ values.primary_colour }}</output>
+          </div>
         </div>
         <div>
           <label for="accent_colour">Spoken-word colour</label>
-          <input id="accent_colour" name="accent_colour" type="color"
-                 value="{{ values.accent_colour }}" data-caption-accent />
+          <div class="swatch">
+            <input id="accent_colour" name="accent_colour" type="color"
+                   value="{{ values.accent_colour }}" data-caption-accent />
+            <output for="accent_colour">{{ values.accent_colour }}</output>
+          </div>
         </div>
       </div>
 
@@ -126,9 +148,14 @@
         </div>
       </div>
 
-      <p class="caption-preview" data-caption-preview>
-        the <span data-caption-word>spoken</span> word
-      </p>
+      {# A viewport, not a swatch: the caption sits where the alignment above
+         puts it, in the colours picked, at the size that will render. #}
+      <figure class="frame" data-caption-preview data-align="{{ values.alignment }}">
+        <div class="frame-inner">
+          <p class="cap">the <span data-caption-word>spoken</span> word</p>
+        </div>
+        <figcaption>1920×1080 — position, colour and size as they will render</figcaption>
+      </figure>
 
       <div class="actions">
         <button type="submit" class="button">Save settings</button>

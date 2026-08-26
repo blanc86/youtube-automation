@@ -62,8 +62,18 @@
     return p;
   }
 
+  // The scan sweep across the two canvases is driven by a data attribute on the
+  // panel wrapper, which sits outside the region these functions rewrite.
+  function setRenderState(panel, state) {
+    var wrapper = panel.closest(".render");
+    if (!wrapper) return;
+    if (state) wrapper.dataset.state = state;
+    else delete wrapper.dataset.state;
+  }
+
   function finish(panel, record) {
     var heading = panel.querySelector("h2");
+    setRenderState(panel, null);
     panel.textContent = "";
     if (heading) panel.appendChild(heading);
 
@@ -119,6 +129,7 @@
 
   function showRunning(panel, runningText) {
     var heading = panel.querySelector("h2");
+    setRenderState(panel, "running");
     panel.textContent = "";
     if (heading) panel.appendChild(heading);
     panel.appendChild(spinnerRow(runningText));
@@ -162,19 +173,47 @@
     });
   }
 
-  // -- caption colour preview --------------------------------------------
+  // -- caption preview ----------------------------------------------------
+  //
+  // The frame is 16:9 and its type is sized in cqh, so one unit of --cap-scale
+  // is 1% of frame height. A caption is specified in pixels against a 1080-high
+  // canvas, so the conversion is size / 1080 * 100, i.e. size / 10.8 - which is
+  // why the 54px default lands on 5.
+
+  var CAPTION_CANVAS_HEIGHT = 1080;
+  var DEFAULT_CAPTION_SIZE = 54;
 
   var preview = document.querySelector("[data-caption-preview]");
   if (preview) {
     var primary = document.querySelector("[data-caption-primary]");
     var accent = document.querySelector("[data-caption-accent]");
+    var alignment = document.querySelector("#alignment");
+    var fontSize = document.querySelector("#font_size");
+    var caption = preview.querySelector(".cap");
     var word = preview.querySelector("[data-caption-word]");
-    var apply = function () {
-      preview.style.color = primary.value;
-      word.style.color = accent.value;
+
+    var readout = function (input) {
+      var output = input.parentNode.querySelector("output");
+      if (output) output.textContent = input.value;
     };
-    primary.addEventListener("input", apply);
-    accent.addEventListener("input", apply);
+
+    var apply = function () {
+      caption.style.color = primary.value;
+      word.style.color = accent.value;
+      readout(primary);
+      readout(accent);
+      preview.dataset.align = alignment.value;
+
+      // Blank means "scale per canvas", and this frame is the landscape one.
+      var size = parseFloat(fontSize.value);
+      if (!isFinite(size) || size <= 0) size = DEFAULT_CAPTION_SIZE;
+      caption.style.setProperty("--cap-scale", (size / CAPTION_CANVAS_HEIGHT) * 100);
+    };
+
+    [primary, accent, alignment, fontSize].forEach(function (control) {
+      control.addEventListener("input", apply);
+      control.addEventListener("change", apply);
+    });
     apply();
   }
 })();

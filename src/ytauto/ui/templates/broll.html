@@ -35,12 +35,12 @@
     <div class="field-row">
       <div>
         <label for="attribution">Attribution</label>
-        <input id="attribution" name="attribution" type="text"
+        <input id="attribution" name="attribution" type="text" class="prose"
                value="{{ form.attribution if form else '' }}" />
       </div>
       <div>
         <label for="notes">Notes</label>
-        <input id="notes" name="notes" type="text" value="{{ form.notes if form else '' }}" />
+        <input id="notes" name="notes" type="text" class="prose" value="{{ form.notes if form else '' }}" />
       </div>
     </div>
 
@@ -49,16 +49,18 @@
     </div>
   </form>
 
-  <section class="panel" id="broll-status"
-           data-poll-url="{{ url_for('task_status', task_id='TASK_ID') }}"
-           {% if pending_task %}data-task-id="{{ pending_task.id }}"{% endif %}>
-    {% if pending_task %}
+  {# Only when something is actually in flight: an empty panel is a blank box
+     the reader has to work out the meaning of. #}
+  {% if pending_task %}
+    <section class="panel" id="broll-status"
+             data-poll-url="{{ url_for('task_status', task_id='TASK_ID') }}"
+             data-task-id="{{ pending_task.id }}">
       <p class="status running">
         <span class="spinner" aria-hidden="true"></span>
         Adding {{ pending_task.label }} — transcoding to both canvases.
       </p>
-    {% endif %}
-  </section>
+    </section>
+  {% endif %}
 
   {% if clips %}
     <table>

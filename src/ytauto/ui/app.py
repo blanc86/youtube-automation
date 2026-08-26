@@ -116,6 +116,11 @@ def create_app(paths: AppPaths, *, tasks: TaskManager | None = None) -> Flask:
     # random key is right: it costs nothing, and the only consequence of it
     # changing is that a flash message does not survive a restart.
     app.secret_key = secrets.token_bytes(32)
+    # Never cache the stylesheet or the script. Flask's twelve-hour default is
+    # for servers with many users and a CDN; this serves one person off local
+    # disk, where the only thing that default can do is hand them yesterday's
+    # CSS after they pull. The request cost is a file read.
+    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
     app.config["YTAUTO_PATHS"] = paths
     app.config["YTAUTO_TASKS"] = tasks if tasks is not None else TaskManager()
 

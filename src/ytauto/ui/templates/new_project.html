@@ -10,7 +10,7 @@
   <div class="split">
     <form method="post" action="{{ url_for('create') }}" class="panel">
       <label for="title">Title</label>
-      <input id="title" name="title" type="text" value="{{ title }}" required
+      <input id="title" name="title" type="text" class="prose" value="{{ title }}" required
              autocomplete="off" placeholder="The Ghost Train" />
       <p class="hint">The slug is derived from this, and made unique automatically.</p>
 

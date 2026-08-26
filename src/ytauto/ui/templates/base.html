@@ -8,7 +8,15 @@
   </head>
   <body>
     <header class="topbar">
-      <a class="wordmark" href="{{ url_for('index') }}">ytauto</a>
+      <a class="wordmark" href="{{ url_for('index') }}">
+        {# Two rectangles at true 16:9 and 9:16, sharing a baseline: every
+           project leaves here as both. #}
+        <svg class="mark" viewBox="0 0 25 14" aria-hidden="true">
+          <rect x="0.5" y="2.5" width="16" height="9" rx="1" />
+          <rect x="18.5" y="2.5" width="5.0625" height="9" rx="1" />
+        </svg>
+        <span>ytauto</span>
+      </a>
       <nav>
         <a href="{{ url_for('index') }}" {% if nav == 'projects' %}class="current"{% endif %}>Projects</a>
         <a href="{{ url_for('broll') }}" {% if nav == 'broll' %}class="current"{% endif %}>B-roll</a>

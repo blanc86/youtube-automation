@@ -1,27 +1,52 @@
 /* ytauto local UI.
  *
  * Dark, because this sits next to a video editor and a white page beside a
- * timeline is a flashbang. One accent colour (--accent), used for the primary
- * action and for the caption preview's spoken word - the same amber the
- * default caption style actually renders, so the preview is not a lie. No
- * gradients, no webfonts, no icon set: everything here is a system font and a
- * border.
+ * timeline is a flashbang.
+ *
+ * TWO COLOURS, ONE RULE. Teal is the interface talking: primary actions, focus
+ * rings, the live state. Amber is the *video* talking - it is the exact amber
+ * the default caption style renders, so it appears only on caption controls and
+ * in the caption preview. Never mix them. If something is amber it is a
+ * statement about the finished file, not about this page.
+ *
+ * (Teal against amber is the colour grade of half the footage on YouTube. Here
+ * it is load-bearing rather than decorative, which is the only excuse for it.)
+ *
+ * THE MARK is two rectangles, 16:9 and 9:16, sharing a baseline - because this
+ * tool renders every project twice, once per canvas, and that is the single
+ * fact that distinguishes it from every other little web form.
+ *
+ * No webfonts, deliberately: this is a localhost page that must paint instantly
+ * with the network unplugged. The character comes from setting the monospace
+ * face as the utility voice - labels, slugs, dimensions, paths, states - the
+ * way a slate or an EDL is set.
  */
 
 :root {
-  --bg: #16181c;
-  --surface: #1e2126;
-  --surface-raised: #23272d;
-  --border: #2f343c;
-  --text: #e6e8eb;
-  --muted: #949ba6;
-  --accent: #e3a04a;
-  --accent-ink: #1a1408;
+  --bg: #0e0f11;
+  --panel: #15171a;
+  --raised: #1b1e22;
+  --line: #272b31;
+  --line-soft: #1f2328;
+  --ink: #e9ebec;
+  --muted: #868e97;
+  --dim: #5f666e;
+
+  --live: #45c4b0;
+  --live-ink: #05201c;
+  --live-glow: rgba(69, 196, 176, 0.16);
+
+  --caption: #e3a04a;
+
   --ok: #6fbf73;
   --bad: #e2695f;
 
-  --radius: 6px;
-  --gap: 20px;
+  --radius: 9px;
+  --radius-sm: 5px;
+  --gap: 18px;
+
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
 * {
@@ -35,107 +60,160 @@ html {
 body {
   margin: 0;
   background: var(--bg);
-  color: var(--text);
-  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: var(--ink);
+  font: 15px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
 }
 
 code,
 pre,
 .output-dir {
-  font-family: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
-  font-size: 0.92em;
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--live);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 
 /* -- chrome -------------------------------------------------------------- */
 
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
-  align-items: baseline;
-  gap: 28px;
-  padding: 16px 32px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  align-items: center;
+  gap: 32px;
+  padding: 0 28px;
+  height: 56px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
 }
 
 .wordmark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 14px;
   font-weight: 600;
-  letter-spacing: 0.02em;
-  color: var(--text);
+  letter-spacing: 0.06em;
+  color: var(--ink);
   text-decoration: none;
+}
+
+/* The two canvases this tool always emits, at true proportion. */
+.mark {
+  width: 26px;
+  height: 15px;
+  flex: none;
+  overflow: visible;
+  fill: none;
+  stroke: var(--live);
+  stroke-width: 1.1;
 }
 
 .topbar nav {
   display: flex;
-  gap: 20px;
+  gap: 4px;
 }
 
 .topbar nav a {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
   color: var(--muted);
   text-decoration: none;
-  padding-bottom: 2px;
+  transition: color 0.12s ease, background 0.12s ease;
 }
 
 .topbar nav a:hover {
-  color: var(--text);
+  color: var(--ink);
+  background: var(--raised);
 }
 
 .topbar nav a.current {
-  color: var(--text);
-  border-bottom: 2px solid var(--accent);
+  color: var(--ink);
+  background: var(--raised);
+  box-shadow: inset 0 0 0 1px var(--line);
 }
 
 main {
-  max-width: 1180px;
+  max-width: 1120px;
   margin: 0 auto;
-  padding: 32px;
+  padding: 34px 28px 72px;
 }
+
+/* -- headings ------------------------------------------------------------ */
 
 .page-head {
   display: flex;
-  align-items: flex-start;
+  align-items: flex-end;
   justify-content: space-between;
   gap: var(--gap);
-  margin-bottom: 28px;
+  padding-bottom: 20px;
+  margin-bottom: 26px;
+  border-bottom: 1px solid var(--line-soft);
 }
 
 h1 {
-  font-size: 24px;
-  font-weight: 600;
+  font-size: 27px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
   margin: 0;
 }
 
-h2 {
-  font-size: 15px;
+h2,
+h3 {
+  font-family: var(--mono);
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
+  letter-spacing: 0.14em;
+  color: var(--dim);
   margin: 0 0 14px;
 }
 
 h3 {
-  font-size: 13px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  margin: 26px 0 12px;
-  padding-top: 18px;
-  border-top: 1px solid var(--border);
+  margin: 26px 0 14px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line-soft);
 }
 
 .page-head h1 + .muted {
-  margin: 4px 0 0;
+  margin: 6px 0 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+
+.page-head h1 + .muted code {
+  font-size: 1em;
 }
 
 /* -- panels and layout --------------------------------------------------- */
 
 .panel {
-  background: var(--surface);
-  border: 1px solid var(--border);
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 22px 24px;
+  padding: 20px 22px 22px;
   margin-bottom: var(--gap);
+}
+
+/* A one-pixel highlight along the top edge: the panel catches the light. */
+.panel::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.055), transparent);
+  pointer-events: none;
 }
 
 .split {
@@ -149,22 +227,16 @@ h3 {
   margin-bottom: 0;
 }
 
-@media (max-width: 900px) {
-  .split {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
 .field-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 16px;
+  gap: 14px;
 }
 
 .actions {
   display: flex;
   gap: 10px;
-  margin-top: 18px;
+  margin-top: 20px;
 }
 
 /* -- form controls ------------------------------------------------------- */
@@ -172,7 +244,11 @@ h3 {
 label {
   display: block;
   margin: 16px 0 6px;
-  font-size: 13px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
   color: var(--muted);
 }
 
@@ -188,70 +264,134 @@ textarea {
   width: 100%;
   padding: 9px 11px;
   background: var(--bg);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
   font: inherit;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+/* Machine values - voice names, rates, paths, seeds - are set in mono, where a
+ * stray character is visible. Anything a person writes in their own words gets
+ * the reading face back. */
+input[type="text"],
+input[type="number"],
+select {
+  font-family: var(--mono);
+  font-size: 13.5px;
+}
+
+input.prose {
+  font-family: var(--sans);
+  font-size: 14.5px;
 }
 
 textarea {
   resize: vertical;
-  line-height: 1.6;
+  line-height: 1.65;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--dim);
+}
+
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: #343a42;
 }
 
 input:focus,
 select:focus,
 textarea:focus {
-  outline: 2px solid var(--accent);
-  outline-offset: -1px;
-  border-color: var(--accent);
+  outline: none;
+  border-color: var(--live);
+  box-shadow: 0 0 0 3px var(--live-glow);
 }
 
-input[type="color"] {
-  width: 100%;
-  height: 38px;
-  padding: 3px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+/* Caption controls are the video's business, so they answer in amber. A colour
+ * is a small sample beside its hex, not a slab - it is an input, not the point
+ * of the page. */
+.swatch {
+  display: flex;
+  align-items: center;
+  gap: 11px;
 }
 
-.hint {
-  margin: 6px 0 0;
-  font-size: 13px;
+.swatch output {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   color: var(--muted);
 }
 
-.button {
-  display: inline-block;
-  padding: 9px 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface-raised);
-  color: var(--text);
-  font: inherit;
-  text-decoration: none;
+input[type="color"] {
+  width: 58px;
+  height: 34px;
+  flex: none;
+  padding: 3px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
+input[type="color"]:focus {
+  border-color: var(--caption);
+  box-shadow: 0 0 0 3px rgba(227, 160, 74, 0.16);
+}
+
+.hint {
+  margin: 7px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+/* -- buttons ------------------------------------------------------------- */
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--raised);
+  color: var(--ink);
+  font: 500 14px/1 var(--sans);
+  text-decoration: none;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease, transform 0.06s ease;
+}
+
 .button:hover {
-  border-color: var(--muted);
+  border-color: #3b424b;
+  background: #21252a;
+}
+
+.button:active {
+  transform: translateY(1px);
 }
 
 .button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-ink);
-  font-weight: 600;
+  background: var(--live);
+  border-color: var(--live);
+  color: var(--live-ink);
+  font-weight: 650;
 }
 
 .button.primary:hover {
-  filter: brightness(1.08);
+  background: #55d3be;
+  border-color: #55d3be;
 }
 
 .button[disabled] {
-  opacity: 0.55;
+  opacity: 0.45;
   cursor: default;
+  transform: none;
 }
 
 /* -- tables -------------------------------------------------------------- */
@@ -259,55 +399,66 @@ input[type="color"] {
 table {
   width: 100%;
   border-collapse: collapse;
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: var(--panel);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   overflow: hidden;
+  font-variant-numeric: tabular-nums;
 }
 
 th {
   text-align: left;
-  font-size: 12px;
+  font-family: var(--mono);
+  font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  padding: 12px 18px;
-  border-bottom: 1px solid var(--border);
+  letter-spacing: 0.13em;
+  color: var(--dim);
+  padding: 13px 18px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
 }
 
 td {
-  padding: 13px 18px;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top;
+  padding: 15px 18px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: middle;
 }
 
 tbody tr:last-child td {
   border-bottom: none;
 }
 
+tbody tr {
+  transition: background 0.1s ease;
+}
+
 tbody tr:hover {
-  background: var(--surface-raised);
+  background: var(--raised);
 }
 
 td a {
-  color: var(--text);
+  color: var(--ink);
+  font-weight: 550;
   text-decoration: none;
-  border-bottom: 1px solid var(--border);
 }
 
 td a:hover {
-  border-bottom-color: var(--accent);
+  color: var(--live);
+}
+
+td code {
+  color: var(--muted);
 }
 
 .truncate {
-  max-width: 320px;
+  max-width: 300px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* -- status ------------------------------------------------------------- */
+/* -- status -------------------------------------------------------------- */
 
 .muted {
   color: var(--muted);
@@ -315,54 +466,63 @@ td a:hover {
 
 .empty {
   color: var(--muted);
-  padding: 40px 0;
+  padding: 56px 24px;
   text-align: center;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
 }
 
 .empty a,
 main p a {
-  color: var(--accent);
+  color: var(--live);
 }
 
 .state {
-  font-size: 12px;
-  letter-spacing: 0.04em;
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
-  padding: 3px 8px;
+  padding: 4px 9px;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   color: var(--muted);
 }
 
 .state-succeeded {
   color: var(--ok);
-  border-color: var(--ok);
+  border-color: rgba(111, 191, 115, 0.4);
+  background: rgba(111, 191, 115, 0.08);
 }
 
 .state-failed {
   color: var(--bad);
-  border-color: var(--bad);
+  border-color: rgba(226, 105, 95, 0.4);
+  background: rgba(226, 105, 95, 0.08);
 }
 
 .state-running {
-  color: var(--accent);
-  border-color: var(--accent);
+  color: var(--live);
+  border-color: rgba(69, 196, 176, 0.4);
+  background: var(--live-glow);
 }
 
 .banner {
-  padding: 12px 16px;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: var(--surface);
+  padding: 13px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  background: var(--panel);
   margin: 0 0 var(--gap);
 }
 
 .banner-success {
-  border-color: var(--ok);
+  border-left-color: var(--ok);
 }
 
 .banner-error {
-  border-color: var(--bad);
+  border-left-color: var(--bad);
 }
 
 .status {
@@ -382,21 +542,23 @@ main p a {
 
 /* The one thing the user most needs to be able to find afterwards. */
 .output-dir {
-  margin: 10px 0 0;
+  margin: 12px 0 0;
   padding: 12px 14px;
   background: var(--bg);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius);
-  color: var(--text);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--live);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
   word-break: break-all;
   user-select: all;
+  cursor: text;
 }
 
 .spinner {
   width: 13px;
   height: 13px;
-  border: 2px solid var(--border);
-  border-top-color: var(--accent);
+  border: 2px solid var(--line);
+  border-top-color: var(--live);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
   flex: none;
@@ -408,9 +570,83 @@ main p a {
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .spinner {
-    animation-duration: 3s;
+/* -- the render panel and its two canvases ------------------------------- */
+
+.render {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+}
+
+.render-body {
+  min-width: 0;
+  flex: 1;
+}
+
+/* What this project emits: always two files, always these two shapes. They
+ * share a baseline at their true proportions, so the vertical stands taller -
+ * which is the honest picture of what comes out. */
+.canvas-pair {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  flex: none;
+}
+
+.canvas-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.canvas-slot span {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.canvas {
+  position: relative;
+  border: 1px solid #3a414a;
+  border-radius: 3px;
+  background: linear-gradient(158deg, #22262c, #101317);
+  overflow: hidden;
+}
+
+.canvas-landscape {
+  height: 50px;
+  aspect-ratio: 16 / 9;
+}
+
+.canvas-vertical {
+  height: 78px;
+  aspect-ratio: 9 / 16;
+}
+
+/* A scan sweep while the encoder is working, and only then. */
+.render[data-state="running"] .canvas {
+  border-color: rgba(69, 196, 176, 0.45);
+}
+
+.render[data-state="running"] .canvas::after {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 40%;
+  background: linear-gradient(180deg, transparent, var(--live-glow));
+  animation: sweep 1.9s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0% {
+    transform: translateY(-100%);
+  }
+  100% {
+    transform: translateY(250%);
   }
 }
 
@@ -419,26 +655,155 @@ main p a {
 .prompt {
   margin: 14px 0 0;
   padding: 16px;
-  max-height: 460px;
+  max-height: 440px;
   overflow: auto;
   background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
   white-space: pre-wrap;
   color: var(--muted);
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 /* -- caption preview ----------------------------------------------------- */
+/*
+ * Not a swatch - a viewport. The frame is 16:9, the caption sits in the cell
+ * the alignment dropdown actually selects, and the type is sized as a real
+ * percentage of frame height (the 54px default is 5% of 1080). What you see
+ * here is where the words land.
+ */
 
-.caption-preview {
-  margin: 22px 0 0;
-  padding: 20px;
-  text-align: center;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font-size: 20px;
+.frame {
+  margin: 24px 0 0;
+}
+
+.frame-inner {
+  aspect-ratio: 16 / 9;
+  container-type: size;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  /* No padding: 1cqh must map to 1% of the *whole* frame, or the type here
+     lies about its size. The safe area belongs to the caption instead. */
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  /* Dim, but unmistakably a picture rather than a hole: a light source off to
+     one side and the corners falling away, the way a graded frame does. It
+     stands in for footage without pretending to be any. */
+  background:
+    radial-gradient(78% 78% at 50% 50%, transparent 38%, rgba(0, 0, 0, 0.55) 100%),
+    radial-gradient(95% 80% at 26% 12%, #3b424b 0%, transparent 66%),
+    linear-gradient(158deg, #22262c 0%, #101317 100%);
+}
+
+.cap {
+  margin: 0;
+  padding: 0 4%;
+  font-size: 17px;
+  font-size: calc(var(--cap-scale, 5) * 1cqh);
   font-weight: 700;
-  letter-spacing: 0.01em;
+  line-height: 1.25;
+  letter-spacing: 0.005em;
+  text-shadow: 0 2px 5px rgba(0, 0, 0, 0.85);
+  color: #ffffff;
+}
+
+.frame-inner .cap {
+  grid-row: 2;
+  grid-column: 1 / 4;
+  align-self: center;
+  text-align: center;
+}
+
+/* Top and bottom keep libass's vertical margin off the frame edge. */
+.frame[data-align="7"] .cap,
+.frame[data-align="8"] .cap,
+.frame[data-align="9"] .cap {
+  grid-row: 1;
+  align-self: start;
+  margin-top: 3.5%;
+}
+
+.frame[data-align="1"] .cap,
+.frame[data-align="2"] .cap,
+.frame[data-align="3"] .cap {
+  grid-row: 3;
+  align-self: end;
+  margin-bottom: 3.5%;
+}
+
+.frame[data-align="7"] .cap,
+.frame[data-align="4"] .cap,
+.frame[data-align="1"] .cap {
+  grid-column: 1 / 3;
+  text-align: left;
+}
+
+.frame[data-align="9"] .cap,
+.frame[data-align="6"] .cap,
+.frame[data-align="3"] .cap {
+  grid-column: 2 / 4;
+  text-align: right;
+}
+
+.frame figcaption {
+  margin-top: 9px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+
+/* -- responsive ---------------------------------------------------------- */
+
+@media (max-width: 900px) {
+  .split,
+  .field-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .render {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 26px;
+  }
+
+  .canvas-pair {
+    justify-content: flex-start;
+  }
+
+  .page-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+  }
+}
+
+@media (max-width: 560px) {
+  main {
+    padding: 24px 16px 56px;
+  }
+
+  .topbar {
+    padding: 0 16px;
+    gap: 18px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .spinner {
+    animation: spin 3s linear infinite !important;
+  }
+
+  .render[data-state="running"] .canvas::after {
+    animation: none;
+    opacity: 0.5;
+    transform: translateY(150%);
+  }
 }
