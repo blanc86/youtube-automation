@@ -111,6 +111,41 @@
         </div>
       </div>
 
+      <h3>Music</h3>
+      {% if tracks %}
+        <div class="field-row">
+          <div>
+            <label for="music_track_id">Track</label>
+            <select id="music_track_id" name="music_track_id">
+              <option value="" {% if not values.music_track_id %}selected{% endif %}>No music</option>
+              {% for track in tracks %}
+                <option value="{{ track.id }}" {% if track.id == values.music_track_id %}selected{% endif %}>
+                  {{ track.title }} ({{ '%.0f'|format(track.duration_s) }}s)
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label for="music_gain_db">Volume</label>
+            <div class="slider">
+              <input id="music_gain_db" name="music_gain_db" type="range"
+                     min="-40" max="0" step="1" value="{{ values.music_gain_db }}"
+                     data-music-gain />
+              <output for="music_gain_db">{{ values.music_gain_db }} dB</output>
+            </div>
+          </div>
+        </div>
+        <p class="hint">
+          Applied to the bed alone — the narration keeps its level whatever this says.
+          Short tracks loop; every track fades out at the end.
+        </p>
+      {% else %}
+        <p class="hint">
+          No tracks in the library yet. <a href="{{ url_for('music') }}">Add one</a> to put a
+          bed under this narration.
+        </p>
+      {% endif %}
+
       <h3>Captions</h3>
       <div class="field-row">
         <div>

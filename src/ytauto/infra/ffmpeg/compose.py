@@ -53,6 +53,71 @@ class ComposeClip:
     duration_s: float
 
 
+@dataclass(frozen=True)
+class MusicBed:
+    """An optional music track to mix in under the narration.
+
+    ``gain_db`` is applied to the music alone - the narration is never
+    touched - so it is an absolute statement about how loud the bed sits,
+    independent of the voice. Negative values are the ordinary case; the
+    default the project seeds is -18 dB, which is roughly where a bed sits
+    under speech without fighting it.
+
+    ``fade_out_s`` is the tail fade applied at the end of the mix. Music that
+    stops dead on the last frame is the single most noticeable artefact of a
+    naively muxed bed, and the fix is one filter, so it is not optional.
+    """
+
+    path: Path
+    gain_db: float
+    total_duration_s: float
+    fade_out_s: float = 1.5
+
+
+def _audio_graph(narration_index: int, music: MusicBed | None) -> tuple[str, str]:
+    """Build the audio half of the filter graph, and name its output pad.
+
+    With no music this is empty and the caller maps the narration stream
+    directly, exactly as it did before music existed - a project with no bed
+    produces the identical argument vector it always has.
+
+    With music, three details are load-bearing and each is silent when wrong:
+
+    ``normalize=0`` on ``amix``. ffmpeg's default is ``normalize=1``, which
+    divides every input by the number of inputs - so simply adding a bed
+    would halve the narration's volume, and the operator would hear a quieter
+    voice and reasonably conclude the *music* setting was too loud. With
+    normalisation off, ``volume`` is the only thing that changes a level, and
+    it is applied to the music alone.
+
+    ``duration=first``. The narration is the first input, so the mix ends
+    when the voice ends rather than running to the end of a bed that may be
+    minutes longer. This is what makes the caller's ``-stream_loop -1`` safe:
+    the music repeats indefinitely so a short track still covers a long
+    video, and this is the thing that stops it. Nothing here may pad the
+    narration - ``apad`` would make the first input infinite too, and then
+    the mix has no defined end at all and only ``-shortest`` saves it.
+
+    The tail fade is computed against the *video's* duration, not the
+    narration's. Those differ by design: the video ends at the last word
+    (Task 7), while narration.mp3 can carry trailing silence past it, and
+    ``-shortest`` cuts the mux at the video. Fading against the video is
+    therefore fading against what someone actually watches.
+    """
+    if music is None:
+        return "", f"{narration_index}:a"
+
+    music_index = narration_index + 1
+    fade_start = max(0.0, music.total_duration_s - music.fade_out_s)
+    graph = (
+        f"[{music_index}:a]volume={music.gain_db}dB,"
+        f"afade=t=out:st={fade_start:.3f}:d={music.fade_out_s}[bed];"
+        f"[{narration_index}:a][bed]"
+        "amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+    )
+    return graph, "[aout]"
+
+
 def _scale_pad(width: int, height: int) -> str:
     """The same scale-then-pad chain ``infra.broll.normalise_clip`` uses.
 
@@ -79,6 +144,7 @@ def compose_args(
     width: int,
     height: int,
     encoder: str,
+    music: MusicBed | None = None,
 ) -> list[str]:
     """Build the full ffmpeg argument vector for one compose pass. Pure.
 
@@ -128,6 +194,12 @@ def compose_args(
             str(clip.path),
         ]
     args += ["-i", str(audio_path)]
+    if music is not None:
+        # -stream_loop applies to the input that follows it, and must precede
+        # that input's own -i. -1 is "repeat forever": a 30-second bed under a
+        # three-minute video is the ordinary case, and the mix's
+        # duration=first is what bounds it again.
+        args += ["-stream_loop", "-1", "-i", str(music.path)]
 
     clip_count = len(clips)
     scale_pad = _scale_pad(width, height)
@@ -136,6 +208,9 @@ def compose_args(
     graph = (
         f"{per_clip};{concat_inputs}concat=n={clip_count}:v=1:a=0[vcat];[vcat]ass={ass_path}[vout]"
     )
+    audio_graph, audio_map = _audio_graph(clip_count, music)
+    if audio_graph:
+        graph = f"{graph};{audio_graph}"
 
     args += [
         "-filter_complex",
@@ -143,7 +218,7 @@ def compose_args(
         "-map",
         "[vout]",
         "-map",
-        f"{clip_count}:a",
+        audio_map,
         "-c:v",
         encoder,
         "-pix_fmt",

@@ -47,6 +47,7 @@ from ytauto.core.errors import ValidationError
 from ytauto.core.models.content_hash import ContentHash, hash_bytes
 from ytauto.infra.broll import BrollLibrary
 from ytauto.infra.cas.store import CasStore
+from ytauto.infra.music import MusicLibrary
 
 _STORY_KIND = "text"
 
@@ -64,6 +65,14 @@ DEFAULT_SETTINGS: Mapping[str, object] = MappingProxyType(
         # compose_landscape / compose_vertical
         "caption_style": {},
         "encoder": "auto",
+        # Music bed. "" means no music, which is the default: a video with no
+        # bed is a complete video, and a track that has to be chosen before
+        # anything renders would be a step in the way of the common case.
+        "music_track_id": "",
+        # Applied to the bed alone, never to the narration - see
+        # infra.ffmpeg.compose.MusicBed. -18 dB is roughly where a bed sits
+        # under speech without competing with it.
+        "music_gain_db": -18.0,
     }
 )
 """The settings template ``create_project`` seeds, so a project created
@@ -89,10 +98,21 @@ computes both from the story it was handed) and ``broll_manifest_digest``
 (derived from the global, mutable B-roll library - see
 ``refresh_run_settings``)."""
 
+DERIVED_SETTINGS: tuple[str, ...] = ("broll_manifest_digest", "music_digest")
+"""Required to run, but deliberately absent from a freshly created project:
+both are re-derived per run by ``refresh_run_settings`` from state that
+changes underneath the project - the global B-roll library, and the music
+library row a project's ``music_track_id`` points at.
+
+Named here rather than spelled out at each use because the set grows: it was
+one key, is now two, and every place that has to say "everything except the
+derived ones" - ``create_project``'s own tests included - was carrying its own
+literal copy that had to be remembered separately."""
+
 REQUIRED_SETTINGS: tuple[str, ...] = (
     "story_digest",
     "story_path",
-    "broll_manifest_digest",
+    *DERIVED_SETTINGS,
     *DEFAULT_SETTINGS,
 )
 """Every settings key some stage reads with a bare ``ctx.settings[...]``
@@ -154,6 +174,15 @@ def validate_settings(settings: Mapping[str, object]) -> None:
     for key in ("story_digest", "broll_manifest_digest"):
         if key in settings:
             _require_str(settings, key)
+    # The two music keys are strings that are *legitimately* empty - "" is how
+    # "no bed" is spelled, and it is the default. _require_str rejects empty
+    # strings by design, so these get their own check: the type must be right,
+    # the emptiness must not be an error.
+    for key in ("music_track_id", "music_digest"):
+        if key in settings and not isinstance(settings[key], str):
+            raise ValidationError(
+                f"setting {key!r} must be a string (empty means no music), got {settings[key]!r}"
+            )
     if "seed" in settings:
         _require_int(settings, "seed")
     if "caption_style" in settings and not isinstance(settings["caption_style"], Mapping):
@@ -181,6 +210,19 @@ def validate_settings(settings: Mapping[str, object]) -> None:
                 "setting 'words_per_group_max' must be at least "
                 f"'words_per_group_min', got max={group_max} < "
                 f"min={settings['words_per_group_min']!r}"
+            )
+
+    if "music_gain_db" in settings:
+        gain = _require_number(settings, "music_gain_db")
+        # A bed above the narration is never what anyone means, and ffmpeg
+        # will happily clip the mix if asked. The ceiling is 0 dB (the track
+        # at its own recorded level); the floor is where it stops being
+        # audible at all, and below that the honest setting is no track.
+        if not (-60.0 <= gain <= 0.0):
+            raise ValidationError(
+                f"setting 'music_gain_db' must be between -60 and 0, got {gain} "
+                "- positive gain drives the mix into clipping, and below -60 dB "
+                "the bed is inaudible; to remove it, clear 'music_track_id'"
             )
 
     if "segment_seconds_min" in settings:
@@ -376,6 +418,22 @@ def refresh_run_settings(
     projects = ProjectService(conn)
     settings = projects.settings_for(project_id)
 
+    # Backfill any key added to DEFAULT_SETTINGS since this project was
+    # created. Without this, adding a setting to the template retroactively
+    # breaks every project already on disk: require_runnable_settings below
+    # fails on the absent key, and `ytauto run` refuses a project that
+    # rendered fine yesterday, with a message about hand-edited settings that
+    # is simply untrue. Seeding the documented default is what an upgrade
+    # should mean - it is the value a project created today would have.
+    #
+    # Only absent keys are touched, so a deliberately changed value is never
+    # reverted; and the whole thing is a no-op for a project created after
+    # the key existed.
+    for key, default in DEFAULT_SETTINGS.items():
+        if key not in settings:
+            projects.set_setting(project_id, key, default)
+    settings = projects.settings_for(project_id)
+
     story_path = settings.get("story_path")
     if not isinstance(story_path, str) or not story_path.strip():
         raise ValidationError(
@@ -386,6 +444,23 @@ def refresh_run_settings(
 
     manifest_digest = BrollLibrary(conn, cas).write_manifest()
     projects.set_setting(project_id, "broll_manifest_digest", str(manifest_digest))
+
+    # `music_track_id` names a row; the compose stages run in worker processes
+    # that hold a CasStore and no database connection, so the id is resolved
+    # to a digest here - the same shape as the B-roll manifest above, and for
+    # the same reason.
+    track_id = str(settings.get("music_track_id", "") or "")
+    if track_id:
+        digest = MusicLibrary(conn, cas).digest_for(track_id)
+        if digest is None:
+            raise ValidationError(
+                f"this project's music_track_id ({track_id!r}) is not in the music "
+                "library - it was probably removed after the project selected it. "
+                "Choose another track, or clear the setting to render without a bed."
+            )
+        projects.set_setting(project_id, "music_digest", str(digest))
+    else:
+        projects.set_setting(project_id, "music_digest", "")
 
     fresh = projects.settings_for(project_id)
     require_runnable_settings(fresh)

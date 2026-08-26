@@ -71,6 +71,7 @@ from ytauto.infra.broll import BrollLibrary
 from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
+from ytauto.infra.music import MusicLibrary, MusicTrack
 from ytauto.infra.paths import AppPaths, resolve_output_dir
 from ytauto.ui import script_prompt
 from ytauto.ui.settings_form import ALIGNMENTS, FormError, form_values, parse_form
@@ -350,6 +351,54 @@ def _register_routes(app: Flask) -> None:
             400,
         )
 
+    @app.get("/music")
+    def music() -> str:
+        return render_template("music.html", tracks=_music_rows(_conn()))
+
+    @app.post("/music")
+    def add_music() -> ResponseReturnValue:
+        """Synchronous, unlike `add_broll`.
+
+        Adding a clip transcodes it twice and takes a minute, which is why
+        that route hands off to a background task and polls. A track is
+        hashed, probed and copied - no encode at all - so it finishes inside
+        the request and a task record would be machinery with nothing to
+        report.
+        """
+        form = request.form
+        path = form.get("path", "").strip()
+        source_url = form.get("source_url", "").strip()
+        licence = form.get("licence", "").strip()
+        error = None
+        if not path:
+            error = "A path to the audio file is required."
+        elif not source_url:
+            error = "A source URL is required - it is half of the provenance record."
+        elif not licence:
+            error = "A licence is required - it is the other half."
+        if error is None:
+            conn = _conn()
+            try:
+                MusicLibrary(conn, _cas(conn)).add(
+                    Path(path).expanduser(),
+                    source_url=source_url,
+                    licence=licence,
+                    title=form.get("title", "").strip(),
+                    attribution=form.get("attribution", "").strip(),
+                    notes=form.get("notes", "").strip(),
+                )
+            except ValidationError as exc:
+                error = str(exc)
+            except OSError as exc:
+                error = f"Could not read that file: {exc}"
+            else:
+                flash("Track added.", "success")
+                return redirect(url_for("music"))
+        return (
+            render_template("music.html", tracks=_music_rows(_conn()), error=error, form=form),
+            400,
+        )
+
     # -- helpers that need the app context --------------------------------
 
     def _render_project_page(
@@ -374,6 +423,7 @@ def _register_routes(app: Flask) -> None:
             story=story,
             values=form_values(settings),
             alignments=ALIGNMENTS,
+            tracks=_music_rows(conn),
             last_job=_last_job(conn, project_id),
             render_task=_tasks().for_key(_render_key(project_id)),
             error=error,
@@ -410,6 +460,9 @@ def _register_routes(app: Flask) -> None:
             raise RenderFailed(f"{message} {outcome.detail}".strip())
 
         return _tasks().submit(key=_render_key(project_id), kind="render", label=slug, work=work)
+
+    def _music_rows(conn: sqlite3.Connection) -> Sequence[MusicTrack]:
+        return MusicLibrary(conn, _cas(conn)).list_tracks()
 
     def _start_broll_add(
         *, path: Path, source_url: str, licence: str, attribution: str, notes: str

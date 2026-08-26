@@ -36,7 +36,7 @@ from ytauto.core.pipeline.graph import Pipeline
 from ytauto.core.pipeline.stage import JobContext, ProgressFn, StageResult
 from ytauto.infra.artifacts import ArtifactStore
 from ytauto.infra.cas.store import CasStore
-from ytauto.infra.db.engine import connect
+from ytauto.infra.db.engine import connect, transaction
 from ytauto.infra.paths import AppPaths
 from ytauto.ui.app import create_app
 from ytauto.ui.tasks import TaskManager
@@ -592,3 +592,70 @@ def test_a_project_that_has_never_run_says_so(client: FlaskClient) -> None:
     _create(client, title="Fresh")
 
     assert "never run" in client.get("/").data.decode("utf-8")
+
+
+# -- the music library --------------------------------------------------------
+
+
+def _seed_track(conn: sqlite3.Connection, track_id: str = "t1", title: str = "Slow Pulse") -> None:
+    with transaction(conn, immediate=True):
+        conn.execute(
+            """
+            INSERT INTO music_tracks (id, source_digest, duration_s, title,
+                                      source_url, licence, attribution, notes, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, '', '', ?)
+            """,
+            (
+                track_id,
+                "b" * 64,
+                42.0,
+                title,
+                "https://example.com/t",
+                "CC0",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+
+
+def test_the_music_page_lists_the_library(client: FlaskClient, db_conn: sqlite3.Connection) -> None:
+    _seed_track(db_conn)
+    body = client.get("/music").get_data(as_text=True)
+    assert "Slow Pulse" in body
+    assert "CC0" in body
+
+
+def test_adding_a_track_without_a_licence_is_refused_with_a_message(
+    client: FlaskClient,
+) -> None:
+    """The provenance record is the point, and a browser must be told why in
+    words rather than by a stack trace."""
+    response = client.post(
+        "/music", data={"path": "x.mp3", "source_url": "https://e/x", "licence": ""}
+    )
+    assert response.status_code == 400
+    assert "licence is required" in response.get_data(as_text=True)
+
+
+def test_a_project_offers_no_music_picker_until_the_library_has_something(
+    client: FlaskClient, db_conn: sqlite3.Connection
+) -> None:
+    """An empty dropdown reading only 'No music' is a dead control; the page
+    says where tracks come from instead."""
+    slug = _create(client, title="No Bed")
+    body = client.get(f"/projects/{slug}").get_data(as_text=True)
+    assert 'id="music_track_id"' not in body
+    assert "No tracks in the library yet" in body
+
+
+def test_a_project_can_select_a_track_and_the_choice_persists(
+    client: FlaskClient, db_conn: sqlite3.Connection
+) -> None:
+    _seed_track(db_conn)
+    slug = _create(client, title="With A Bed")
+
+    form = _settings_form(music_track_id="t1", music_gain_db="-24")
+    client.post(f"/projects/{slug}/settings", data=form, follow_redirects=True)
+
+    body = client.get(f"/projects/{slug}").get_data(as_text=True)
+    assert 'value="t1" selected' in body.replace("  ", " ")
+    assert 'value="-24.0"' in body or 'value="-24"' in body

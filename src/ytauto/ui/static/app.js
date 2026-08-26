@@ -173,6 +173,21 @@
     });
   }
 
+  // -- music gain readout -------------------------------------------------
+  //
+  // A number of decibels means nothing as a slider position alone, and the
+  // form posts the raw value either way - this only makes the control legible.
+
+  var gain = document.querySelector("[data-music-gain]");
+  if (gain) {
+    var gainOut = gain.parentNode.querySelector("output");
+    var showGain = function () {
+      gainOut.textContent = gain.value + " dB";
+    };
+    gain.addEventListener("input", showGain);
+    showGain();
+  }
+
   // -- caption preview ----------------------------------------------------
   //
   // The frame is 16:9 and its type is sized in cqh, so one unit of --cap-scale

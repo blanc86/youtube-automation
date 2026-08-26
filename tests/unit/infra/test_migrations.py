@@ -204,11 +204,11 @@ def test_the_claim_index_avoids_a_sort_pass(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_head_version_is_four(tmp_path: Path) -> None:
+def test_head_version_is_five(tmp_path: Path) -> None:
     conn = connect(tmp_path / "t.db")
     apply_migrations(conn)
-    assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 4
-    assert HEAD_VERSION == 4
+    assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 5
+    assert HEAD_VERSION == 5
     conn.close()
 
 
@@ -302,7 +302,7 @@ def test_a_job_inserted_under_v2_is_claimable_after_a_real_upgrade_to_v3(
 
 def test_migration_004_adds_projects_and_broll_clips(db_conn: sqlite3.Connection) -> None:
     apply_migrations(db_conn)
-    assert current_version(db_conn) == 4
+    assert current_version(db_conn) == 5
     tables = {
         r["name"] for r in db_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }

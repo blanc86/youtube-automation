@@ -50,6 +50,10 @@ DEFAULT_ALIGNMENT = 5
 _NUMBER_FIELDS: tuple[str, ...] = ("segment_seconds_min", "segment_seconds_max")
 _INT_FIELDS: tuple[str, ...] = ("seed", "words_per_group_min", "words_per_group_max")
 _TEXT_FIELDS: tuple[str, ...] = ("voice", "rate", "encoder")
+_OPTIONAL_TEXT_FIELDS: tuple[str, ...] = ("music_track_id",)
+"""Text fields whose empty value is meaningful rather than missing: ""
+is how "no music" is spelled. Kept apart from ``_TEXT_FIELDS`` because a
+blank voice or encoder is an error and a blank track id is the default."""
 
 
 class FormError(Exception):
@@ -114,6 +118,14 @@ def parse_form(form: Mapping[str, str], *, current: Mapping[str, object]) -> dic
     parsed: dict[str, object] = {}
     for key in _TEXT_FIELDS:
         parsed[key] = form.get(key, "").strip()
+    for key in _OPTIONAL_TEXT_FIELDS:
+        if key in form:
+            parsed[key] = form[key].strip()
+    # Absent means "this form does not manage the field", so keep what the
+    # project already has - not an error, and not a silent reset to the
+    # template. Present-but-unreadable is still a FormError.
+    if "music_gain_db" in form:
+        parsed["music_gain_db"] = _float_field(form, "music_gain_db")
     for key in _INT_FIELDS:
         parsed[key] = _int_field(form, key)
     for key in _NUMBER_FIELDS:
@@ -170,8 +182,11 @@ def form_values(settings: Mapping[str, object]) -> dict[str, object]:
     """
     style = _current_style(settings)
     values: dict[str, object] = {
-        key: settings.get(key, "") for key in (*_TEXT_FIELDS, *_INT_FIELDS, *_NUMBER_FIELDS)
+        key: settings.get(key, "")
+        for key in (*_TEXT_FIELDS, *_OPTIONAL_TEXT_FIELDS, *_INT_FIELDS, *_NUMBER_FIELDS)
     }
+    gain = settings.get("music_gain_db", -18.0)
+    values["music_gain_db"] = gain if isinstance(gain, int | float) else -18.0
     values["primary_colour"] = ass_to_hex(style.get("primary_colour"), default=DEFAULT_PRIMARY_HEX)
     values["accent_colour"] = ass_to_hex(style.get("accent_colour"), default=DEFAULT_ACCENT_HEX)
     alignment = style.get("alignment", DEFAULT_ALIGNMENT)

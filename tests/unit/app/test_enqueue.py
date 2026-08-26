@@ -23,6 +23,7 @@ those exit codes come from.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -30,6 +31,7 @@ import pytest
 
 from ytauto.app.services.enqueue import (
     DEFAULT_SETTINGS,
+    DERIVED_SETTINGS,
     REQUIRED_SETTINGS,
     create_project,
     refresh_run_settings,
@@ -40,6 +42,7 @@ from ytauto.app.services.enqueue import (
 from ytauto.app.services.projects import ProjectService
 from ytauto.core.errors import ValidationError
 from ytauto.infra.cas.store import CasStore
+from ytauto.infra.db.engine import transaction
 
 # db_conn is defined in tests/unit/conftest.py.
 
@@ -74,14 +77,14 @@ def test_create_project_seeds_every_setting_the_pipeline_reads(
     tmp_path: Path, db_conn: sqlite3.Connection, cas: CasStore
 ) -> None:
     """The one assertion that would have caught Critical 1 at creation time.
-    ``broll_manifest_digest`` is the single exception, supplied per-run by
+    ``DERIVED_SETTINGS`` are the exceptions, supplied per-run by
     ``refresh_run_settings`` - see its own tests below."""
     project_id, _story = _create(db_conn, cas, tmp_path)
 
     settings = ProjectService(db_conn).settings_for(project_id)
 
     missing = [
-        key for key in REQUIRED_SETTINGS if key != "broll_manifest_digest" and key not in settings
+        key for key in REQUIRED_SETTINGS if key not in DERIVED_SETTINGS and key not in settings
     ]
     assert missing == [], f"a created project must be runnable; missing {missing}"
     for key, value in DEFAULT_SETTINGS.items():
@@ -96,6 +99,10 @@ def test_the_seeded_template_is_itself_valid(
     project_id, _story = _create(db_conn, cas, tmp_path)
     settings = ProjectService(db_conn).settings_for(project_id)
     settings["broll_manifest_digest"] = "0" * 64
+    # Empty is what "no music" is spelled as, and it is the default a created
+    # project carries - so the template must validate with it empty, not only
+    # with a track chosen.
+    settings["music_digest"] = ""
 
     require_runnable_settings(settings)  # must not raise
 
@@ -265,4 +272,69 @@ def test_refresh_reports_a_project_with_no_story_path(
     )
 
     with pytest.raises(ValidationError, match="story_path"):
+        refresh_run_settings(db_conn, cas, project_id)
+
+
+# -- an upgrade must not brick projects that already exist ---------------------
+
+
+def test_refresh_backfills_settings_added_since_the_project_was_created(
+    tmp_path: Path, db_conn: sqlite3.Connection, cas: CasStore
+) -> None:
+    """Adding a key to DEFAULT_SETTINGS retroactively breaks every project on
+    disk unless the refresh seeds it: require_runnable_settings fails on the
+    absent key and `ytauto run` refuses a project that rendered fine
+    yesterday, blaming hand-edited settings that were never touched.
+
+    Simulated by deleting the music keys, which is exactly the shape of a
+    project created before they existed."""
+    project_id, _story = _create(db_conn, cas, tmp_path)
+    projects = ProjectService(db_conn)
+
+    settings = projects.settings_for(project_id)
+    del settings["music_track_id"]
+    del settings["music_gain_db"]
+    # Written straight to the column: this is literally what a project created
+    # before these keys existed looks like on disk.
+    with transaction(db_conn, immediate=True):
+        db_conn.execute(
+            "UPDATE projects SET settings_json = ? WHERE id = ?",
+            (json.dumps(settings), project_id),
+        )
+    assert "music_track_id" not in projects.settings_for(project_id)
+
+    refreshed = refresh_run_settings(db_conn, cas, project_id)
+
+    assert refreshed["music_track_id"] == ""
+    assert refreshed["music_gain_db"] == -18.0
+    assert projects.settings_for(project_id)["music_track_id"] == "", (
+        "the backfill must be persisted, not merely returned"
+    )
+
+
+def test_the_backfill_never_overwrites_a_value_someone_chose(
+    tmp_path: Path, db_conn: sqlite3.Connection, cas: CasStore
+) -> None:
+    """Only absent keys are seeded. A refresh that reset deliberate settings to
+    the template on every run would be far worse than the bug it fixes."""
+    project_id, _story = _create(db_conn, cas, tmp_path)
+    projects = ProjectService(db_conn)
+    projects.set_setting(project_id, "voice", "en-GB-RyanNeural")
+    projects.set_setting(project_id, "music_gain_db", -30.0)
+
+    refreshed = refresh_run_settings(db_conn, cas, project_id)
+
+    assert refreshed["voice"] == "en-GB-RyanNeural"
+    assert refreshed["music_gain_db"] == -30.0
+
+
+def test_a_music_track_that_has_been_removed_is_reported_at_enqueue_time(
+    tmp_path: Path, db_conn: sqlite3.Connection, cas: CasStore
+) -> None:
+    """Naming the problem before the job is queued, rather than failing inside
+    a worker two stages into a render that has already spent an encode."""
+    project_id, _story = _create(db_conn, cas, tmp_path)
+    ProjectService(db_conn).set_setting(project_id, "music_track_id", "deleted-track")
+
+    with pytest.raises(ValidationError, match="not in the music library"):
         refresh_run_settings(db_conn, cas, project_id)

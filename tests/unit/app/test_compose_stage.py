@@ -438,3 +438,57 @@ def test_a_failed_render_keeps_everything_in_the_workdir_for_diagnosis(
     assert (ctx.workdir / "ffmpeg-stderr.log").is_file()
     assert "boom" in (ctx.workdir / "ffmpeg-stderr.log").read_text(encoding="utf-8")
     assert (ctx.workdir / "captions.ass").is_file()
+
+
+# -- the music bed reaches the cache key --------------------------------------
+
+
+def _fingerprint_ctx(**settings: object) -> JobContext:
+    base: dict[str, object] = {
+        "broll_manifest_digest": "0" * 64,
+        "caption_style": {},
+        "encoder": "auto",
+        "music_digest": "",
+        "music_gain_db": -18.0,
+    }
+    base.update(settings)
+    return JobContext(
+        job_id="job",
+        project_id="proj",
+        settings=base,
+        inputs={},
+        workdir=Path("work"),
+    )
+
+
+def test_selecting_a_music_track_changes_the_fingerprint(
+    tmp_path: Path, db_conn: sqlite3.Connection
+) -> None:
+    """The failure this guards is not hypothetical. When the caption fix
+    changed ``render_ass`` without bumping anything the fingerprint saw, a
+    corrected render returned byte-identical masters in 1.8 seconds and the
+    operator believed the fix had shipped. A music bed is a bigger change to
+    the output than that was: if it does not reach the cache key, adding a
+    track to an already-rendered project produces silence and success."""
+    cas = CasStore(root=tmp_path / "cas", conn=db_conn)
+    stage = make_compose_landscape(cas=cas, settings={})
+
+    without = stage.fingerprint(_fingerprint_ctx())
+    with_track = stage.fingerprint(_fingerprint_ctx(music_digest="a" * 64))
+
+    assert without != with_track
+
+
+def test_changing_only_the_music_volume_changes_the_fingerprint(
+    tmp_path: Path, db_conn: sqlite3.Connection
+) -> None:
+    """Gain is the one setting someone will actually iterate on - render,
+    listen, decide it is too loud, render again. If it misses the cache key
+    the second render is a no-op that reports success."""
+    cas = CasStore(root=tmp_path / "cas", conn=db_conn)
+    stage = make_compose_landscape(cas=cas, settings={})
+
+    loud = stage.fingerprint(_fingerprint_ctx(music_digest="a" * 64, music_gain_db=-6.0))
+    quiet = stage.fingerprint(_fingerprint_ctx(music_digest="a" * 64, music_gain_db=-24.0))
+
+    assert loud != quiet

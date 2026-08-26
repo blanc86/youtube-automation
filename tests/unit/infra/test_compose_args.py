@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from ytauto.infra.ffmpeg.compose import ComposeClip, compose_args
+from ytauto.infra.ffmpeg.compose import ComposeClip, MusicBed, compose_args
 
 
 def _c(path: str, in_point_s: float, duration_s: float) -> ComposeClip:
@@ -175,3 +175,99 @@ def test_no_clips_is_refused_rather_than_building_an_empty_concat() -> None:
 # loop) and the verbatim failure it produced. Recorded here as a comment so
 # the guard's existence and its predicted failure mode are next to the test
 # it protects, per this task's "beware tests that look like coverage" note.
+
+
+# -- the music bed ------------------------------------------------------------
+
+
+def _with_music(gain_db: float = -18.0, total: float = 20.0, fade: float = 1.5) -> list[str]:
+    return compose_args(
+        clips=[_c("a.mp4", 0, 10), _c("b.mp4", 0, 10)],
+        ass_path=Path("c.ass"),
+        audio_path=Path("n.mp3"),
+        out_path=Path("o.mp4"),
+        width=1920,
+        height=1080,
+        encoder="libx264",
+        music=MusicBed(
+            path=Path("bed.mp3"), gain_db=gain_db, total_duration_s=total, fade_out_s=fade
+        ),
+    )
+
+
+def test_no_music_produces_the_vector_that_existed_before_music() -> None:
+    """The overwhelmingly common case must not pay for the feature: with no
+    bed there is no audio filter graph at all and the narration stream is
+    mapped straight through, exactly as it was."""
+    args = compose_args(
+        clips=[_c("a.mp4", 0, 3)],
+        ass_path=Path("c.ass"),
+        audio_path=Path("n.mp3"),
+        out_path=Path("o.mp4"),
+        width=1920,
+        height=1080,
+        encoder="libx264",
+    )
+    graph = args[args.index("-filter_complex") + 1]
+    assert "amix" not in graph
+    assert "volume=" not in graph
+    assert "-stream_loop" not in args
+    # One clip, so the narration is input 1 and is mapped as a bare stream
+    # specifier rather than a filter pad.
+    assert args[args.index("-map") + 3] == "1:a"
+
+
+def test_the_mix_does_not_normalise_so_the_narration_keeps_its_level() -> None:
+    """ffmpeg's amix defaults to normalize=1, which divides every input by the
+    number of inputs - adding a bed would halve the voice, and the operator
+    would blame the music setting. This is the assertion that pins it."""
+    graph = _with_music()[_with_music().index("-filter_complex") + 1]
+    assert "normalize=0" in graph
+
+
+def test_the_bed_is_looped_and_the_mix_ends_with_the_narration() -> None:
+    """A 30-second track under a three-minute video is ordinary, so the input
+    repeats forever; duration=first is the only thing that bounds it."""
+    args = _with_music()
+    loop_at = args.index("-stream_loop")
+    assert args[loop_at + 1] == "-1"
+    # -stream_loop is an input option: it must precede the -i it applies to,
+    # and that -i must be the music, not a clip.
+    assert args[loop_at + 2] == "-i"
+    assert args[loop_at + 3] == "bed.mp3"
+    graph = args[args.index("-filter_complex") + 1]
+    assert "duration=first" in graph
+
+
+def test_gain_applies_to_the_bed_alone() -> None:
+    """'Independent volume' means the voice is never touched."""
+    graph = _with_music(gain_db=-24.0)[_with_music(gain_db=-24.0).index("-filter_complex") + 1]
+    bed = graph.split("[bed]")[0]
+    assert "volume=-24.0dB" in bed
+    # The narration pad is consumed by amix directly, with no volume filter of
+    # its own anywhere in the graph.
+    assert graph.count("volume=") == 1
+
+
+def test_the_tail_fade_is_timed_against_the_video_not_the_track() -> None:
+    """The video ends at the last word and -shortest cuts there, so fading
+    against anything else fades at a moment nobody sees."""
+    graph = _with_music(total=20.0, fade=1.5)[
+        _with_music(total=20.0, fade=1.5).index("-filter_complex") + 1
+    ]
+    assert "afade=t=out:st=18.500:d=1.5" in graph
+
+
+def test_a_video_shorter_than_the_fade_does_not_seek_backwards() -> None:
+    """A five-second short with a 1.5s fade is fine; a one-second one must not
+    produce a negative start time, which ffmpeg rejects outright."""
+    graph = _with_music(total=1.0, fade=1.5)[
+        _with_music(total=1.0, fade=1.5).index("-filter_complex") + 1
+    ]
+    assert "st=0.000" in graph
+
+
+def test_the_mapped_audio_is_the_mix_when_there_is_a_bed() -> None:
+    args = _with_music()
+    maps = [args[i + 1] for i, a in enumerate(args) if a == "-map"]
+    assert maps == ["[vout]", "[aout]"]

@@ -23,6 +23,7 @@ from ytauto.infra.cas.store import CasStore
 from ytauto.infra.db.engine import connect
 from ytauto.infra.db.migrations import apply_migrations
 from ytauto.infra.logging import bind_correlation_id, configure_logging
+from ytauto.infra.music import MusicLibrary
 from ytauto.infra.paths import AppPaths, ensure_writable_dir, resolve_output_dir
 from ytauto.ui import DEFAULT_PORT, HOST
 
@@ -77,6 +78,70 @@ def _broll_add(paths: AppPaths, args: argparse.Namespace) -> int:
     finally:
         conn.close()
     print(f"added B-roll clip {clip_id}")
+    return 0
+
+
+def _add_music_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    music = subparsers.add_parser("music", help="manage the music library")
+    music_subparsers = music.add_subparsers(dest="music_command", required=True)
+
+    add = music_subparsers.add_parser(
+        "add", help="ingest a music track: probe, store, record provenance"
+    )
+    add.add_argument("path", type=Path, help="path to the audio file")
+    # Required here for the same reason as on `broll add`, and with less room
+    # for argument: a Content ID match on the bed claims the whole video.
+    add.add_argument("--source-url", required=True, help="where the track came from")
+    add.add_argument("--licence", required=True, help="the track's licence")
+    add.add_argument("--title", default="", help="display name (defaults to the filename)")
+    add.add_argument("--attribution", default="", help="attribution text, if the licence needs one")
+    add.add_argument("--notes", default="", help="free-form notes")
+
+    music_subparsers.add_parser("list", help="list every track in the library")
+
+
+def _music_add(paths: AppPaths, args: argparse.Namespace) -> int:
+    """Ingest one track. Returns the process exit code.
+
+    No manifest rewrite, unlike ``_broll_add``: a project names one track by
+    id and ``refresh_run_settings`` resolves it per run, so there is no
+    library-wide blob for a stage to read.
+    """
+    paths.ensure()
+    conn = connect(paths.db_file)
+    try:
+        apply_migrations(conn)
+        cas = CasStore(root=paths.cas, conn=conn)
+        track_id = MusicLibrary(conn, cas).add(
+            args.path,
+            source_url=args.source_url,
+            licence=args.licence,
+            title=args.title,
+            attribution=args.attribution,
+            notes=args.notes,
+        )
+    finally:
+        conn.close()
+    print(f"added music track {track_id}")
+    return 0
+
+
+def _music_list(paths: AppPaths, args: argparse.Namespace) -> int:
+    """Print the library, one track per line. Returns the process exit code."""
+    paths.ensure()
+    conn = connect(paths.db_file)
+    try:
+        apply_migrations(conn)
+        cas = CasStore(root=paths.cas, conn=conn)
+        tracks = MusicLibrary(conn, cas).list_tracks()
+    finally:
+        conn.close()
+
+    if not tracks:
+        print("no music tracks yet - add one with `ytauto music add`")
+        return 0
+    for track in tracks:
+        print(f"{track.id}  {track.duration_s:7.1f}s  {track.licence:<12}  {track.title}")
     return 0
 
 
@@ -343,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="check that the environment is usable")
     _add_broll_subcommand(subparsers)
+    _add_music_subcommand(subparsers)
     _add_project_subcommand(subparsers)
     _add_run_subcommand(subparsers)
     _add_ui_subcommand(subparsers)
@@ -375,6 +441,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.broll_command == "add":
             return _broll_add(paths, args)
         parser.error(f"unknown broll command: {args.broll_command}")
+
+    if args.command == "music":
+        if args.music_command == "add":
+            return _music_add(paths, args)
+        if args.music_command == "list":
+            return _music_list(paths, args)
+        parser.error(f"unknown music command: {args.music_command}")
         return 2
 
     if args.command == "project":

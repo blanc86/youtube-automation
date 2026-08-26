@@ -807,3 +807,39 @@ main p a {
     transform: translateY(150%);
   }
 }
+
+/* -- range slider --------------------------------------------------------- */
+
+.slider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.slider input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  accent-color: var(--live);
+  cursor: pointer;
+}
+
+.slider input[type="range"]:focus {
+  outline: 2px solid var(--live);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+.slider output {
+  flex: none;
+  min-width: 5.5ch;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}

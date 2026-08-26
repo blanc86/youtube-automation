@@ -123,6 +123,70 @@ def probe_media(path: Path, *, ffprobe: Path) -> MediaInfo:
     return MediaInfo(width=int(width), height=int(height), duration_s=duration)
 
 
+def probe_audio_duration(path: Path, *, ffprobe: Path) -> float:
+    """Probe ``path``'s *audio* stream and return its duration in seconds.
+
+    Separate from ``probe_media`` rather than a flag on it, because the two
+    disagree about what a valid file is. ``probe_media`` requires a video
+    stream and reads width/height off it; a music file has no video stream at
+    all, so it would be rejected outright - and an MP3 that carries embedded
+    cover art is worse than rejected, because the artwork *is* a video stream
+    (mjpeg, one frame) and ``probe_media`` would happily return the cover
+    image's dimensions and, on some files, its frame duration. This asks the
+    audio stream directly.
+
+    Raises:
+        ValidationError: ``path`` does not exist, ffprobe exited non-zero, its
+            stdout was not parseable JSON, the file has no audio stream, or no
+            positive duration could be found on either the format block or the
+            audio stream.
+        subprocess.TimeoutExpired: ffprobe did not respond within 30s.
+        OSError: ``ffprobe`` cannot be executed.
+    """
+    if not path.is_file():
+        raise ValidationError(f"source file does not exist: {path}")
+
+    result = subprocess.run(
+        [
+            str(ffprobe),
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            str(path),
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValidationError(
+            f"ffprobe exited {result.returncode} probing {path}: {result.stderr.strip()}"
+        )
+
+    try:
+        payload: dict[str, Any] = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"ffprobe produced unparseable output for {path}: {exc}") from exc
+
+    streams: list[dict[str, Any]] = payload.get("streams", [])
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if audio_stream is None:
+        raise ValidationError(f"no audio stream found in {path}")
+
+    duration = _duration(payload.get("format", {}), audio_stream)
+    if duration is None:
+        raise ValidationError(
+            f"could not determine a positive duration for {path}: absent from both "
+            "format.duration and the audio stream's own duration"
+        )
+    return duration
+
+
 def probe_dimensions(path: Path, *, ffprobe: Path) -> tuple[int, int]:
     """Convenience wrapper over ``probe_media`` for callers that only need size.
 
