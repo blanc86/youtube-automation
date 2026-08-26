@@ -113,8 +113,8 @@ ytauto ui
 
 Then open **http://127.0.0.1:8765**. Everything above is there: create a
 project by pasting a story (the slug is derived from the title), edit that
-story later, change settings including caption colours, add B-roll, and
-render — with the output folder shown when it finishes.
+story later, change settings including caption colours, add B-roll and
+music, and render — with the output folder shown when it finishes.
 
 It binds to loopback only and has no authentication, deliberately: it is a
 tool for one person on one machine. There is no `--host` flag; `--port`
@@ -171,6 +171,26 @@ Settings live per project. `project create` seeds working defaults:
 | `segment_seconds_max` | `4.0` | Longest B-roll segment |
 | `caption_style` | `{}` | Font, size, colours; empty means all defaults |
 | `encoder` | `auto` | Or name one explicitly, e.g. `libx264` |
+| `music_track_id` | `""` | A track from the music library; empty means no bed |
+| `music_gain_db` | `-18.0` | The bed's level. Applied to the music alone |
+
+### Music
+
+Optional, and off by default — a video with no bed is a finished video.
+
+```bash
+ytauto music add C:\music\slow-pulse.mp3 --source-url https://example.com/track --licence CC0
+```
+
+Then pick it on the project page and set its level. The volume is independent
+of the narration: the gain applies to the bed alone, so the voice keeps its
+level whatever you do. A track shorter than the video loops, and every bed
+fades out at the end.
+
+**The source URL and licence are required, and this matters more here than it
+does for footage.** Music is the most Content-ID-matched category on YouTube,
+matching runs automatically on every upload, and a claim on the bed takes the
+whole video however well-licensed the footage under it is.
 
 > **There is no `project set-setting` command yet.** To change a setting from
 > the CLI today you edit the project's `settings_json` in the SQLite database
@@ -196,6 +216,13 @@ ytauto run                    render one project
     --project SLUG            which project             (required)
     --max-ticks N             dispatcher budget per poll round (default 100)
     --output-dir PATH         where to write the masters
+ytauto music add <path>       ingest a music track
+    --source-url URL          where it came from        (required)
+    --licence TEXT            its licence               (required)
+    --title TEXT              display name (defaults to the filename)
+    --attribution TEXT        attribution, if needed
+    --notes TEXT              free-form notes
+ytauto music list             list every track in the library
 ytauto ui                     serve the local web UI on 127.0.0.1
     --port N                  port to listen on         (default 8765)
 
@@ -212,7 +239,6 @@ Deliberately out of scope for this phase, in rough order of likely arrival:
 - **Metadata and thumbnails** — title, description, hashtags, cover image as a
   real pipeline stage.
 - **`project set-setting`**, and a `broll list` — both exist in the web UI.
-- **Background music.** Nothing is wired for it yet, in either front end.
 - **AI-generated video** as an alternative to your own footage.
 - **Auto-upload.** Chosen against deliberately: YouTube's API allows about six
   uploads a day against a target of 20–100. The pipeline will prepare everything
