@@ -108,24 +108,25 @@ def test_the_subtitles_filter_alone_is_not_enough() -> None:
 
 # -- version robustness: the flag column is not a fixed width -------------------
 
-FILTERS_OUTPUT_FOUR_FLAGS = """Filters:
+FILTERS_OUTPUT_FFMPEG_9 = """Filters:
   T.. = Timeline support
   .S. = Slice threading
-  ...C = Command support
   A->A = Audio input/output
- ...C. ass               V->V       Render ASS subtitles onto input video using the libass library.
- TS.C. volume            A->A       Change input volume.
- ...C. amix              N->A       Audio mixing.
+ .. ass               V->V       Render ASS subtitles onto input video using the libass library.
+ TS volume            A->A       Change input volume.
+ .. amix              N->A       Audio mixing.
 """
 
 
-def test_filters_parse_when_the_flag_column_is_wider() -> None:
-    """The bug this pins cost a red CI run and produced a message that blamed
-    the user's ffmpeg: a fixed three-character flag column matched nothing on a
-    newer build, every capability came back empty, and the operator was told a
-    gyan full build "has no 'ass' filter (libass)".
+def test_filters_parse_on_ffmpeg_9_which_prints_two_flag_characters() -> None:
+    """Captured verbatim from a CI run on ffmpeg 9.0.1, which prints two flag
+    characters where 7.1.1 printed three.
+
+    A fixed-width flag column matched nothing on that build, every capability
+    came back empty, and the operator was told a gyan full build compiled with
+    --enable-libass "has no 'ass' filter (libass)".
     """
-    filters = parse_filters(FILTERS_OUTPUT_FOUR_FLAGS)
+    filters = parse_filters(FILTERS_OUTPUT_FFMPEG_9)
     assert "ass" in filters
     assert {"volume", "amix"} <= filters
 
@@ -133,7 +134,7 @@ def test_filters_parse_when_the_flag_column_is_wider() -> None:
 def test_the_legend_never_becomes_a_filter_name() -> None:
     """Structural, not a special case: legend and header rows carry no
     ``inputs->outputs`` signature, so the anchor excludes them."""
-    filters = parse_filters(FILTERS_OUTPUT_FOUR_FLAGS)
+    filters = parse_filters(FILTERS_OUTPUT_FFMPEG_9)
     assert "Filters:" not in filters
     assert "=" not in filters
     assert "Timeline" not in filters

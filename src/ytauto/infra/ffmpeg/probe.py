@@ -20,7 +20,7 @@ ENCODER_PREFERENCE: tuple[str, ...] = ("h264_nvenc", "h264_qsv", "libx264")
 # but the token is a literal "=" — never a real capability name — so that
 # token is excluded rather than trusted.
 _ENCODER_RE = re.compile(r"^\s*[A-Z.]{6,}\s+(\S+)")
-_FILTER_RE = re.compile(r"^\s*[A-Z.]{3,}\s+(\S+)\s+\S*->\S*")
+_FILTER_RE = re.compile(r"^\s*[A-Z.]+\s+(\S+)\s+\S*->\S*")
 """Deliberately not a fixed-width flag column.
 
 ``ffmpeg -filters`` prints ``FLAGS NAME INPUTS->OUTPUTS DESCRIPTION``. Pinning
@@ -31,7 +31,13 @@ back empty, and ``has_subtitle_burn_in`` then told the operator their build
 CI hit exactly that, and a message that confidently names the wrong cause is
 worse than no message.
 
-So the flag column is ``{3,}``/``{6,}`` (a future flag cannot break it) and
+ffmpeg 9 prints TWO flag characters where ffmpeg 7 printed three, captured
+verbatim from CI:
+
+    ffmpeg 7.1.1:  ` ... ass               V->V       Render ASS subtitles...`
+    ffmpeg 9.0.1:  ` .. ass               V->V       Render ASS subtitles...`
+
+So the flag column is left unbounded rather than counted, and
 filters additionally anchor on the ``->`` in the signature column, which has
 been stable for many releases and is what makes a widened flag column
 unambiguous rather than a guess about where the name starts. That anchor also

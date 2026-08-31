@@ -37,9 +37,13 @@ jobs:
         if: runner.os == 'Windows'
         uses: FedericoCarboni/setup-ffmpeg@v3.1
         id: setup-ffmpeg
+      # ffmpeg-full, not ffmpeg: Homebrew's plain formula ships without libass,
+      # so `ffmpeg -filters` on it lists no `ass` filter at all and captions
+      # cannot be burned in. Its own post-install caveat is what points at the
+      # full formula.
       - name: install ffmpeg (macOS)
         if: runner.os == 'macOS'
-        run: brew install ffmpeg
+        run: brew install ffmpeg-full
       # Fail here, loudly, rather than inside a test: a missing libass surfaces
       # as "this build cannot burn in captions", which reads like a code defect
       # rather than a runner-image problem.
