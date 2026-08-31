@@ -26,8 +26,28 @@ jobs:
       # stable ffmpeg): the action's own docs note pinning an exact ffmpeg
       # version is "only fully supported on Windows", so forcing one here
       # would be unreliable on the macos-latest leg.
-      - uses: FedericoCarboni/setup-ffmpeg@v3.1
+      #
+      # Two installers, because one no longer covers both legs.
+      # setup-ffmpeg only ships x64 binaries, and `macos-latest` is Apple
+      # Silicon now - the action fails outright with "Unsupported architecture
+      # (only x64 is supported)" before a single test runs. Homebrew has an
+      # arm64 ffmpeg with libass, so macOS uses that and Windows keeps the
+      # action.
+      - name: install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        uses: FedericoCarboni/setup-ffmpeg@v3.1
         id: setup-ffmpeg
+      - name: install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      # Fail here, loudly, rather than inside a test: a missing libass surfaces
+      # as "this build cannot burn in captions", which reads like a code defect
+      # rather than a runner-image problem.
+      - name: show what ffmpeg we got
+        run: |
+          ffmpeg -hide_banner -version
+          ffmpeg -hide_banner -filters | grep -E "ass" || (echo "no ass filter in this build" && exit 1)
+        shell: bash
       - run: pip install -e ".[dev]"
       # One step, invoking the same gate developers run locally. Listing the
       # gates here separately let CI drift from the script - it was missing

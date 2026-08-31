@@ -20,42 +20,114 @@ There is no metadata or thumbnail generation and no auto-upload — see
 
 ## What you need
 
-- **Python 3.12+**
-- **ffmpeg and ffprobe** on your `PATH` (7.x recommended)
-- **A GPU is optional.** `h264_nvenc` is used when present; it falls back to
-  `h264_qsv`, then `libx264`, automatically.
+- **Python 3.12 or newer.** `python --version` should say 3.12+.
+- **ffmpeg and ffprobe**, both on your `PATH`, in a build that includes
+  **libass** (captions are burned in with it). Almost every general-purpose
+  build has it; see below.
 - **An internet connection** for speech synthesis. Nothing else phones home.
+- **A GPU is optional.** `h264_nvenc` is used when present, falling back to
+  `h264_qsv`, then `libx264`, automatically. No GPU just means a slower encode.
+
+### Installing ffmpeg
+
+**Windows** (either one):
+
+```bash
+winget install Gyan.FFmpeg
+```
+
+```bash
+choco install ffmpeg-full
+```
+
+**macOS:**
+
+```bash
+brew install ffmpeg
+```
+
+**Linux (Debian/Ubuntu):**
+
+```bash
+sudo apt install ffmpeg
+```
+
+Close and reopen your terminal afterwards, then check both binaries are found:
+
+```bash
+ffmpeg -version
+```
+
+---
 
 ## Install
 
 ```bash
 git clone https://github.com/blanc86/youtube-automation.git
 cd youtube-automation
-python -m venv .venv
 ```
 
-Windows:
+Create a virtual environment and **activate it** — every command below assumes
+an activated environment, and this is the step most easily skipped:
+
+**Windows (PowerShell):**
 
 ```bash
-.venv\Scripts\pip install -e ".[dev]"
+python -m venv .venv; .venv\Scripts\Activate.ps1
 ```
 
-macOS / Linux:
+**Windows (cmd):**
 
 ```bash
-.venv/bin/pip install -e ".[dev]"
+python -m venv .venv && .venv\Scripts\activate.bat
 ```
 
-Then check your environment:
+**macOS / Linux:**
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+```
+
+Your prompt should now start with `(.venv)`. Then install:
+
+```bash
+pip install -e ".[dev]"
+```
+
+Now confirm the whole environment is sane — ffmpeg, paths, disk, database:
 
 ```bash
 ytauto doctor
 ```
 
+If that prints no errors, you are ready. Every later session needs the
+activation step again (the `pip install` is one-time).
+
 > **Reinstall after pulling.** Pipeline stages are registered as Python entry
 > points, so a stale editable install silently advertises fewer stages than the
 > code has — and a job will report success having rendered nothing. If you pull
-> and anything behaves oddly, run `pip install -e ".[dev]"` again first.
+> and anything behaves oddly, run `pip install -e ".[dev]"` again first. This
+> has been the cause of more confusing behaviour than any actual bug.
+
+---
+
+## The five-minute version
+
+From a clean clone to a finished video, with the web UI:
+
+```bash
+ytauto broll add path/to/any-video.mp4 --source-url https://example.com --licence CC0
+```
+
+```bash
+ytauto ui
+```
+
+Open **http://127.0.0.1:8765**, click **New project**, paste a story (or copy
+the prompt on that page into any chat assistant and paste its reply), then
+press **Render**. The finished folder is shown on screen when it's done.
+
+Everything past this point is detail.
 
 ---
 
@@ -243,6 +315,20 @@ Deliberately out of scope for this phase, in rough order of likely arrival:
 - **Auto-upload.** Chosen against deliberately: YouTube's API allows about six
   uploads a day against a target of 20–100. The pipeline will prepare everything
   and hand off; you post.
+
+### If something goes wrong
+
+| What you see | What it is |
+|---|---|
+| `ytauto: command not found` | The virtual environment isn't activated. Re-run the activate step from [Install](#install). |
+| `ModuleNotFoundError` for a package you know is installed | You're on a different Python than the one you installed into — activate the venv, or re-run `pip install -e ".[dev]"`. |
+| A job succeeds but no video appears | Almost always a stale editable install. Run `pip install -e ".[dev]"` again. |
+| `has no 'ass' filter (libass)` | Your ffmpeg build can't burn captions. Install one of the builds listed under [Installing ffmpeg](#installing-ffmpeg). |
+| `no h264 encoder` | Same cause, same fix. |
+| Renders finish instantly and nothing changes | That's the cache doing its job. Change a setting, or edit the story, and it re-runs the stages that actually depend on it. |
+
+`ytauto doctor` checks most of this in one command, and is the first thing to
+run when anything behaves oddly.
 
 ### Known rough edges
 

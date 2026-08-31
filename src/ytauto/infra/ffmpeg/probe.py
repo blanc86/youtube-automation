@@ -19,8 +19,24 @@ ENCODER_PREFERENCE: tuple[str, ...] = ("h264_nvenc", "h264_qsv", "libx264")
 # Legend lines (e.g. " V..... = Video") have the same flag-then-token shape,
 # but the token is a literal "=" — never a real capability name — so that
 # token is excluded rather than trusted.
-_ENCODER_RE = re.compile(r"^\s*[A-Z.]{6}\s+(\S+)")
-_FILTER_RE = re.compile(r"^\s*[A-Z.]{3}\s+(\S+)")
+_ENCODER_RE = re.compile(r"^\s*[A-Z.]{6,}\s+(\S+)")
+_FILTER_RE = re.compile(r"^\s*[A-Z.]{3,}\s+(\S+)\s+\S*->\S*")
+"""Deliberately not a fixed-width flag column.
+
+``ffmpeg -filters`` prints ``FLAGS NAME INPUTS->OUTPUTS DESCRIPTION``. Pinning
+the flag column to exactly three characters made this parser silently
+version-specific: on ffmpeg 9 it matched nothing at all, every capability came
+back empty, and ``has_subtitle_burn_in`` then told the operator their build
+"has no 'ass' filter (libass)" - about a gyan full build that ships libass.
+CI hit exactly that, and a message that confidently names the wrong cause is
+worse than no message.
+
+So the flag column is ``{3,}``/``{6,}`` (a future flag cannot break it) and
+filters additionally anchor on the ``->`` in the signature column, which has
+been stable for many releases and is what makes a widened flag column
+unambiguous rather than a guess about where the name starts. That anchor also
+does the header/legend exclusion structurally: ``Filters:`` and the ``=``
+legend row carry no signature."""
 
 
 def parse_encoders(output: str) -> frozenset[str]:
@@ -67,6 +83,18 @@ class FfmpegCapabilities:
 
 
 def _run(binary: str, flag: str) -> str:
+    """Ask the binary one capability question and return its stdout.
+
+    Raises rather than returning ``""`` on a non-zero exit. An empty string
+    parses to an empty capability set, which every caller then reports as a
+    *missing feature* - "this build has no h264 encoder", "this build has no
+    'ass' filter" - when the truth is that the probe never ran. That failure
+    mode blames the user's ffmpeg for something this code did, and it is the
+    hardest kind of message to debug because it is specific and wrong.
+
+    Raises:
+        ConfigurationError: ffmpeg exited non-zero.
+    """
     result = subprocess.run(
         [binary, "-hide_banner", flag],
         capture_output=True,
@@ -75,6 +103,11 @@ def _run(binary: str, flag: str) -> str:
         timeout=30,
         check=False,
     )
+    if result.returncode != 0:
+        raise ConfigurationError(
+            f"{binary} {flag} exited {result.returncode}, so this build's capabilities "
+            f"could not be determined: {result.stderr.strip()[:400]}"
+        )
     return result.stdout
 
 
