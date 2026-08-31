@@ -185,8 +185,8 @@ def form_values(settings: Mapping[str, object]) -> dict[str, object]:
         key: settings.get(key, "")
         for key in (*_TEXT_FIELDS, *_OPTIONAL_TEXT_FIELDS, *_INT_FIELDS, *_NUMBER_FIELDS)
     }
-    gain = settings.get("music_gain_db", -18.0)
-    values["music_gain_db"] = gain if isinstance(gain, int | float) else -18.0
+    gain = settings.get("music_gain_db", 0.0)
+    values["music_gain_db"] = gain if isinstance(gain, int | float) else 0.0
     values["primary_colour"] = ass_to_hex(style.get("primary_colour"), default=DEFAULT_PRIMARY_HEX)
     values["accent_colour"] = ass_to_hex(style.get("accent_colour"), default=DEFAULT_ACCENT_HEX)
     alignment = style.get("alignment", DEFAULT_ALIGNMENT)

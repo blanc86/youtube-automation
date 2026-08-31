@@ -53,15 +53,41 @@ class ComposeClip:
     duration_s: float
 
 
+BED_TARGET_LUFS = -32.0
+"""The level every bed is normalised to before the operator's trim.
+
+Chosen by measurement, not taste. Three legitimate tracks spanning 24 dB of
+input level (-39.5, -21.5 and -15.5 dBFS mean) all land within 0.1 dB of
+-31.4 dBFS mean after ``loudnorm=I=-32``. Narration from edge-tts sits around
+-21.8 dBFS mean in a finished master, so a normalised bed arrives about 10 dB
+under the voice - present, and not competing with it.
+
+That spread is the whole reason this constant exists. Before it, ``gain_db``
+attenuated a track whose own level was unknown, so the same setting produced
+an inaudible bed for one track and a reasonable one for another. Nothing in
+the plumbing was wrong; the control simply did not mean anything."""
+
+_BED_TRUE_PEAK = -3.0
+"""No format pin on either branch, deliberately, and this was measured the
+hard way. Pinning both to ``aformat=...:channel_layouts=stereo`` to make
+``amix``'s inputs agree also pushes a mono narration through ffmpeg's
+mono-to-stereo rematrix, which applies its own attenuation: the finished
+master came back 2.5 dB *quieter* than the same render with no music at all.
+The voice must never be touched, so libavfilter is left to negotiate the
+sample-rate difference between 24 kHz narration and loudnorm's 48 kHz output
+- which it already did correctly for the 44.1 kHz beds that preceded
+loudnorm."""
+
+
 @dataclass(frozen=True)
 class MusicBed:
     """An optional music track to mix in under the narration.
 
-    ``gain_db`` is applied to the music alone - the narration is never
-    touched - so it is an absolute statement about how loud the bed sits,
-    independent of the voice. Negative values are the ordinary case; the
-    default the project seeds is -18 dB, which is roughly where a bed sits
-    under speech without fighting it.
+    ``trim_db`` adjusts the bed *after* it has been normalised to
+    ``BED_TARGET_LUFS``, so 0 means "the standard bed level" and the number is
+    a statement about this video rather than about the file. It is applied to
+    the music alone - the narration is never touched - which is what keeps the
+    volume independent of the voice.
 
     ``fade_out_s`` is the tail fade applied at the end of the mix. Music that
     stops dead on the last frame is the single most noticeable artefact of a
@@ -69,7 +95,7 @@ class MusicBed:
     """
 
     path: Path
-    gain_db: float
+    trim_db: float
     total_duration_s: float
     fade_out_s: float = 1.5
 
@@ -110,7 +136,11 @@ def _audio_graph(narration_index: int, music: MusicBed | None) -> tuple[str, str
     music_index = narration_index + 1
     fade_start = max(0.0, music.total_duration_s - music.fade_out_s)
     graph = (
-        f"[{music_index}:a]volume={music.gain_db}dB,"
+        # loudnorm FIRST, then the trim. Normalising after the trim would put
+        # the level back exactly where loudnorm wants it and the setting would
+        # do nothing at all.
+        f"[{music_index}:a]loudnorm=I={BED_TARGET_LUFS}:TP={_BED_TRUE_PEAK}:LRA=11,"
+        f"volume={music.trim_db}dB,"
         f"afade=t=out:st={fade_start:.3f}:d={music.fade_out_s}[bed];"
         f"[{narration_index}:a][bed]"
         "amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"

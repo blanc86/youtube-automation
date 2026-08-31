@@ -180,7 +180,7 @@ def test_no_clips_is_refused_rather_than_building_an_empty_concat() -> None:
 # -- the music bed ------------------------------------------------------------
 
 
-def _with_music(gain_db: float = -18.0, total: float = 20.0, fade: float = 1.5) -> list[str]:
+def _with_music(trim_db: float = 0.0, total: float = 20.0, fade: float = 1.5) -> list[str]:
     return compose_args(
         clips=[_c("a.mp4", 0, 10), _c("b.mp4", 0, 10)],
         ass_path=Path("c.ass"),
@@ -190,7 +190,7 @@ def _with_music(gain_db: float = -18.0, total: float = 20.0, fade: float = 1.5) 
         height=1080,
         encoder="libx264",
         music=MusicBed(
-            path=Path("bed.mp3"), gain_db=gain_db, total_duration_s=total, fade_out_s=fade
+            path=Path("bed.mp3"), trim_db=trim_db, total_duration_s=total, fade_out_s=fade
         ),
     )
 
@@ -241,12 +241,16 @@ def test_the_bed_is_looped_and_the_mix_ends_with_the_narration() -> None:
 
 def test_gain_applies_to_the_bed_alone() -> None:
     """'Independent volume' means the voice is never touched."""
-    graph = _with_music(gain_db=-24.0)[_with_music(gain_db=-24.0).index("-filter_complex") + 1]
+    graph = _with_music(trim_db=-24.0)[_with_music(trim_db=-24.0).index("-filter_complex") + 1]
     bed = graph.split("[bed]")[0]
     assert "volume=-24.0dB" in bed
-    # The narration pad is consumed by amix directly, with no volume filter of
-    # its own anywhere in the graph.
+    # Exactly one volume filter in the whole graph, and it is on the bed branch:
+    # the narration reaches amix through nothing but a format pin.
     assert graph.count("volume=") == 1
+    assert "loudnorm" in bed, "the trim is meaningless without the normalisation before it"
+    assert bed.index("loudnorm") < bed.index("volume="), (
+        "normalising after the trim would undo it exactly"
+    )
 
 
 def test_the_tail_fade_is_timed_against_the_video_not_the_track() -> None:

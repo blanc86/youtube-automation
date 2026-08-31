@@ -69,10 +69,11 @@ DEFAULT_SETTINGS: Mapping[str, object] = MappingProxyType(
         # bed is a complete video, and a track that has to be chosen before
         # anything renders would be a step in the way of the common case.
         "music_track_id": "",
-        # Applied to the bed alone, never to the narration - see
-        # infra.ffmpeg.compose.MusicBed. -18 dB is roughly where a bed sits
-        # under speech without competing with it.
-        "music_gain_db": -18.0,
+        # A trim around the standard bed level, not a raw attenuation: the
+        # bed is normalised to BED_TARGET_LUFS first, so 0 means "the standard
+        # level under narration" and the number describes this video rather
+        # than the file. Applied to the bed alone, never to the narration.
+        "music_gain_db": 0.0,
     }
 )
 """The settings template ``create_project`` seeds, so a project created
@@ -214,15 +215,16 @@ def validate_settings(settings: Mapping[str, object]) -> None:
 
     if "music_gain_db" in settings:
         gain = _require_number(settings, "music_gain_db")
-        # A bed above the narration is never what anyone means, and ffmpeg
-        # will happily clip the mix if asked. The ceiling is 0 dB (the track
-        # at its own recorded level); the floor is where it stops being
-        # audible at all, and below that the honest setting is no track.
-        if not (-60.0 <= gain <= 0.0):
+        # A trim around an already-normalised bed, so it is signed both ways:
+        # +12 is a bed pushed forward, -30 is one barely there. Beyond those
+        # the bed either fights the narration or is inaudible, and the honest
+        # setting for inaudible is no track at all.
+        if not (-30.0 <= gain <= 12.0):
             raise ValidationError(
-                f"setting 'music_gain_db' must be between -60 and 0, got {gain} "
-                "- positive gain drives the mix into clipping, and below -60 dB "
-                "the bed is inaudible; to remove it, clear 'music_track_id'"
+                f"setting 'music_gain_db' must be between -30 and 12, got {gain} "
+                "- it trims a bed that is already normalised to a standard level, "
+                "so 0 is the ordinary value; to remove the bed, clear "
+                "'music_track_id'"
             )
 
     if "segment_seconds_min" in settings:

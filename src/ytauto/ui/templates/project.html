@@ -126,17 +126,19 @@
             </select>
           </div>
           <div>
-            <label for="music_gain_db">Volume</label>
+            <label for="music_gain_db">Level (0 = standard)</label>
             <div class="slider">
               <input id="music_gain_db" name="music_gain_db" type="range"
-                     min="-40" max="0" step="1" value="{{ values.music_gain_db }}"
+                     min="-30" max="12" step="1" value="{{ values.music_gain_db }}"
                      data-music-gain />
               <output for="music_gain_db">{{ values.music_gain_db }} dB</output>
             </div>
           </div>
         </div>
         <p class="hint">
-          Applied to the bed alone — the narration keeps its level whatever this says.
+          Every track is normalised to the same bed level first, so this is a trim
+          around it rather than a raw attenuation — 0 sits about 10 dB under the
+          narration whether the file is quiet or loud. The voice is never touched.
           Short tracks loop; every track fades out at the end.
         </p>
       {% else %}

@@ -593,7 +593,7 @@ def _compose_with(
     job_id: str,
     narration: Path,
     music: Path | None,
-    gain_db: float = -18.0,
+    gain_db: float = 0.0,
     video_seconds: float = 3.0,
 ) -> Path:
     """Render one landscape master over a single clip, with or without a bed.
@@ -732,4 +732,53 @@ def test_a_track_shorter_than_the_video_loops_instead_of_falling_silent(
     later = _mean_volume_db(out, ffmpeg=ffmpeg_binaries.ffmpeg, start_s=0.7, duration_s=0.7)
     assert later > -60.0, (
         f"the bed stopped after one pass instead of looping: {later} dBFS at 0.7-1.4s"
+    )
+
+
+def test_two_tracks_at_wildly_different_levels_land_at_the_same_bed_level(
+    tmp_path: Path, cas: CasStore, ffmpeg_binaries: FfmpegBinaries
+) -> None:
+    """This is the bug report, reduced to a measurement.
+
+    ``music_gain_db`` used to attenuate a track whose own level was unknown.
+    Two perfectly legitimate files 24 dB apart - a quietly mastered bed and a
+    loud one - therefore produced an inaudible bed and a reasonable one from
+    the identical setting, and the honest description of that is "background
+    music is not working".
+
+    Normalising before the trim is what makes the control mean something, so
+    the assertion is that the *rendered masters* agree, not that the filter
+    string contains a particular filter name.
+    """
+    silence = _lavfi_tone(tmp_path, ffmpeg_binaries, name="sil-n", seconds=3.0, volume="0")
+    quiet = _lavfi_tone(
+        tmp_path, ffmpeg_binaries, name="quiet", seconds=4.0, frequency=220, volume="0.05"
+    )
+    loud = _lavfi_tone(
+        tmp_path, ffmpeg_binaries, name="loud", seconds=4.0, frequency=220, volume="1.0"
+    )
+
+    raw_gap = abs(
+        _mean_volume_db(quiet, ffmpeg=ffmpeg_binaries.ffmpeg)
+        - _mean_volume_db(loud, ffmpeg=ffmpeg_binaries.ffmpeg)
+    )
+    assert raw_gap > 15.0, (
+        f"the two source tracks must genuinely differ for this test to mean "
+        f"anything; they differ by {raw_gap:.1f} dB"
+    )
+
+    quiet_master = _compose_with(
+        tmp_path, cas, ffmpeg_binaries, job_id="q", narration=silence, music=quiet, gain_db=0.0
+    )
+    loud_master = _compose_with(
+        tmp_path, cas, ffmpeg_binaries, job_id="l", narration=silence, music=loud, gain_db=0.0
+    )
+
+    rendered_gap = abs(
+        _mean_volume_db(quiet_master, ffmpeg=ffmpeg_binaries.ffmpeg)
+        - _mean_volume_db(loud_master, ffmpeg=ffmpeg_binaries.ffmpeg)
+    )
+    assert rendered_gap < 4.0, (
+        f"the same setting produced beds {rendered_gap:.1f} dB apart from sources "
+        f"{raw_gap:.1f} dB apart - the bed is not being normalised"
     )

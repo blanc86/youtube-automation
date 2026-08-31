@@ -222,7 +222,7 @@ class ComposeStage:
     ``duration_s`` from.
     """
 
-    version = 3
+    version = 5
     """Bump whenever this stage's *rendered output* changes - including when the
     change is in a dependency rather than in this file.
 
@@ -239,7 +239,20 @@ class ComposeStage:
 
     v3: an optional music bed is mixed under the narration. The audio half of
     the filter graph is new, so even a project with no track selected renders
-    through changed code and must not be served a v2 master."""
+    through changed code and must not be served a v2 master.
+
+    v4: the bed is normalised to a standard level before the operator's trim.
+    Without it, `music_gain_db` attenuated a track whose own level was unknown
+    - three legitimate tracks spanning 24 dB of input level meant the same
+    setting produced an inaudible bed for one and a reasonable one for
+    another, which is what "the background music is not working" turned out to
+    be.
+
+    v5: no format pin on the mix branches. Pinning both to stereo so amix's
+    inputs agreed also pushed a mono narration through ffmpeg's
+    mono-to-stereo rematrix, and the finished master came back 2.5 dB quieter
+    than the same render with no music at all - the voice attenuated by a
+    change that was supposed to be about the music."""
 
     depends_on: tuple[str, ...] = ("plan_timeline", "select_broll", "synthesize_speech")
     settings_keys: tuple[str, ...] = (
@@ -369,7 +382,7 @@ class ComposeStage:
 
         return MusicBed(
             path=music_path,
-            gain_db=_as_float(ctx.settings.get("music_gain_db", -18.0)),
+            trim_db=_as_float(ctx.settings.get("music_gain_db", 0.0)),
             total_duration_s=sum(clip.duration_s for clip in clips),
         )
 

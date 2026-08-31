@@ -306,7 +306,7 @@ def test_refresh_backfills_settings_added_since_the_project_was_created(
     refreshed = refresh_run_settings(db_conn, cas, project_id)
 
     assert refreshed["music_track_id"] == ""
-    assert refreshed["music_gain_db"] == -18.0
+    assert refreshed["music_gain_db"] == 0.0
     assert projects.settings_for(project_id)["music_track_id"] == "", (
         "the backfill must be persisted, not merely returned"
     )

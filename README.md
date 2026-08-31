@@ -244,7 +244,7 @@ Settings live per project. `project create` seeds working defaults:
 | `caption_style` | `{}` | Font, size, colours; empty means all defaults |
 | `encoder` | `auto` | Or name one explicitly, e.g. `libx264` |
 | `music_track_id` | `""` | A track from the music library; empty means no bed |
-| `music_gain_db` | `-18.0` | The bed's level. Applied to the music alone |
+| `music_gain_db` | `0.0` | Trim around the standard bed level, in dB (−30…+12) |
 
 ### Music
 
@@ -254,10 +254,18 @@ Optional, and off by default — a video with no bed is a finished video.
 ytauto music add C:\music\slow-pulse.mp3 --source-url https://example.com/track --licence CC0
 ```
 
-Then pick it on the project page and set its level. The volume is independent
-of the narration: the gain applies to the bed alone, so the voice keeps its
-level whatever you do. A track shorter than the video loops, and every bed
-fades out at the end.
+Then pick it on the project page and set its level.
+
+**Every track is normalised to the same bed level before your setting is
+applied**, so `0` means "the standard level under narration" — roughly 10 dB
+below the voice — whether the file you added is quietly or loudly mastered.
+That normalisation is the difference between a control that means something
+and one that doesn't: three legitimate tracks spanning 24 dB of input level
+all land within 0.1 dB of each other once normalised.
+
+Positive values push the bed forward, negative push it back. The narration is
+never touched, so the voice keeps its level whatever you do here. A track
+shorter than the video loops, and every bed fades out at the end.
 
 **The source URL and licence are required, and this matters more here than it
 does for footage.** Music is the most Content-ID-matched category on YouTube,
