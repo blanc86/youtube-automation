@@ -275,3 +275,44 @@ def test_forget_if_unreferenced_reports_what_it_did(store: CasStore) -> None:
     assert store.forget_if_unreferenced(held) is False
     assert store.exists(held), "a refused delete must not touch the file"
     assert store.refcount(held) == 1
+
+
+def test_an_orphan_dated_in_the_future_is_still_swept(store: CasStore) -> None:
+    """A blob's timestamp can read ahead of the wall clock.
+
+    NTFS records mtime to 100ns while the Windows system clock advances in
+    ~15.6ms ticks, so a file written microseconds ago can carry an mtime later
+    than ``time.time()``. The age check used to compare ``st_mtime`` against a
+    cutoff directly, which made that file's age negative and skipped it - and
+    with ``min_age_s=0``, which reads as "no age restriction", it was skipped
+    permanently rather than merely deferred.
+
+    This is not hypothetical clock-skew paranoia: the same test passed on one
+    Windows machine and failed on another with ``assert 0 == 1``, and the
+    difference was which side of the tick the two clocks landed on.
+    """
+    digest = store.stage_file(b"an orphan from the future", kind="blob")
+    path = store.path_for(digest)
+
+    # Explicitly dated ahead, which is the condition that has to be tolerated.
+    future = time.time() + 30.0
+    os.utime(path, (future, future))
+
+    report = Evictor(store, EvictionPolicy(max_bytes=1)).sweep_orphans(min_age_s=0)
+
+    assert report.orphan_blobs == 1, "a future-dated orphan must still be reclaimable"
+    assert not path.is_file()
+
+
+def test_a_minimum_age_still_protects_a_freshly_written_blob(store: CasStore) -> None:
+    """The clamp must not turn min_age_s into a no-op: a future-dated file is
+    brand new, so a non-zero minimum age must still leave it alone."""
+    digest = store.stage_file(b"too young to reap", kind="blob")
+    path = store.path_for(digest)
+    future = time.time() + 30.0
+    os.utime(path, (future, future))
+
+    report = Evictor(store, EvictionPolicy(max_bytes=1)).sweep_orphans(min_age_s=300)
+
+    assert report.orphan_blobs == 0
+    assert path.is_file()
