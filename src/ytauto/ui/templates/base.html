@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}ytauto{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="wordmark" href="{{ url_for('index') }}">
+        {# Two rectangles at true 16:9 and 9:16, sharing a baseline: every
+           project leaves here as both. #}
+        <svg class="mark" viewBox="0 0 25 14" aria-hidden="true">
+          <rect x="0.5" y="2.5" width="16" height="9" rx="1" />
+          <rect x="18.5" y="2.5" width="5.0625" height="9" rx="1" />
+        </svg>
+        <span>ytauto</span>
+      </a>
+      <nav>
+        <a href="{{ url_for('index') }}" {% if nav == 'projects' %}class="current"{% endif %}>Projects</a>
+        <a href="{{ url_for('broll') }}" {% if nav == 'broll' %}class="current"{% endif %}>B-roll</a>
+        <a href="{{ url_for('music') }}" {% if nav == 'music' %}class="current"{% endif %}>Music</a>
+      </nav>
+    </header>
+
+    <main>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+          <p class="banner banner-{{ category }}">{{ message }}</p>
+        {% endfor %}
+      {% endwith %}
+      {% if error %}<p class="banner banner-error">{{ error }}</p>{% endif %}
+
+      {% block content %}{% endblock %}
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

@@ -1,6 +1,10 @@
+from collections.abc import Sequence
+
 import pytest
 
 from ytauto.core.errors import ValidationError
+from ytauto.core.models.narration import Narration, WordBoundary
+from ytauto.core.models.visual import VisualCandidate, VisualPlacement
 from ytauto.core.ports.capability import CapabilityDescriptor, CostModel, LatencyClass
 from ytauto.core.ports.providers import (
     ImageGenerator,
@@ -101,10 +105,52 @@ def test_a_conforming_synthesizer_satisfies_the_protocol() -> None:
     class Fake:
         capabilities = _descriptor()
 
-        def synthesize(self, text: str, *, voice: str) -> bytes:
-            return b""
+        def synthesize(self, text: str, *, voice: str) -> Narration:
+            return Narration(audio=b"", boundaries=None)
 
     assert isinstance(Fake(), SpeechSynthesizer)
+
+
+def test_a_boundary_transcriber_and_an_asr_one_share_the_same_port() -> None:
+    """The seam's whole point: the free path and the GPU path are
+    interchangeable. A bytes-only ``transcribe`` could not express the free
+    one at all - the boundaries would have to travel beside the port."""
+
+    class FromBoundaries:
+        capabilities = _descriptor()
+
+        def transcribe(self, narration: Narration) -> tuple[tuple[str, float, float], ...]:
+            if narration.boundaries is None:
+                raise ValidationError("this engine emitted no word boundaries")
+            return tuple((b.text, b.start_s, b.end_s) for b in narration.boundaries)
+
+    class FromAudio:
+        capabilities = _descriptor()
+
+        def transcribe(self, narration: Narration) -> tuple[tuple[str, float, float], ...]:
+            return (("decoded", 0.0, 1.0),) if narration.audio else ()
+
+    spoken = Narration(audio=b"\x00", boundaries=(WordBoundary("hi", 0.5, 0.25),))
+    assert isinstance(FromBoundaries(), Transcriber)
+    assert isinstance(FromAudio(), Transcriber)
+    assert FromBoundaries().transcribe(spoken) == (("hi", 0.5, 0.75),)
+    assert FromAudio().transcribe(spoken) == (("decoded", 0.0, 1.0),)
+
+
+def test_a_boundary_transcriber_refuses_audio_only_narration() -> None:
+    """Fabricating timings would ship captions that drift out of sync - far
+    harder to catch in review than a stage that failed."""
+
+    class FromBoundaries:
+        capabilities = _descriptor()
+
+        def transcribe(self, narration: Narration) -> tuple[tuple[str, float, float], ...]:
+            if narration.boundaries is None:
+                raise ValidationError("this engine emitted no word boundaries")
+            return ()
+
+    with pytest.raises(ValidationError, match="boundaries"):
+        FromBoundaries().transcribe(Narration(audio=b"\x00", boundaries=None))
 
 
 def test_a_synthesizer_missing_synthesize_does_not_satisfy_it() -> None:
@@ -112,3 +158,36 @@ def test_a_synthesizer_missing_synthesize_does_not_satisfy_it() -> None:
         capabilities = _descriptor()
 
     assert not isinstance(Fake(), SpeechSynthesizer)
+
+
+def test_a_conforming_visual_strategy_satisfies_the_protocol() -> None:
+    """Task 10's widening: ``plan`` now takes per-segment durations and a
+    candidate library, and returns ``VisualPlacement`` objects rather than
+    bare strings - see ``VisualStrategy``'s own docstring for why the
+    original shape could not express ``select_broll``'s selection. This
+    pins the widened shape at the protocol level, independent of
+    ``LibraryVisualStrategy``'s own conformance test in
+    ``tests/unit/providers/test_library_visual.py``."""
+
+    class Fake:
+        capabilities = _descriptor()
+
+        def plan(
+            self,
+            segment_durations: Sequence[float],
+            candidates: Sequence[VisualCandidate],
+            *,
+            seed: int,
+        ) -> tuple[VisualPlacement, ...]:
+            first = candidates[0]
+            return tuple(
+                VisualPlacement(asset_id=first.asset_id, in_point_s=0.0, duration_s=d)
+                for d in segment_durations
+            )
+
+    strategy = Fake()
+    assert isinstance(strategy, VisualStrategy)
+    candidate = VisualCandidate(asset_id="clip-1", duration_s=10.0)
+    assert strategy.plan([5.0], [candidate], seed=1) == (
+        VisualPlacement(asset_id="clip-1", in_point_s=0.0, duration_s=5.0),
+    )

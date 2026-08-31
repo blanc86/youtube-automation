@@ -1,0 +1,21 @@
+Metadata-Version: 2.1
+Name: ytauto-it-stages
+Version: 0.0.0
+Summary: Entry-point metadata for the integration suite's synthetic stages.
+
+This directory is hand-written distribution metadata, not an installed
+package. ``importlib.metadata`` discovers entry points by scanning every
+``sys.path`` entry for ``*.dist-info`` directories, and the integration
+fixtures already put ``tests/`` on ``sys.path`` (and on the ``PYTHONPATH`` a
+worker subprocess inherits) so that a worker can import the synthetic stage
+modules at all. Registering them here rather than in the project's own
+``pyproject.toml`` has three points in its favour:
+
+1. The shipped ``ytauto`` distribution does not advertise stages that live in
+   the test tree and would fail to import for anyone who installed it.
+2. No ``pip install -e .`` is needed for a test-only stage, so the suite
+   cannot silently run against stale entry-point metadata.
+3. It is the real third-party plugin path, exercised end to end: a *separate*
+   distribution registering ``ytauto.stages`` entry points is exactly how a
+   provider package will ship, and the integration suite now proves that
+   works across a process boundary instead of asserting it in prose.

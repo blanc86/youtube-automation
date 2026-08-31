@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% set nav = 'broll' %}
+{% block title %}B-roll · ytauto{% endblock %}
+
+{% block content %}
+  <div class="page-head">
+    <h1>B-roll library</h1>
+  </div>
+
+  <form method="post" action="{{ url_for('broll') }}" class="panel">
+    <h2>Add a clip</h2>
+    <p class="hint">
+      Adding transcodes the clip twice — once per canvas — so it takes a while. The source URL
+      and licence are required: that record is your DMCA defence.
+    </p>
+
+    <label for="path">File path</label>
+    <input id="path" name="path" type="text" required autocomplete="off"
+           placeholder="C:\clips\dark-forest-drive.mp4"
+           value="{{ form.path if form else '' }}" />
+
+    <div class="field-row">
+      <div>
+        <label for="source_url">Source URL</label>
+        <input id="source_url" name="source_url" type="text" required
+               placeholder="https://example.com/clip" value="{{ form.source_url if form else '' }}" />
+      </div>
+      <div>
+        <label for="licence">Licence</label>
+        <input id="licence" name="licence" type="text" required
+               placeholder="CC0" value="{{ form.licence if form else '' }}" />
+      </div>
+    </div>
+
+    <div class="field-row">
+      <div>
+        <label for="attribution">Attribution</label>
+        <input id="attribution" name="attribution" type="text" class="prose"
+               value="{{ form.attribution if form else '' }}" />
+      </div>
+      <div>
+        <label for="notes">Notes</label>
+        <input id="notes" name="notes" type="text" class="prose" value="{{ form.notes if form else '' }}" />
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="button primary">Add clip</button>
+    </div>
+  </form>
+
+  {# Only when something is actually in flight: an empty panel is a blank box
+     the reader has to work out the meaning of. #}
+  {% if pending_task %}
+    <section class="panel" id="broll-status"
+             data-poll-url="{{ url_for('task_status', task_id='TASK_ID') }}"
+             data-task-id="{{ pending_task.id }}">
+      <p class="status running">
+        <span class="spinner" aria-hidden="true"></span>
+        Adding {{ pending_task.label }} — transcoding to both canvases.
+      </p>
+    </section>
+  {% endif %}
+
+  {% if clips %}
+    <table>
+      <thead>
+        <tr>
+          <th>Clip</th>
+          <th>Duration</th>
+          <th>Source size</th>
+          <th>Licence</th>
+          <th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for clip in clips %}
+          <tr>
+            <td><code>{{ clip.id[:12] }}</code></td>
+            <td>{{ '%.1f'|format(clip.duration_s) }}s</td>
+            <td class="muted">{{ clip.width }}×{{ clip.height }}</td>
+            <td>{{ clip.licence }}{% if clip.attribution %} <span class="muted">({{ clip.attribution }})</span>{% endif %}</td>
+            <td class="truncate muted">{{ clip.source_url }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No clips yet. The selector needs three or four before a render stops repeating itself.</p>
+  {% endif %}
+{% endblock %}

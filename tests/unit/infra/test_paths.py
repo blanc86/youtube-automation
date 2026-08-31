@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from ytauto.core.errors import ConfigurationError
-from ytauto.infra.paths import AppPaths
+from ytauto.infra.paths import AppPaths, ensure_writable_dir, resolve_output_dir
 
 
 def test_explicit_override_wins(tmp_path: Path) -> None:
@@ -64,3 +64,72 @@ def test_ensure_translates_oserror_to_configuration_error(
     with pytest.raises(ConfigurationError) as excinfo:
         paths.ensure()
     assert isinstance(excinfo.value.__cause__, PermissionError)
+
+
+# -- resolve_output_dir: where rendered videos land for the operator --------
+
+
+def _blocked_root(tmp_path: Path, name: str) -> Path:
+    """A path whose own creation is guaranteed to fail: ``name`` is written
+    as an ordinary *file*, so ``mkdir(parents=True)`` on anything underneath
+    it raises ``OSError`` (``NotADirectoryError`` on POSIX, a Windows
+    ``OSError`` with a "not a directory"-flavoured winerror on Windows) -
+    a portable way to simulate "cannot be created" without relying on
+    platform-specific permission bits.
+    """
+    blocker = tmp_path / name
+    blocker.write_text("not a directory", encoding="utf-8")
+    return blocker / "root"
+
+
+def test_resolve_output_dir_uses_videos_when_writable(tmp_path: Path) -> None:
+    videos = tmp_path / "Videos"
+    downloads = tmp_path / "Downloads"
+
+    result = resolve_output_dir(videos_dir=videos, downloads_dir=downloads)
+
+    assert result == videos / "ytauto"
+    assert result.is_dir()
+
+
+def test_resolve_output_dir_falls_back_to_downloads_when_videos_is_unusable(
+    tmp_path: Path,
+) -> None:
+    videos = _blocked_root(tmp_path, "videos-blocker")
+    downloads = tmp_path / "Downloads"
+
+    result = resolve_output_dir(videos_dir=videos, downloads_dir=downloads)
+
+    assert result == downloads / "ytauto"
+    assert result.is_dir()
+
+
+def test_resolve_output_dir_raises_naming_both_paths_when_both_are_unusable(
+    tmp_path: Path,
+) -> None:
+    videos = _blocked_root(tmp_path, "videos-blocker")
+    downloads = _blocked_root(tmp_path, "downloads-blocker")
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        resolve_output_dir(videos_dir=videos, downloads_dir=downloads)
+
+    message = str(excinfo.value)
+    assert str(videos / "ytauto") in message
+    assert str(downloads / "ytauto") in message
+
+
+def test_ensure_writable_dir_proves_a_real_write_not_just_permission_bits(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "probe-me"
+
+    assert ensure_writable_dir(target) is True
+    assert target.is_dir()
+    # The probe file itself must be cleaned up, not left behind.
+    assert list(target.iterdir()) == []
+
+
+def test_ensure_writable_dir_returns_false_rather_than_raising(tmp_path: Path) -> None:
+    blocked = _blocked_root(tmp_path, "blocker")
+
+    assert ensure_writable_dir(blocked) is False

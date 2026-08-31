@@ -11,18 +11,30 @@ test that passes for the wrong reason.
 
 ## Coordination — read this first
 
-Work is in flight on `phase-1b-queue-and-dispatcher`. **Do not edit these files**
-until that branch merges, or you will collide:
+`phase-1b-queue-and-dispatcher` **has merged** (f0d6524). The files it was
+holding — `infra/cas/store.py`, `infra/artifacts.py`, `app/scheduler/*`,
+`app/worker.py` — are now stable and safe to touch.
+
+Work is now in flight on `phase-2a-first-light`, which builds the first real
+pipeline stages. **Do not edit these files** until it merges:
 
 ```
-src/ytauto/infra/db/engine.py          src/ytauto/core/pipeline/*
-src/ytauto/infra/db/migrations.py      src/ytauto/core/models/artifact.py
-src/ytauto/infra/artifacts.py          src/ytauto/app/scheduler/*  (new)
-src/ytauto/infra/cas/store.py          src/ytauto/app/worker.py    (new)
+src/ytauto/app/scheduler/dispatcher.py   src/ytauto/core/ports/providers.py
+src/ytauto/app/worker.py                 src/ytauto/core/pipeline/stage.py
+src/ytauto/app/registry.py      (new)    src/ytauto/core/captions/*   (new)
+src/ytauto/app/stages/*         (new)    src/ytauto/core/pipeline/timeline.py (new)
+src/ytauto/providers/*          (new)    src/ytauto/infra/db/migrations.py
+src/ytauto/cli/__main__.py               src/ytauto/infra/broll.py    (new)
 ```
 
-Every task below stays clear of those. Claim one by commenting on its issue so
-two people don't take the same thing.
+Two protocol signatures are changing in that branch, so **do not start a TTS or
+transcriber adapter yet**: `SpeechSynthesizer.synthesize` will return a
+`Narration` (audio plus optional word boundaries) instead of `bytes`, and
+`Transcriber.transcribe` will take that `Narration` instead of raw audio. Every
+other port is unchanged.
+
+Individual tasks below carry their own note where they collide. Claim one by
+commenting on its issue so two people don't take the same thing.
 
 ---
 
@@ -290,9 +302,20 @@ completely reasonable first PR and will not leave you blocked.
 
 ## 12. Build the provider registry so features are pluggable
 
-**Difficulty:** medium · **Files:** new `src/ytauto/app/registry.py`, plus `pyproject.toml`
+**Difficulty:** medium · **Files:** `src/ytauto/app/registry.py`, plus `pyproject.toml`
 
-`app/registry.py` is specified in the design (§5.4) and does not exist. It is the
+> **NOT YET FILED AS AN ISSUE — held deliberately.** Phase 2a builds
+> `app/registry.py` with entry-point resolution as part of its Task 3, because
+> no pipeline stage can be constructed without it. Filing this now would send a
+> contributor head-on into that work.
+>
+> What Phase 2a does **not** build, and what this task becomes once it lands:
+> validating each provider's `CapabilityDescriptor` at load time, and proving a
+> provider shipped in a *separate installable package* is discovered. Both are
+> still real and still worth doing. Repost rescoped as "harden the registry"
+> after `phase-2a-first-light` merges.
+
+`app/registry.py` is specified in the design (§5.4). It is the
 one missing piece between "you can add a provider" and "someone else can add a
 provider without editing this repo."
 

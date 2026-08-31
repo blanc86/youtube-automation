@@ -7,8 +7,11 @@ change to core/ or app/.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from ytauto.core.models.narration import Narration
+from ytauto.core.models.visual import VisualCandidate, VisualPlacement
 from ytauto.core.ports.capability import CapabilityDescriptor
 
 
@@ -38,8 +41,18 @@ class SpeechSynthesizer(Protocol):
 
     capabilities: CapabilityDescriptor
 
-    def synthesize(self, text: str, *, voice: str) -> bytes:
-        """Return encoded audio bytes."""
+    def synthesize(self, text: str, *, voice: str) -> Narration:
+        """Return the synthesised audio, with word boundaries if this engine
+        emits them.
+
+        Returning ``Narration`` rather than bare bytes is what makes the free
+        captioning path possible: an engine that already knows where each word
+        starts (edge-tts reports offset+duration per word as it streams) has
+        given away for free exactly what ASR would otherwise need a GPU lease
+        to recover. An engine that reports nothing sets
+        ``Narration.boundaries`` to None, which is the signal a
+        boundary-consuming transcriber refuses on rather than guessing.
+        """
 
 
 @runtime_checkable
@@ -53,18 +66,53 @@ class Transcriber(Protocol):
 
     capabilities: CapabilityDescriptor
 
-    def transcribe(self, audio: bytes) -> tuple[tuple[str, float, float], ...]:
-        """Return (word, start_seconds, end_seconds) triples."""
+    def transcribe(self, narration: Narration) -> tuple[tuple[str, float, float], ...]:
+        """Return (word, start_seconds, end_seconds) triples.
+
+        Takes the whole ``Narration``, not just its bytes, so that the two
+        implementations differ only in which half they read: the free one
+        consumes ``boundaries`` and raises when it is None; the ASR one
+        ignores ``boundaries`` and decodes ``audio``. A bytes-only signature
+        would force the boundaries to travel beside the port as a second
+        argument every caller had to remember to pass.
+        """
 
 
 @runtime_checkable
 class VisualStrategy(Protocol):
-    """Populates a timeline's visual segments."""
+    """Populates a timeline's visual segments.
+
+    Widened for Task 10, the same way ``SpeechSynthesizer``/``Transcriber``
+    were widened in Task 3 (see that task's design note): the original
+    ``plan(duration_s: float, *, seed: int) -> tuple[str, ...]`` could not
+    express what ``select_broll`` actually needs. A timeline's segments are
+    independently sized (``core.pipeline.timeline.Segment``), so a single
+    ``duration_s`` cannot stand in for all of them; a bare tuple of strings
+    has nowhere to carry an in-point; and there was no parameter at all for
+    the candidate library a selection strategy draws from - it would have had
+    to be smuggled in at construction time instead, which ``make_stage``'s
+    "construct the provider unconditionally, no branch on settings" rule
+    does not comfortably accommodate for data that is itself a per-job
+    ``settings`` value (the manifest digest). There are zero implementations
+    of the old shape anywhere in the codebase, so this costs nothing today.
+    """
 
     capabilities: CapabilityDescriptor
 
-    def plan(self, duration_s: float, *, seed: int) -> tuple[str, ...]:
-        """Return ordered visual asset references covering the duration."""
+    def plan(
+        self,
+        segment_durations: Sequence[float],
+        candidates: Sequence[VisualCandidate],
+        *,
+        seed: int,
+    ) -> tuple[VisualPlacement, ...]:
+        """Return one ``VisualPlacement`` per entry in ``segment_durations``,
+        in the same order, each drawn from ``candidates``.
+
+        Implementations are free to repeat a candidate once every eligible
+        one has been used, but must never choose a candidate shorter than the
+        segment it would fill.
+        """
 
 
 @runtime_checkable

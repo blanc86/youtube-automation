@@ -104,7 +104,73 @@ _M003 = Migration(
     ),
 )
 
-MIGRATIONS: tuple[Migration, ...] = (_M001, _M002, _M003)
+_M004 = Migration(
+    version=4,
+    name="projects_and_broll",
+    statements=(
+        """
+        CREATE TABLE projects (
+            id            TEXT PRIMARY KEY,
+            slug          TEXT NOT NULL UNIQUE,
+            title         TEXT NOT NULL,
+            story_digest  TEXT,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE broll_clips (
+            id                          TEXT PRIMARY KEY,
+            source_digest               TEXT NOT NULL,
+            normalised_landscape_digest TEXT NOT NULL,
+            normalised_vertical_digest  TEXT NOT NULL,
+            duration_s                  REAL NOT NULL,
+            width                       INTEGER NOT NULL,
+            height                      INTEGER NOT NULL,
+            source_url                  TEXT NOT NULL,
+            licence                     TEXT NOT NULL,
+            attribution                 TEXT NOT NULL DEFAULT '',
+            notes                       TEXT NOT NULL DEFAULT '',
+            added_at                    TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_broll_source_digest ON broll_clips (source_digest)",
+    ),
+)
+
+_M005 = Migration(
+    version=5,
+    name="music_tracks",
+    statements=(
+        # Deliberately shaped like broll_clips, minus the per-canvas
+        # normalisation: one audio file serves both canvases unchanged, so
+        # there is a single digest here where B-roll needs three.
+        #
+        # source_url and licence are NOT NULL for the same reason they are on
+        # broll_clips, only more so. Music is the most Content-ID-claimed
+        # asset class on YouTube by a wide margin - a claim on the bed costs
+        # the video's monetisation whatever the footage under it is licensed
+        # as - so a track with no recorded provenance is exactly the row this
+        # table must refuse to hold.
+        """
+        CREATE TABLE music_tracks (
+            id            TEXT PRIMARY KEY,
+            source_digest TEXT NOT NULL,
+            duration_s    REAL NOT NULL,
+            title         TEXT NOT NULL DEFAULT '',
+            source_url    TEXT NOT NULL,
+            licence       TEXT NOT NULL,
+            attribution   TEXT NOT NULL DEFAULT '',
+            notes         TEXT NOT NULL DEFAULT '',
+            added_at      TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_music_source_digest ON music_tracks (source_digest)",
+    ),
+)
+
+MIGRATIONS: tuple[Migration, ...] = (_M001, _M002, _M003, _M004, _M005)
 HEAD_VERSION: int = MIGRATIONS[-1].version
 
 

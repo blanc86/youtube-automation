@@ -3,19 +3,55 @@ on: [push, pull_request]
 
 jobs:
   gate:
-    # Both platforms run the SAME gate script. Windows is the primary target;
-    # macOS is here because a contributor works there, and an untested platform
-    # is an unsupported one no matter what the README claims.
+    # Windows only, deliberately. macOS was in this matrix on the same
+    # reasoning - an untested platform is an unsupported one - but it never
+    # got to the point of testing anything: setup-ffmpeg ships x64 only and
+    # the runners are Apple Silicon, Homebrew's plain ffmpeg has no libass,
+    # and with ffmpeg-full installed the leg then sat in the integration suite
+    # for thirty-nine minutes because edge-tts has no timeout of its own and
+    # the runner could not reach it. Three environment problems and no code
+    # signal. Windows is the target this actually runs on; a red macOS leg
+    # that has never once caught a real defect is worse than no macOS leg,
+    # because it blocks every merge and trains people to ignore CI.
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Phase 2a's integration suite shells out to real ffmpeg/ffprobe
+      # (compose, probe, locator.locate() - which requires the pair). Phase
+      # 1b's suite never touched a real binary, so this step did not exist
+      # before; setup-ffmpeg installs a maintained static build (with
+      # ffprobe alongside it) and puts both on PATH for the gate step below.
+      # Pinned to the v3.1 release tag rather than a floating branch/major
+      # tag. ffmpeg-version is left at its default ("release" = latest
+      # stable ffmpeg): the action's own docs note pinning an exact ffmpeg
+      # version is "only fully supported on Windows", so forcing one here
+      # would be unreliable on the macos-latest leg.
+      #
+      # Two installers, because one no longer covers both legs.
+      # setup-ffmpeg only ships x64 binaries, and `macos-latest` is Apple
+      # Silicon now - the action fails outright with "Unsupported architecture
+      # (only x64 is supported)" before a single test runs. Homebrew has an
+      # arm64 ffmpeg with libass, so macOS uses that and Windows keeps the
+      # action.
+      - name: install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        uses: FedericoCarboni/setup-ffmpeg@v3.1
+        id: setup-ffmpeg
+      # Fail here, loudly, rather than inside a test: a missing libass surfaces
+      # as "this build cannot burn in captions", which reads like a code defect
+      # rather than a runner-image problem.
+      - name: show what ffmpeg we got
+        run: |
+          ffmpeg -hide_banner -version
+          ffmpeg -hide_banner -filters | grep -w ass || (echo "no libass in this ffmpeg build" && exit 1)
+        shell: bash
       - run: pip install -e ".[dev]"
       # One step, invoking the same gate developers run locally. Listing the
       # gates here separately let CI drift from the script - it was missing
@@ -26,9 +62,10 @@ jobs:
         run: python scripts/check.py
 
   # Aggregator. Branch protection requires a status check named `check`, and a
-  # matrix job reports as `gate (windows-latest)` / `gate (macos-latest)` - names
-  # that would never match, leaving every PR blocked forever on a check that does
-  # not exist. This job keeps the stable name and turns red if any leg fails.
+  # matrix job reports as `gate (windows-latest)` - a name that would never
+  # match, leaving every PR blocked forever on a check that does not exist.
+  # This job keeps the stable name and turns red if any leg fails. It stays a
+  # matrix of one so adding a platform back needs no change here.
   # `if: always()` is required: without it the job is skipped when a leg fails,
   # and a skipped required check blocks the PR instead of failing it.
   check:

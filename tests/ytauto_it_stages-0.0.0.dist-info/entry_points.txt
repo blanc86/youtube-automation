@@ -1,0 +1,8 @@
+[ytauto.stages]
+t14-three-stage:fetch = integration.test_resume:make_fetch
+t14-three-stage:tts = integration.test_resume:make_tts
+t14-three-stage:render = integration.test_resume:make_render
+it-flood:flood = integration.stages:make_stderr_flooder
+it-fingerprint:fixed = integration.stages:make_fixed_fingerprint
+it-fingerprint:unfingerprintable = integration.stages:make_unfingerprintable
+it-encoding:chatty = integration.test_worker_encoding:make_chatty

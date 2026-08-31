@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% set nav = 'projects' %}
+{% block title %}Projects · ytauto{% endblock %}
+
+{% block content %}
+  <div class="page-head">
+    <h1>Projects</h1>
+    <a class="button primary" href="{{ url_for('new_project') }}">New project</a>
+  </div>
+
+  {% if projects %}
+    <table>
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>Slug</th>
+          <th>Last job</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for project in projects %}
+          <tr>
+            <td><a href="{{ url_for('project', slug=project.slug) }}">{{ project.title }}</a></td>
+            <td><code>{{ project.slug }}</code></td>
+            <td>
+              {% if project.last_state %}
+                <span class="state state-{{ project.last_state }}">{{ project.last_state }}</span>
+              {% else %}
+                <span class="muted">never run</span>
+              {% endif %}
+            </td>
+            <td class="muted">{{ project.created_at[:16].replace('T', ' ') }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">
+      No projects yet. <a href="{{ url_for('new_project') }}">Create one</a> — paste a story,
+      give it a title, and render it.
+    </p>
+  {% endif %}
+{% endblock %}

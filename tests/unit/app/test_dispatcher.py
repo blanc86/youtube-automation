@@ -1,17 +1,26 @@
 import io
+import os
 import sqlite3
-from collections.abc import Iterator, Sequence
+import subprocess
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
 
 import pytest
 
 import ytauto.app.scheduler.dispatcher as dispatcher_module
-from ytauto.app.scheduler.dispatcher import _MAX_STAGE_ATTEMPTS, Dispatcher, StagedArtifact
+from ytauto.app.scheduler.dispatcher import (
+    _MAX_STAGE_ATTEMPTS,
+    Dispatcher,
+    StagedArtifact,
+    _build_assignment,
+)
 from ytauto.app.scheduler.governor import Governor
-from ytauto.app.scheduler.queue import JobQueue
+from ytauto.app.scheduler.queue import ClaimedJob, JobQueue
 from ytauto.app.scheduler.worker_protocol import Error
-from ytauto.core.errors import ErrorKind
+from ytauto.app.services.projects import ProjectService
+from ytauto.core.errors import ErrorKind, ValidationError
 from ytauto.core.models.artifact import ArtifactRef
 from ytauto.core.models.content_hash import ContentHash
 from ytauto.core.pipeline.graph import Pipeline
@@ -28,10 +37,16 @@ from ytauto.infra.db.migrations import apply_migrations
 _FETCH_FINGERPRINT = "a" * 64
 _TTS_FINGERPRINT = "b" * 64
 _SOLO_FINGERPRINT = "c" * 64
+_RENDER_FINGERPRINT = "d" * 64
 _TEST_PIPELINE_ID = "test-pipeline"
 _SOLO_PIPELINE_ID = "solo-pipeline"
 
-_FINGERPRINTS = {"fetch": _FETCH_FINGERPRINT, "tts": _TTS_FINGERPRINT, "only": _SOLO_FINGERPRINT}
+_FINGERPRINTS = {
+    "fetch": _FETCH_FINGERPRINT,
+    "tts": _TTS_FINGERPRINT,
+    "only": _SOLO_FINGERPRINT,
+    "render": _RENDER_FINGERPRINT,
+}
 
 
 class _FixedStage:
@@ -42,14 +57,36 @@ class _FixedStage:
     dispatcher's own probe to land on a fingerprint the test can predict in
     advance, without replicating JobContext/build_spec/compute_fingerprint
     here - so it is a fixed constant per stage_id.
+
+    ``capture`` is how the settings-plumbing test sees what the dispatcher put
+    in the ``JobContext``: ``fingerprint`` is the first and only thing
+    ``tick()`` hands a stage before it decides between a cache hit and a
+    spawn, so it is the one hook that works on both paths.
     """
 
-    def __init__(self, stage_id: str, depends_on: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        stage_id: str,
+        depends_on: tuple[str, ...] = (),
+        *,
+        capture: Callable[[Mapping[str, object]], None] | None = None,
+        gpu_pool: str = "gpu_compute",
+    ) -> None:
         self.id = stage_id
         self.version = 1
         self.depends_on = depends_on
+        self.settings_keys: tuple[str, ...] = ()
+        self._capture = capture
+        # gpu_pool is a required Stage Protocol member (Task 11's review),
+        # read directly by _spawn with no getattr fallback - so every double
+        # must always carry one. Defaults to "gpu_compute", matching every
+        # pre-Task-11 stage; a test that cares about a different pool passes
+        # gpu_pool= explicitly.
+        self.gpu_pool = gpu_pool
 
     def fingerprint(self, ctx: JobContext) -> str:
+        if self._capture is not None:
+            self._capture(ctx.settings)
         return _FINGERPRINTS[self.id]
 
     def run(self, ctx: JobContext, emit: ProgressFn) -> StageResult:
@@ -60,16 +97,33 @@ class _FixedStage:
         )
 
 
-def _test_pipeline() -> Pipeline:
+def _test_pipeline(capture: Callable[[Mapping[str, object]], None] | None = None) -> Pipeline:
     """fetch -> tts."""
     return Pipeline(
         id=_TEST_PIPELINE_ID,
-        stages=(_FixedStage("fetch"), _FixedStage("tts", depends_on=("fetch",))),
+        stages=(
+            _FixedStage("fetch", capture=capture),
+            _FixedStage("tts", depends_on=("fetch",), capture=capture),
+        ),
     )
 
 
 def _solo_pipeline() -> Pipeline:
     return Pipeline(id=_SOLO_PIPELINE_ID, stages=(_FixedStage("only"),))
+
+
+def _project(
+    conn: sqlite3.Connection, *, slug: str, settings: dict[str, object] | None = None
+) -> str:
+    """A real ``projects`` row, returning its generated id.
+
+    Every job below needs one: ``tick()`` reads the claimed job's project
+    settings into the ``JobContext`` it builds, so a job pointing at a project
+    that does not exist is unrunnable rather than settingless.
+    """
+    return ProjectService(conn).create(
+        slug=slug, title=slug, story_digest=None, settings={} if settings is None else settings
+    )
 
 
 class _FakeProcess:
@@ -137,6 +191,69 @@ class DeadOnArrivalSpawnSpy(SpawnSpy):
         return proc
 
 
+class _NeverExitingProcess:
+    """A subprocess.Popen double whose stdout blocks forever until killed.
+
+    Backed by a genuine OS pipe (``os.pipe()``), not ``io.StringIO``: an
+    empty ``StringIO`` reaches EOF immediately, which cannot exercise the
+    blocking read the pump deadline (Step 5's test) needs to interrupt. The
+    pipe's write end is never closed by anything except ``kill()`` - a silent,
+    immortal worker - so ``_pump``'s ``for raw_line in stdout`` loop stays
+    blocked until something calls it, exactly the way killing a real worker
+    closes its real stdout pipe and ends the loop through its ordinary EOF
+    path.
+    """
+
+    def __init__(self) -> None:
+        self.pid = -1
+        self.returncode: int | None = None
+        read_fd, self._write_fd = os.pipe()
+        self.stdin: io.StringIO = io.StringIO()
+        self.stdout: io.TextIOWrapper | None = io.TextIOWrapper(
+            io.FileIO(read_fd, "rb"), encoding="utf-8"
+        )
+        self.stderr: io.StringIO | None = io.StringIO("")
+        self._exited = threading.Event()
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._exited.wait(timeout=timeout):
+            raise subprocess.TimeoutExpired(cmd="never-exiting", timeout=timeout or 0)
+        assert self.returncode is not None
+        return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        if self._exited.is_set():
+            return
+        self.returncode = -9
+        os.close(self._write_fd)
+        self._exited.set()
+
+    def terminate(self) -> None:
+        self.kill()
+
+
+class NeverExitingSpawnSpy:
+    """Replaces subprocess.Popen with a worker that writes nothing and never
+    exits - the case the pump deadline (not the stderr-file fix) bounds.
+
+    Not a SpawnSpy subclass: SpawnSpy.__call__ is typed to return
+    _FakeProcess, and this needs to return an unrelated double.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.processes: list[_NeverExitingProcess] = []
+
+    def __call__(self, argv: Sequence[str], **kwargs: object) -> _NeverExitingProcess:
+        self.calls += 1
+        proc = _NeverExitingProcess()
+        self.processes.append(proc)
+        return proc
+
+
 @pytest.fixture()
 def store(tmp_path: Path, db_conn: sqlite3.Connection) -> CasStore:
     """A CasStore sharing the migrated connection from ``db_conn``."""
@@ -181,7 +298,7 @@ def dispatcher(
         queue,
         pipelines={_TEST_PIPELINE_ID: _test_pipeline(), _SOLO_PIPELINE_ID: _solo_pipeline()},
     )
-    queue.enqueue("j1", "p1", _TEST_PIPELINE_ID)
+    queue.enqueue("j1", _project(db_conn, slug="p1"), _TEST_PIPELINE_ID)
     queue.claim("baseline-owner", lease_s=-1)  # already expired
     _mark_stage(db_conn, "j1", "tts", "running")
     return d
@@ -213,6 +330,71 @@ def _status(conn: sqlite3.Connection, job_id: str, stage_id: str) -> str | None:
         "SELECT status FROM job_stages WHERE job_id = ? AND stage_id = ?", (job_id, stage_id)
     ).fetchone()
     return str(row["status"]) if row is not None else None
+
+
+def _dispatcher(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    *,
+    pump_deadline_s: float = 1800.0,
+    capture_ctx: Callable[[Mapping[str, object]], None] | None = None,
+) -> Dispatcher:
+    """Build a fresh Dispatcher over the two-stage test pipeline, with nothing
+    enqueued yet.
+
+    Unlike the ``dispatcher`` fixture (pre-wired with "j1" already claimed and
+    its "tts" stage running - the baseline every reap()-focused test needs),
+    this starts from an empty queue so a test can control both what gets
+    enqueued and pump_deadline_s, which the fixture has no way to override.
+
+    ``capture_ctx`` is handed each stage's ``JobContext.settings`` as the
+    dispatcher fingerprints it.
+    """
+    store = CasStore(root=tmp_path / "cas", conn=conn)
+    artifacts = ArtifactStore(store, conn)
+    governor = Governor()
+    queue = JobQueue(conn)
+    return Dispatcher(
+        conn,
+        store,
+        artifacts,
+        governor,
+        queue,
+        pipelines={
+            _TEST_PIPELINE_ID: _test_pipeline(capture_ctx),
+            _SOLO_PIPELINE_ID: _solo_pipeline(),
+        },
+        pump_deadline_s=pump_deadline_s,
+    )
+
+
+def _enqueue(
+    conn: sqlite3.Connection,
+    job_id: str,
+    *,
+    project_id: str | None = None,
+    stages: tuple[str, ...] = ("fetch", "tts"),
+) -> None:
+    """Enqueue a fresh job against ``_test_pipeline()`` (fetch -> tts).
+
+    ``project_id`` defaults to a project created on the spot, slugged after
+    the job, since ``tick()`` requires the row to exist; pass one explicitly
+    when the test cares what settings it holds.
+
+    ``stages`` documents which stage(s) the calling test actually drives; the
+    pipeline itself is always the fixed fetch->tts one, so passing a
+    different tuple does not change what runs - it exists for readability at
+    call sites.
+    """
+    if project_id is None:
+        project_id = _project(conn, slug=job_id)
+    JobQueue(conn).enqueue(job_id, project_id, _TEST_PIPELINE_ID)
+
+
+def _job_last_error(conn: sqlite3.Connection, job_id: str) -> str:
+    row = conn.execute("SELECT last_error FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    last_error = row["last_error"]
+    return str(last_error) if last_error is not None else ""
 
 
 def _job_state(conn: sqlite3.Connection, job_id: str) -> str:
@@ -277,7 +459,7 @@ def _complete_a_one_stage_job(dispatcher: Dispatcher, store: CasStore) -> Conten
     """Run a fresh one-stage job to completion via commit_stage, returning its
     output digest so the caller can assert on the CAS's post-completion state."""
     job_id = "solo"
-    dispatcher._queue.enqueue(job_id, "p1", _SOLO_PIPELINE_ID)
+    dispatcher._queue.enqueue(job_id, _project(dispatcher._conn, slug="solo"), _SOLO_PIPELINE_ID)
     dispatcher._queue.claim("solo-owner", lease_s=60)
     _mark_stage(dispatcher._conn, job_id, "only", "running")
     data = b"solo output"
@@ -286,6 +468,73 @@ def _complete_a_one_stage_job(dispatcher: Dispatcher, store: CasStore) -> Conten
         job_id, "only", _SOLO_FINGERPRINT, [_staged(digest, size_bytes=len(data))]
     )
     return digest
+
+
+def _claimed() -> ClaimedJob:
+    return ClaimedJob(job_id="j1", project_id="p1", pipeline_id="story_video", attempts=0)
+
+
+def _assignment_ctx() -> JobContext:
+    return JobContext(
+        job_id="j1",
+        project_id="p1",
+        settings={"voice": "en-GB-RyanNeural"},
+        inputs={},
+        workdir=Path("/tmp/j1/fetch"),
+    )
+
+
+def test_a_stages_context_carries_the_projects_real_settings(
+    db_conn: sqlite3.Connection, tmp_path: Path, spawn_spy: SpawnSpy
+) -> None:
+    """The dispatcher hardcoded settings={} until this task. A regression to
+    that would leave every stage running on defaults, failing nothing: the
+    fingerprint would still be stable, the cache would still hit, and two
+    projects with different voices would quietly share one narration."""
+    project_id = _project(db_conn, slug="s", settings={"voice": "en-GB-RyanNeural"})
+    seen: dict[str, object] = {}
+    dispatcher = _dispatcher(db_conn, tmp_path, capture_ctx=seen.update)
+    _enqueue(db_conn, "j1", project_id=project_id)
+
+    dispatcher.tick()
+
+    assert seen["voice"] == "en-GB-RyanNeural", "project settings must reach the JobContext"
+
+
+def test_a_job_whose_project_does_not_exist_is_refused(
+    db_conn: sqlite3.Connection, tmp_path: Path, spawn_spy: SpawnSpy
+) -> None:
+    """The contrast that keeps the test above honest.
+
+    Falling back to an empty mapping for a missing project would make that
+    test pass for a project that was never created, and would record cache
+    entries under fingerprints no correctly-configured run reproduces. An
+    unrunnable job is refused the same way an unknown pipeline id is.
+    """
+    JobQueue(db_conn).enqueue("j1", "no-such-project", _TEST_PIPELINE_ID)
+    dispatcher = _dispatcher(db_conn, tmp_path)
+
+    with pytest.raises(ValidationError, match="no-such-project"):
+        dispatcher.tick()
+
+    assert spawn_spy.calls == 0
+
+
+def test_the_assignment_carries_pipeline_id_not_a_stage_import() -> None:
+    """The worker resolves stages through the registry now; a lingering
+    stage_import would work by reflection and silently bypass the registry -
+    running a stage the entry-point table never named, with none of the
+    constructor arguments a real stage needs."""
+    assignment = _build_assignment(
+        _claimed(), _FixedStage("fetch"), _assignment_ctx(), "f" * 64, "/cas"
+    )
+
+    assert assignment["pipeline_id"] == "story_video"
+    assert "stage_import" not in assignment
+    assert assignment["stage_id"] == "fetch"
+    assert assignment["settings"] == {"voice": "en-GB-RyanNeural"}, (
+        "the worker's only source of settings is this payload"
+    )
 
 
 def test_a_cache_hit_marks_the_stage_skipped_without_spawning_a_worker(
@@ -319,6 +568,77 @@ def test_a_claimed_job_with_nothing_ready_goes_back_to_the_queue(
     assert report.idle
     assert spawn_spy.calls == 0
     assert _job_state(db_conn, "j1") == "queued", "an unadvanceable claim must be released"
+
+
+def test_a_stage_with_a_gpu_pool_attribute_leases_from_that_pool(
+    db_conn: sqlite3.Connection, tmp_path: Path, spawn_spy: SpawnSpy
+) -> None:
+    """Task 11's ``ComposeStage`` sets ``gpu_pool = "gpu_encode"`` so a render
+    competes for encode hardware, never for the ``gpu_compute`` pool a future
+    Whisper-based ``Transcriber`` will need. ``_spawn`` must read that
+    attribute rather than always leasing ``"gpu_compute"``."""
+    store = CasStore(root=tmp_path / "cas", conn=db_conn)
+    artifacts = ArtifactStore(store, db_conn)
+    governor = Governor()
+    queue = JobQueue(db_conn)
+    pipeline_id = "encode-pipeline"
+    pipeline = Pipeline(id=pipeline_id, stages=(_FixedStage("render", gpu_pool="gpu_encode"),))
+    d = Dispatcher(db_conn, store, artifacts, governor, queue, pipelines={pipeline_id: pipeline})
+
+    leased_pools: list[str] = []
+    real_lease = governor.lease
+
+    def _spying_lease(pool: str, owner: str) -> object:
+        leased_pools.append(pool)
+        return real_lease(pool, owner)
+
+    governor.lease = _spying_lease  # type: ignore[method-assign]
+
+    project_id = _project(db_conn, slug="encode")
+    queue.enqueue("j-encode", project_id, pipeline_id)
+
+    report = d.tick()
+
+    assert report.spawned == ("render",)
+    assert leased_pools == ["gpu_encode"], "must lease gpu_encode, never the gpu_compute default"
+    assert governor.available("gpu_compute") == 1, "gpu_compute must be untouched by this spawn"
+
+
+def test_a_stage_with_the_default_gpu_pool_leases_gpu_compute(
+    dispatcher: Dispatcher, governor: Governor, queue: JobQueue, spawn_spy: SpawnSpy
+) -> None:
+    """The path every pre-Task-11 stage relies on: ``_FixedStage``'s default
+    ``gpu_pool="gpu_compute"`` (mirroring every real stage's own explicit
+    ``gpu_pool = "gpu_compute"``) must behave exactly as before this task's
+    Protocol change made the attribute required."""
+    queue.requeue("j1", available_in_s=-1)
+
+    report = dispatcher.tick()
+
+    assert report.spawned == ("fetch",)
+    assert governor.available("gpu_encode") == 1, "gpu_encode must be untouched"
+
+
+def test_a_stage_declaring_an_unknown_gpu_pool_fails_loudly_and_names_the_stage(
+    db_conn: sqlite3.Connection, tmp_path: Path, spawn_spy: SpawnSpy
+) -> None:
+    """A typo in a stage's own ``gpu_pool`` (``"gpu_pol"``, say) must not
+    silently degrade to anything - it must fail loudly, naming the stage
+    that got it wrong, before ever reaching ``Governor.lease``."""
+    store = CasStore(root=tmp_path / "cas", conn=db_conn)
+    artifacts = ArtifactStore(store, db_conn)
+    governor = Governor()
+    queue = JobQueue(db_conn)
+    pipeline_id = "bad-pool-pipeline"
+    pipeline = Pipeline(id=pipeline_id, stages=(_FixedStage("render", gpu_pool="gpu_pol"),))
+    d = Dispatcher(db_conn, store, artifacts, governor, queue, pipelines={pipeline_id: pipeline})
+    project_id = _project(db_conn, slug="bad-pool")
+    queue.enqueue("j-bad-pool", project_id, pipeline_id)
+
+    with pytest.raises(ValidationError, match="render.*gpu_pol"):
+        d.tick()
+
+    assert spawn_spy.calls == 0, "no worker may start while the pool is invalid"
 
 
 def test_a_refused_lease_is_not_reported_as_a_spawn(
@@ -501,6 +821,34 @@ def test_a_worker_that_dies_without_a_terminal_message_is_not_respawned_forever(
     assert db_conn.execute("SELECT last_error FROM jobs WHERE id='j1'").fetchone()["last_error"]
 
 
+def test_a_worker_that_never_exits_is_killed_by_the_pump_deadline(
+    db_conn: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A silent, immortal worker must not hang the dispatcher forever.
+
+    The stderr-to-file fix (this task's other half) does nothing for this
+    case: a worker that writes nothing at all to either pipe and never exits
+    still blocks ``_pump``'s ``for raw_line in stdout`` forever, since that
+    loop has no timeout of its own. Only the watchdog bounds it.
+
+    ``NeverExitingSpawnSpy`` hands back a process backed by a genuine OS pipe
+    whose write end nothing closes except its own ``kill()`` - see
+    ``_NeverExitingProcess`` for why ``io.StringIO`` (the rest of this file's
+    doubles) cannot exercise a blocking read at all.
+    """
+    spy = NeverExitingSpawnSpy()
+    monkeypatch.setattr(dispatcher_module, "Popen", spy)
+    dispatcher = _dispatcher(db_conn, tmp_path, pump_deadline_s=0.2)
+    _enqueue(db_conn, "j1", stages=("fetch",))
+
+    report = dispatcher.tick()
+
+    assert report.spawned == ("fetch",)
+    assert _status(db_conn, "j1", "fetch") == "pending", "a timed-out stage must reset"
+    assert _stage_attempts(db_conn, "j1", "fetch") == 1, "a deadline kill must charge an attempt"
+    assert "deadline" in _job_last_error(db_conn, "j1")
+
+
 def test_a_FATAL_error_fails_the_job_without_requeueing(
     dispatcher: Dispatcher, db_conn: sqlite3.Connection
 ) -> None:
@@ -678,7 +1026,7 @@ def test_completing_a_job_survives_a_writer_committing_mid_release(
         pipelines={_SOLO_PIPELINE_ID: _solo_pipeline()},
     )
 
-    queue.enqueue("solo", "p1", _SOLO_PIPELINE_ID)
+    queue.enqueue("solo", _project(conn_a, slug="solo"), _SOLO_PIPELINE_ID)
     queue.claim("owner", lease_s=60)
     digest = cas.put_bytes(b"solo output", kind="blob")
     artifacts.record(

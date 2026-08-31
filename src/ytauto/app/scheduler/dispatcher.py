@@ -34,9 +34,13 @@ paths go through ``_release_job_pins``; failure has to release too, because
 ``queue.fail`` is terminal and ``claim()`` matches only ``state =
 'queued'``, so nothing can ever revisit a failed job to tidy up after it.
 
-**Governor lease ownership.** Every ``gpu_compute`` lease this module
-acquires is owned by the string ``f"{job_id}:{stage_id}"`` - one stage
-attempt, one owner. ``reap()`` reconstructs that same string from
+**Governor lease ownership.** Every GPU lease this module acquires - from
+``gpu_compute`` or, for a stage that opts into it (see ``_spawn``), from
+``gpu_encode`` - is owned by the string ``f"{job_id}:{stage_id}"`` - one
+stage attempt, one owner, regardless of which pool it came from.
+``release_all(owner)`` frees every lease that owner holds across every pool
+(``Governor``'s own contract), so ``reap()`` does not need to know which
+pool a dead worker's stage used. ``reap()`` reconstructs that same string from
 ``job_stages`` rows still marked ``running`` under a job whose lease expired,
 so it can call ``Governor.release_all`` for a worker that died holding a
 lease it can never release itself.
@@ -59,13 +63,15 @@ import json
 import sqlite3
 import subprocess
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import Popen
+from typing import IO
 
-from ytauto.app.scheduler.governor import Governor
+from ytauto.app.scheduler.governor import KNOWN_POOLS, Governor
 from ytauto.app.scheduler.queue import ClaimedJob, JobQueue
 from ytauto.app.scheduler.runner import gather_inputs
 from ytauto.app.scheduler.worker_protocol import (
@@ -75,6 +81,7 @@ from ytauto.app.scheduler.worker_protocol import (
     Staged,
     decode,
 )
+from ytauto.app.services.projects import ProjectService
 from ytauto.core.errors import ErrorKind, ValidationError
 from ytauto.core.models.artifact import ArtifactRef
 from ytauto.core.models.content_hash import ContentHash
@@ -87,11 +94,12 @@ from ytauto.infra.clock import utc_now_iso
 from ytauto.infra.db.engine import transaction
 
 _DEFAULT_JOB_LEASE_S = 300.0
+_DEFAULT_PUMP_DEADLINE_S = 1800.0
+"""Bounds a worker that writes nothing to stdout and never exits - see _pump."""
 _DEFAULT_RETRY_AFTER_S = 60.0
 _BASE_BACKOFF_S = 5.0
 _MAX_BACKOFF_S = 3600.0
 _MAX_STAGE_ATTEMPTS = 5
-_GPU_POOL = "gpu_compute"
 
 
 @dataclass(frozen=True)
@@ -134,26 +142,32 @@ def _build_assignment(
 ) -> dict[str, object]:
     """Serialise everything ``app/worker.py`` needs to run one stage.
 
-    ``stage_import`` (``"module:QualName"``, resolved by reflection off the
-    stage's own class) is a placeholder for the provider/stage registry
-    Phase 2 will build: Phase 1b ships no concrete ``Stage`` implementations
-    to register, so the worker imports and zero-arg-constructs the same
-    class the dispatcher already holds a reference to. It only works for a
-    module-level class with a no-argument constructor - true of every
-    synthetic test stage in this phase, not guaranteed once real provider
-    parameters exist.
+    ``pipeline_id`` plus ``stage_id`` is the registry key
+    (``app/registry.py``): the worker rebuilds the stage from the
+    ``ytauto.stages`` entry point named ``"<pipeline_id>:<stage_id>"``, handing
+    it the CAS store it opened and the settings below. It replaces the
+    ``stage_import`` string this used to carry - ``"module:QualName"``,
+    resolved by reflection off the dispatcher's own in-memory stage object and
+    zero-arg constructed on the far side - which could not give a stage its
+    ``CasStore`` or its settings at all, and which would have silently
+    bypassed the registry for any stage that happened to remain zero-arg
+    constructible.
+
+    ``settings`` is the project's real settings mapping (see ``tick``), so
+    ``json.dumps`` on the result can now fail on a value a project stored
+    that is not JSON-serialisable. ``_spawn`` serialises *before* it spawns
+    for exactly that reason.
     """
-    stage_type = type(stage)
     return {
         "job_id": claimed.job_id,
         "stage_id": stage.id,
         "project_id": claimed.project_id,
+        "pipeline_id": claimed.pipeline_id,
         "correlation_id": f"{claimed.job_id}:{stage.id}:{claimed.attempts}",
         "cas_root": cas_root,
         "workdir": str(ctx.workdir),
         "settings": dict(ctx.settings),
         "fingerprint": fingerprint,
-        "stage_import": f"{stage_type.__module__}:{stage_type.__qualname__}",
         "inputs": {
             stage_id: [
                 {"name": artifact.name, "kind": artifact.kind, "digest": str(artifact.digest)}
@@ -221,7 +235,17 @@ class Dispatcher:
     Nothing in the schema stores a serialised pipeline - a job's DAG is code,
     constructed once at process start and handed in here - so the caller
     that assembles a ``Dispatcher`` is also the one place a pipeline
-    registry needs to exist.
+    registry needs to exist. ``app.registry.build_pipeline`` is what a caller
+    is expected to build that mapping with; this class deliberately does not
+    call it itself, so a test can hand in a pipeline nothing has registered.
+
+    Note that these stage objects are constructed once, per process, while a
+    worker's are constructed per job from that job's own settings. The two
+    must agree on ``fingerprint``, which is why ``Stage.fingerprint`` has to
+    be a pure function of its ``JobContext`` - a stage that fingerprinted
+    something decided at construction time (a provider chosen from the
+    settings its factory was handed) would have the dispatcher record one
+    digest and the worker compute another.
     """
 
     def __init__(
@@ -235,6 +259,7 @@ class Dispatcher:
         pipelines: Mapping[str, Pipeline],
         owner: str = "dispatcher",
         job_lease_s: float = _DEFAULT_JOB_LEASE_S,
+        pump_deadline_s: float = _DEFAULT_PUMP_DEADLINE_S,
     ) -> None:
         # Must be the exact connection `cas`/`artifacts`/`queue` were
         # themselves constructed with - the module docstring's "one
@@ -247,9 +272,16 @@ class Dispatcher:
         self._artifacts = artifacts
         self._governor = governor
         self._queue = queue
+        # Built from the connection this dispatcher already owns rather than
+        # injected: a constructor parameter would have to be threaded through
+        # every call site to say the same thing this line does, and a
+        # ProjectService over a *different* connection would read a different
+        # snapshot of the settings it is asked for.
+        self._projects = ProjectService(conn)
         self._pipelines: dict[str, Pipeline] = dict(pipelines)
         self._owner = owner
         self._job_lease_s = job_lease_s
+        self._pump_deadline_s = pump_deadline_s
         self._running: dict[str, Popen[str]] = {}
 
     # -- planning -----------------------------------------------------
@@ -306,8 +338,14 @@ class Dispatcher:
 
         Raises:
             ValidationError: the claimed job's ``pipeline_id`` names no
-                registered pipeline, or an upstream fingerprint recorded in
-                ``job_stages`` is malformed (from ``gather_inputs``).
+                registered pipeline, its ``project_id`` names no row in
+                ``projects`` (from ``ProjectService.settings_for``), or an
+                upstream fingerprint recorded in ``job_stages`` is malformed
+                (from ``gather_inputs``). A job pointing at a project that
+                does not exist is unrunnable, not merely settingless:
+                defaulting to an empty mapping would run every stage on
+                provider defaults and record cache entries under fingerprints
+                no correctly-configured run will ever reproduce.
             sqlite3.Error: a claim, read or write fails - includes
                 ``sqlite3.OperationalError`` for lock contention and
                 ``sqlite3.IntegrityError`` propagated from
@@ -333,10 +371,16 @@ class Dispatcher:
 
         stage = ready[0]
         inputs = gather_inputs(pipeline, stage.id, fingerprints, self._artifacts)
+        # The project's real settings, not the empty mapping this passed until
+        # Phase 2a. A stage's fingerprint is computed from what is in here
+        # (narrowed to its own settings_keys - see app.stage_support), so an
+        # empty mapping does not fail anything: it silently runs every stage
+        # on provider defaults and makes two projects with different voices
+        # share one cache entry.
         ctx = JobContext(
             job_id=claimed.job_id,
             project_id=claimed.project_id,
-            settings={},
+            settings=self._projects.settings_for(claimed.project_id),
             inputs=inputs,
             workdir=self._workdir_for(claimed.job_id, stage.id),
         )
@@ -720,27 +764,45 @@ class Dispatcher:
     # -- spawning and pumping a worker --------------------------------------
 
     def _spawn(self, claimed: ClaimedJob, stage: Stage, ctx: JobContext, fingerprint: str) -> bool:
-        """Acquire a ``gpu_compute`` lease, spawn a worker, and block until it
-        reports a terminal message. Returns whether a worker was started.
+        """Acquire a GPU lease, spawn a worker, and block until it reports a
+        terminal message. Returns whether a worker was started.
 
-        Only ``gpu_compute`` exists to lease against in this phase (§3.5 of
-        the design defers ``gpu_encode``/``cpu_heavy``/``net_api`` until
-        something needs them), so every spawn takes it - conservative for a
-        stage that does not actually need the GPU, but correct: nothing in
-        the current ``Stage`` protocol carries a capability descriptor to
-        decide otherwise, and a real ``requires_gpu`` gate is Phase 2's job
-        once providers exist.
+        Every spawn takes a lease from *some* GPU pool - ``stage.gpu_pool``,
+        a required ``Stage`` Protocol member (``"gpu_compute"`` for the
+        common case; ``"gpu_encode"`` for ``app.stages.compose.ComposeStage``,
+        Phase 2a's first work that contends for encode hardware rather than
+        compute). Read directly, never through ``getattr`` with a fallback:
+        an earlier version of this method defaulted a missing attribute to
+        ``gpu_compute``, which meant a typo in a stage's own ``gpu_pool``
+        degraded silently, with no type error and no test failure. Requiring
+        the attribute on the Protocol turns that into a mypy error at every
+        call site that constructs a concrete ``Stage``, which is the entire
+        point (Task 11's review) - see ``core.pipeline.stage.Stage.gpu_pool``'s
+        own docstring for the full account. Validated against
+        ``governor.KNOWN_POOLS`` here, before ever reaching
+        ``Governor.lease``, so a bad value names the offending stage rather
+        than surfacing as a bare "unknown pool" with no attribution.
 
         A refused lease defers to a later tick rather than blocking - but the
         job has to go back on the queue for that later tick to exist at all,
         and the caller has to be told no worker started, or ``tick`` reports
-        a spawn that never happened.
+        a spawn that never happened. That requeue-on-refusal path is generic
+        over which pool was tried, so it needed no change to grow a second
+        lessable pool.
 
         Raises:
+            ValidationError: ``stage.gpu_pool`` names a pool
+                ``app.scheduler.governor`` does not know about.
             OSError: the worker subprocess cannot be started.
         """
         owner = f"{claimed.job_id}:{stage.id}"
-        lease = self._governor.lease(_GPU_POOL, owner)
+        pool = stage.gpu_pool
+        if pool not in KNOWN_POOLS:
+            raise ValidationError(
+                f"stage {stage.id!r} declares gpu_pool={pool!r}, which is not a pool "
+                f"the governor knows about (known: {sorted(KNOWN_POOLS)})"
+            )
+        lease = self._governor.lease(pool, owner)
         granted = lease.__enter__()
         if not granted:
             lease.__exit__(None, None, None)
@@ -748,6 +810,7 @@ class Dispatcher:
             return False
 
         started = False
+        stderr_file: IO[bytes] | None = None
         try:
             ctx.workdir.mkdir(parents=True, exist_ok=True)
             now = utc_now_iso()
@@ -767,11 +830,19 @@ class Dispatcher:
             # there), and doing it after Popen would leave a live worker
             # blocked forever on a stdin that is never written.
             payload = json.dumps(assignment)
+            # A worker's stderr goes to a per-attempt file, never a pipe: see
+            # _pump's docstring for why 60 KB there once deadlocked this
+            # method permanently, and ffmpeg - Phase 2a's first real stderr
+            # writer - routinely logs far more than that. A file has no OS
+            # buffer to fill, so there is nothing left to drain concurrently.
+            log_path = ctx.workdir / f"stderr.attempt-{claimed.attempts}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_file = log_path.open("wb")
             proc = Popen(
                 [sys.executable, "-m", "ytauto.app.worker"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=stderr_file,
                 text=True,
                 # Explicit, never the host locale. text=True alone decodes
                 # with the locale codec - cp1252 on a typical Windows box,
@@ -796,12 +867,27 @@ class Dispatcher:
             if not started:
                 self._running.pop(owner, None)
                 self._governor.release_all(owner)
+                # _pump takes ownership of stderr_file only once a worker
+                # actually starts (the `started` path below). Every path that
+                # leaves this method without reaching that hand-off - a
+                # failed Popen, an exception before it - must close the
+                # handle itself, or the ResourceWarning gate (pyproject.toml)
+                # fails the whole suite, possibly in an unrelated test.
+                if stderr_file is not None:
+                    stderr_file.close()
 
-        self._pump(claimed.job_id, stage.id, fingerprint, proc, owner)
+        assert stderr_file is not None, "started=True implies stderr_file was opened"
+        self._pump(claimed.job_id, stage.id, fingerprint, proc, owner, stderr_file)
         return True
 
     def _pump(
-        self, job_id: str, stage_id: str, fingerprint: str, proc: Popen[str], owner: str
+        self,
+        job_id: str,
+        stage_id: str,
+        fingerprint: str,
+        proc: Popen[str],
+        owner: str,
+        stderr_file: IO[bytes],
     ) -> None:
         """Read one worker's stdout until a terminal message, then settle it.
 
@@ -814,18 +900,38 @@ class Dispatcher:
         type/version (``decode`` returning ``None``) is silently skipped -
         version skew, not a bug.
 
-        ``proc.stdout``/``proc.stderr`` are explicitly closed in ``finally``
-        - ``Popen`` never closes its pipe file objects on its own once the
-        process exits, only on GC, and Task 14 is what first exercises this
-        method against real OS pipes rather than the unit suite's
-        ``io.StringIO`` doubles, where the leak is invisible. ``stderr`` is
-        never read here: a worker that writes enough to it while nothing
-        drains the pipe could in principle block waiting for buffer space
-        while this method blocks waiting for it via ``proc.wait()`` - today's
-        synthetic stages never write enough to trigger it, but a future
-        provider stage logging verbosely to stderr could. Flagged for Phase 2
-        rather than fixed here: closing it safely dead requires draining it
-        concurrently with stdout, a larger change than this task's scope.
+        ``stderr_file`` is the per-attempt log ``_spawn`` opened and pointed
+        the worker's stderr at - never a pipe. 60 KB of worker stderr was
+        measured to deadlock this method permanently: nothing drained the
+        stderr pipe concurrently with the stdout loop above, so a worker
+        that filled the OS pipe buffer writing to stderr blocked on that
+        write forever, while this method blocked forever reading stdout -
+        and ffmpeg, Phase 2a's first real stderr writer, clears 60 KB in
+        seconds under ordinary logging. A file has no OS buffer to fill, so
+        there is nothing left to drain. ``_spawn`` hands this method
+        ownership of the handle only once a worker actually starts; it is
+        closed here, in ``finally``, exactly once - every other path closes
+        it in ``_spawn`` itself, since this method is never reached.
+
+        A worker that writes nothing and never exits is a second, independent
+        way to hang forever: the stdout loop above blocks on ``for raw_line
+        in stdout`` with no timeout of its own, and the 60 KB fix does
+        nothing for a worker that never writes anything at all. ``watchdog``,
+        a ``threading.Timer`` armed for ``pump_deadline_s`` before the read
+        loop starts, bounds that: killing the process closes its stdout,
+        which ends the loop above through its ordinary EOF path with no
+        change to the loop itself. A reader-thread-plus-queue redesign would
+        also work but restructures that read loop; the watchdog does not and
+        is the smaller change. ``timed_out`` records which of the two ways
+        this method's "no terminal message" branch was reached, so a retried
+        stage's ``last_error`` names the real cause instead of always
+        claiming a clean exit.
+
+        ``proc.stdout`` is explicitly closed in ``finally`` - ``Popen`` never
+        closes its pipe file objects on its own once the process exits, only
+        on GC, and Task 14 is what first exercises this method against real
+        OS pipes rather than the unit suite's ``io.StringIO`` doubles, where
+        the leak is invisible.
 
         Raises:
             Nothing itself. Exceptions from ``commit_stage``/``handle_error``
@@ -834,6 +940,15 @@ class Dispatcher:
         staged: list[Staged] = []
         result: Result | None = None
         error: Error | None = None
+        timed_out = False
+
+        def _kill_on_deadline() -> None:
+            nonlocal timed_out
+            timed_out = True
+            proc.kill()
+
+        watchdog = threading.Timer(self._pump_deadline_s, _kill_on_deadline)
+        watchdog.start()
         try:
             stdout = proc.stdout
             if stdout is not None:
@@ -869,10 +984,10 @@ class Dispatcher:
                 proc.kill()
                 proc.wait()
         finally:
+            watchdog.cancel()
             if proc.stdout is not None:
                 proc.stdout.close()
-            if proc.stderr is not None:
-                proc.stderr.close()
+            stderr_file.close()
             self._governor.release_all(owner)
             self._running.pop(owner, None)
 
@@ -884,16 +999,20 @@ class Dispatcher:
             self.handle_error(error)
         else:
             # stdout closed with no terminal message: the worker died without
-            # reporting anything. Reset now rather than waiting for the job
-            # lease to expire and reap() to notice - but charge the attempt,
-            # because a worker that dies this way dies again on the next
-            # spawn, and requeueing at zero without counting is an unbounded
-            # fork loop (see _retry_stage).
+            # reporting anything, or the watchdog killed it. Reset now rather
+            # than waiting for the job lease to expire and reap() to notice -
+            # but charge the attempt, because a worker that dies this way
+            # dies again on the next spawn, and requeueing at zero without
+            # counting is an unbounded fork loop (see _retry_stage).
+            reason = (
+                f"exceeded the {self._pump_deadline_s}s pump deadline and was killed"
+                if timed_out
+                else f"exited without a terminal message (exit code {proc.returncode})"
+            )
             with transaction(self._conn):
                 self._reset_stage(job_id, stage_id)
             self._retry_stage(
                 job_id,
                 stage_id,
-                f"worker for stage {stage_id!r} exited without a terminal message "
-                f"(exit code {proc.returncode})",
+                f"worker for stage {stage_id!r} {reason}",
             )

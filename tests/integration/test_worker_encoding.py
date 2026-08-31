@@ -26,11 +26,13 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
 from ytauto.core.pipeline.stage import JobContext, ProgressFn, StageResult
+from ytauto.infra.cas.store import CasStore
 
 pytestmark = pytest.mark.integration
 
@@ -44,15 +46,17 @@ this host."""
 class ChattyStage:
     """A stage that logs one non-ASCII line to its own stdout, then succeeds.
 
-    Zero-arg constructible and at module scope because ``app/worker.py``
-    resolves stages by reflection off ``"module:QualName"`` - see
-    ``tests/integration/test_resume.py``'s module docstring for the full
-    cross-process plumbing note.
+    At module scope, and registered as the ``it-encoding:chatty`` entry point
+    below, because ``app/worker.py`` resolves stages through
+    ``app/registry.py`` - see ``tests/integration/test_resume.py``'s module
+    docstring for the full cross-process plumbing note.
     """
 
     id = "chatty"
     version = 1
     depends_on: tuple[str, ...] = ()
+    settings_keys: tuple[str, ...] = ()
+    gpu_pool = "gpu_compute"
 
     def fingerprint(self, ctx: JobContext) -> str:
         return "d" * 64
@@ -62,17 +66,33 @@ class ChattyStage:
         return StageResult(artifacts=())
 
 
+def make_chatty(*, cas: CasStore, settings: Mapping[str, object]) -> ChattyStage:
+    """Entry point ``it-encoding:chatty``. Produces no artifacts, so it never
+    needs the store it is handed."""
+    return ChattyStage()
+
+
+_PIPELINE_ID = "it-encoding"
+
+
 def _assignment(tmp_path: Path) -> dict[str, object]:
+    """The exact shape ``dispatcher._build_assignment`` emits.
+
+    Hand-built rather than produced by the dispatcher because this test drives
+    the worker directly (see the module docstring); if the two ever disagree,
+    ``tests/unit/app/test_dispatcher.py`` is what notices, since it asserts on
+    the real builder's output.
+    """
     return {
         "job_id": "enc-job",
         "stage_id": ChattyStage.id,
         "project_id": "proj-1",
+        "pipeline_id": _PIPELINE_ID,
         "correlation_id": "enc-job:chatty:1",
         "cas_root": str(tmp_path / "cas"),
         "workdir": str(tmp_path / "work"),
         "settings": {},
         "fingerprint": "d" * 64,
-        "stage_import": f"{ChattyStage.__module__}:{ChattyStage.__qualname__}",
         "inputs": {},
     }
 

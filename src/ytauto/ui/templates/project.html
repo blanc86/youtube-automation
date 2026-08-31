@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+{% set nav = 'projects' %}
+{% block title %}{{ project.title }} · ytauto{% endblock %}
+
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>{{ project.title }}</h1>
+      <p class="muted"><code>{{ project.slug }}</code></p>
+    </div>
+    <form method="post" action="{{ url_for('render', slug=project.slug) }}"
+          id="render-form" data-task-form>
+      <button type="submit" class="button primary">Render</button>
+    </form>
+  </div>
+
+  <section class="panel render"
+           {% if render_task and render_task.state == 'running' %}data-state="running"{% endif %}>
+    {# The status text is replaced wholesale by app.js as a render progresses,
+       so the canvas pair lives outside it and survives. #}
+    <div class="render-body" id="render-status"
+         data-poll-url="{{ url_for('task_status', task_id='TASK_ID') }}"
+         {% if render_task and render_task.state == 'running' %}data-task-id="{{ render_task.id }}"{% endif %}>
+      <h2>Render</h2>
+      {% if render_task %}
+        {% if render_task.state == 'running' %}
+          <p class="status running"><span class="spinner" aria-hidden="true"></span> Rendering — this takes 10–120 seconds.</p>
+        {% elif render_task.state == 'succeeded' %}
+          <p class="status ok">Done. Both masters are in:</p>
+          <p class="output-dir">{{ render_task.payload.output_dir }}</p>
+        {% else %}
+          <p class="status bad">{{ render_task.detail }}</p>
+        {% endif %}
+      {% else %}
+        <p class="muted">Not rendered in this session.
+          {% if last_job %}Last job: <span class="state state-{{ last_job.state }}">{{ last_job.state }}</span>.{% endif %}
+        </p>
+      {% endif %}
+    </div>
+
+    <div class="canvas-pair" aria-hidden="true">
+      <div class="canvas-slot">
+        <div class="canvas canvas-landscape"></div>
+        <span>1920×1080</span>
+      </div>
+      <div class="canvas-slot">
+        <div class="canvas canvas-vertical"></div>
+        <span>1080×1920</span>
+      </div>
+    </div>
+  </section>
+
+  <div class="split">
+    <form method="post" action="{{ url_for('save_story', slug=project.slug) }}" class="panel">
+      <h2>Story</h2>
+      <p class="hint">Saving rewrites <code>story.txt</code>. The next render picks up the change automatically.</p>
+      <textarea name="story" rows="24" required>{{ story }}</textarea>
+      <div class="actions">
+        <button type="submit" class="button">Save story</button>
+      </div>
+    </form>
+
+    <form method="post" action="{{ url_for('save_settings', slug=project.slug) }}" class="panel">
+      <h2>Settings</h2>
+
+      <div class="field-row">
+        <div>
+          <label for="voice">Voice</label>
+          <input id="voice" name="voice" type="text" value="{{ values.voice }}" />
+        </div>
+        <div>
+          <label for="rate">Rate</label>
+          <input id="rate" name="rate" type="text" value="{{ values.rate }}" />
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div>
+          <label for="seed">Seed</label>
+          <input id="seed" name="seed" type="number" step="1" value="{{ values.seed }}" />
+        </div>
+        <div>
+          <label for="encoder">Encoder</label>
+          <input id="encoder" name="encoder" type="text" value="{{ values.encoder }}" />
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div>
+          <label for="words_per_group_min">Words per caption, min</label>
+          <input id="words_per_group_min" name="words_per_group_min" type="number" min="1" step="1"
+                 value="{{ values.words_per_group_min }}" />
+        </div>
+        <div>
+          <label for="words_per_group_max">max</label>
+          <input id="words_per_group_max" name="words_per_group_max" type="number" min="1" step="1"
+                 value="{{ values.words_per_group_max }}" />
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div>
+          <label for="segment_seconds_min">B-roll segment seconds, min</label>
+          <input id="segment_seconds_min" name="segment_seconds_min" type="number" min="0.1" step="0.1"
+                 value="{{ values.segment_seconds_min }}" />
+        </div>
+        <div>
+          <label for="segment_seconds_max">max</label>
+          <input id="segment_seconds_max" name="segment_seconds_max" type="number" min="0.1" step="0.1"
+                 value="{{ values.segment_seconds_max }}" />
+        </div>
+      </div>
+
+      <h3>Music</h3>
+      {% if tracks %}
+        <div class="field-row">
+          <div>
+            <label for="music_track_id">Track</label>
+            <select id="music_track_id" name="music_track_id">
+              <option value="" {% if not values.music_track_id %}selected{% endif %}>No music</option>
+              {% for track in tracks %}
+                <option value="{{ track.id }}" {% if track.id == values.music_track_id %}selected{% endif %}>
+                  {{ track.title }} ({{ '%.0f'|format(track.duration_s) }}s)
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label for="music_gain_db">Level (0 = standard)</label>
+            <div class="slider">
+              <input id="music_gain_db" name="music_gain_db" type="range"
+                     min="-30" max="12" step="1" value="{{ values.music_gain_db }}"
+                     data-music-gain />
+              <output for="music_gain_db">{{ values.music_gain_db }} dB</output>
+            </div>
+          </div>
+        </div>
+        <p class="hint">
+          Every track is normalised to the same bed level first, so this is a trim
+          around it rather than a raw attenuation — 0 sits about 10 dB under the
+          narration whether the file is quiet or loud. The voice is never touched.
+          Short tracks loop; every track fades out at the end.
+        </p>
+      {% else %}
+        <p class="hint">
+          No tracks in the library yet. <a href="{{ url_for('music') }}">Add one</a> to put a
+          bed under this narration.
+        </p>
+      {% endif %}
+
+      <h3>Captions</h3>
+      <div class="field-row">
+        <div>
+          <label for="primary_colour">Word colour</label>
+          <div class="swatch">
+            <input id="primary_colour" name="primary_colour" type="color"
+                   value="{{ values.primary_colour }}" data-caption-primary />
+            <output for="primary_colour">{{ values.primary_colour }}</output>
+          </div>
+        </div>
+        <div>
+          <label for="accent_colour">Spoken-word colour</label>
+          <div class="swatch">
+            <input id="accent_colour" name="accent_colour" type="color"
+                   value="{{ values.accent_colour }}" data-caption-accent />
+            <output for="accent_colour">{{ values.accent_colour }}</output>
+          </div>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div>
+          <label for="alignment">Position</label>
+          <select id="alignment" name="alignment">
+            {% for code, label in alignments %}
+              <option value="{{ code }}" {% if code == values.alignment %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="font_size">Font size</label>
+          <input id="font_size" name="font_size" type="number" min="1" step="1"
+                 value="{{ values.font_size }}" placeholder="automatic" />
+          <p class="hint">Blank scales per canvas: 54 landscape, 96 vertical.</p>
+        </div>
+      </div>
+
+      {# A viewport, not a swatch: the caption sits where the alignment above
+         puts it, in the colours picked, at the size that will render. #}
+      <figure class="frame" data-caption-preview data-align="{{ values.alignment }}">
+        <div class="frame-inner">
+          <p class="cap">the <span data-caption-word>spoken</span> word</p>
+        </div>
+        <figcaption>1920×1080 — position, colour and size as they will render</figcaption>
+      </figure>
+
+      <div class="actions">
+        <button type="submit" class="button">Save settings</button>
+      </div>
+    </form>
+  </div>
+{% endblock %}

@@ -116,7 +116,6 @@ class Evictor:
                 process holds it open).
         """
         known = self._store.known_digests()
-        cutoff = time.time() - min_age_s
         orphans = orphan_bytes = staging = staging_bytes = 0
 
         for path in self._store.root.glob("*/*/*"):
@@ -126,7 +125,16 @@ class Evictor:
                 stat = path.stat()
             except FileNotFoundError:
                 continue  # a concurrent sweep or writer got there first
-            if stat.st_mtime > cutoff:
+            # Clamped at zero, because a file's timestamp can legitimately read
+            # *ahead* of the wall clock: NTFS records to 100ns while the
+            # Windows system clock advances in ~15.6ms ticks, so a blob written
+            # microseconds ago can carry an mtime later than time.time(). A
+            # bare `st_mtime > time.time() - min_age_s` then skips it - and
+            # with min_age_s=0, which reads as "no age restriction", it skipped
+            # a brand-new orphan permanently. That is exactly how this surfaced:
+            # green on one Windows machine, `assert 0 == 1` on another.
+            age_s = max(0.0, time.time() - stat.st_mtime)
+            if age_s < min_age_s:
                 continue
 
             if path.name.endswith(_STAGING_SUFFIX):

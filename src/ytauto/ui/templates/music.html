@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% set nav = 'music' %}
+{% block title %}Music · ytauto{% endblock %}
+
+{% block content %}
+  <div class="page-head">
+    <h1>Music library</h1>
+  </div>
+
+  <form method="post" action="{{ url_for('music') }}" class="panel">
+    <h2>Add a track</h2>
+    <p class="hint">
+      Adding is quick — the file is stored as it is, with no transcode. The source URL and
+      licence are required: a Content ID match on the bed claims the whole video, whatever
+      the footage under it is licensed as.
+    </p>
+
+    <label for="path">File path</label>
+    <input id="path" name="path" type="text" required autocomplete="off"
+           placeholder="C:\music\slow-pulse.mp3"
+           value="{{ form.path if form else '' }}" />
+
+    <div class="field-row">
+      <div>
+        <label for="source_url">Source URL</label>
+        <input id="source_url" name="source_url" type="text" required
+               placeholder="https://example.com/track" value="{{ form.source_url if form else '' }}" />
+      </div>
+      <div>
+        <label for="licence">Licence</label>
+        <input id="licence" name="licence" type="text" required
+               placeholder="CC0" value="{{ form.licence if form else '' }}" />
+      </div>
+    </div>
+
+    <div class="field-row">
+      <div>
+        <label for="title">Title</label>
+        <input id="title" name="title" type="text" class="prose"
+               placeholder="defaults to the filename" value="{{ form.title if form else '' }}" />
+      </div>
+      <div>
+        <label for="attribution">Attribution</label>
+        <input id="attribution" name="attribution" type="text" class="prose"
+               value="{{ form.attribution if form else '' }}" />
+      </div>
+    </div>
+
+    <label for="notes">Notes</label>
+    <input id="notes" name="notes" type="text" class="prose"
+           value="{{ form.notes if form else '' }}" />
+
+    <div class="actions">
+      <button type="submit" class="button primary">Add track</button>
+    </div>
+  </form>
+
+  {% if tracks %}
+    <table>
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>Length</th>
+          <th>Licence</th>
+          <th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for track in tracks %}
+          <tr>
+            <td>{{ track.title }}</td>
+            <td>{{ '%.1f'|format(track.duration_s) }}s</td>
+            <td>{{ track.licence }}{% if track.attribution %} <span class="muted">({{ track.attribution }})</span>{% endif %}</td>
+            <td class="truncate muted">{{ track.source_url }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">
+      No music yet. A video without a bed is a finished video — this is optional.
+    </p>
+  {% endif %}
+{% endblock %}

@@ -104,3 +104,59 @@ def test_the_subtitles_filter_alone_is_not_enough() -> None:
     assert not FfmpegCapabilities(
         encoders=frozenset(), filters=frozenset({"subtitles"})
     ).has_subtitle_burn_in()
+
+
+# -- version robustness: the flag column is not a fixed width -------------------
+
+FILTERS_OUTPUT_FFMPEG_9 = """Filters:
+  T.. = Timeline support
+  .S. = Slice threading
+  A->A = Audio input/output
+ .. ass               V->V       Render ASS subtitles onto input video using the libass library.
+ TS volume            A->A       Change input volume.
+ .. amix              N->A       Audio mixing.
+"""
+
+
+def test_filters_parse_on_ffmpeg_9_which_prints_two_flag_characters() -> None:
+    """Captured verbatim from a CI run on ffmpeg 9.0.1, which prints two flag
+    characters where 7.1.1 printed three.
+
+    A fixed-width flag column matched nothing on that build, every capability
+    came back empty, and the operator was told a gyan full build compiled with
+    --enable-libass "has no 'ass' filter (libass)".
+    """
+    filters = parse_filters(FILTERS_OUTPUT_FFMPEG_9)
+    assert "ass" in filters
+    assert {"volume", "amix"} <= filters
+
+
+def test_the_legend_never_becomes_a_filter_name() -> None:
+    """Structural, not a special case: legend and header rows carry no
+    ``inputs->outputs`` signature, so the anchor excludes them."""
+    filters = parse_filters(FILTERS_OUTPUT_FFMPEG_9)
+    assert "Filters:" not in filters
+    assert "=" not in filters
+    assert "Timeline" not in filters
+    # "A->A = Audio input/output" is a legend row that DOES contain "->";
+    # it must still not be read as a filter named "=".
+    assert not any(name.startswith("=") for name in filters)
+
+
+def test_a_probe_that_cannot_run_is_not_reported_as_a_missing_feature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returning "" on a failed probe made every capability look absent, so the
+    error named a feature the build actually had."""
+    import subprocess as _subprocess
+
+    from ytauto.infra.ffmpeg import probe as probe_module
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "ffmpeg: cannot open shared library"
+
+    monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _Failed())
+    with pytest.raises(ConfigurationError, match="capabilities could not be determined"):
+        probe_module._run("ffmpeg", "-filters")

@@ -219,3 +219,58 @@ def test_put_bytes_still_works_and_is_stage_plus_record(store: CasStore) -> None
     digest = store.put_bytes(b"payload", kind="blob")
     assert store.exists(digest)
     assert store.size_of(digest) == 7
+
+
+# -- stage_path: the worker-safe, path-based sibling of stage_file ------------
+
+
+def test_stage_path_stores_the_file_without_touching_the_database(
+    store: CasStore, tmp_path: Path, db_conn: sqlite3.Connection
+) -> None:
+    """Same contract as ``stage_file``: filesystem only, so a worker
+    subprocess (which must never write SQLite) can call it and report the
+    digest back to the parent."""
+    src = tmp_path / "master.mp4"
+    src.write_bytes(b"rendered video bytes")
+
+    digest = store.stage_path(src, kind="video")
+
+    assert store.exists(digest)
+    assert store.read_bytes(digest) == b"rendered video bytes"
+    assert db_conn.execute("SELECT count(*) AS n FROM cas_objects").fetchone()["n"] == 0
+    assert src.is_file(), "copy is the default; the source must survive"
+
+
+def test_stage_path_with_move_consumes_the_source(store: CasStore, tmp_path: Path) -> None:
+    src = tmp_path / "master.mp4"
+    src.write_bytes(b"rendered video bytes")
+
+    digest = store.stage_path(src, kind="video", move=True)
+
+    assert store.exists(digest)
+    assert not src.exists(), "move=True is what stops a full-size duplicate outliving the copy"
+
+
+def test_stage_path_with_move_consumes_the_source_when_the_content_is_already_stored(
+    store: CasStore, tmp_path: Path
+) -> None:
+    """The deduplication branch. A caller using ``move=True`` for cleanup
+    would otherwise silently keep its duplicate in exactly the case where the
+    content already existed - a re-render producing byte-identical output,
+    which is common here precisely because the pipeline is deterministic."""
+    first = tmp_path / "first.mp4"
+    first.write_bytes(b"identical render")
+    store.stage_path(first, kind="video", move=True)
+
+    second = tmp_path / "second.mp4"
+    second.write_bytes(b"identical render")
+
+    digest = store.stage_path(second, kind="video", move=True)
+
+    assert store.exists(digest)
+    assert not second.exists()
+
+
+def test_stage_path_rejects_a_missing_source(store: CasStore, tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        store.stage_path(tmp_path / "never-rendered.mp4", kind="video")

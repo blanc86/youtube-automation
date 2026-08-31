@@ -57,6 +57,11 @@ class _FakeStage:
         self.id = stage_id
         self.version = 1
         self.depends_on = depends_on
+        # These tests build FingerprintSpecs through build_spec directly, so
+        # nothing here reads settings_keys; it is declared because a Stage
+        # that omits it no longer satisfies the protocol at all.
+        self.settings_keys: tuple[str, ...] = ()
+        self.gpu_pool = "gpu_compute"
         self._produces = tuple(produces)
         self._raises = raises
         self._cas = cas
