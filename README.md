@@ -355,9 +355,14 @@ The quality gate runs everything CI does:
 python scripts/check.py
 ```
 
-That's ruff, mypy, import-linter and both test suites — 687 unit tests and 22
+That's ruff, mypy, import-linter and both test suites — 712 unit tests and 26
 integration tests. The integration suite drives real ffmpeg and real speech
 synthesis, so it needs a network connection and takes a couple of minutes.
+
+**CI runs on Windows only.** That is the platform this is developed and used
+on. The code has no Windows-specific dependency and should run anywhere ffmpeg
+does, but only Windows is actually verified on every push — treat macOS and
+Linux as unverified rather than supported.
 
 Architecture, extension points and contributor tasks:
 
