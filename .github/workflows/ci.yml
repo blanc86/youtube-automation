@@ -46,7 +46,7 @@ jobs:
       - name: show what ffmpeg we got
         run: |
           ffmpeg -hide_banner -version
-          ffmpeg -hide_banner -filters | grep -E "ass" || (echo "no ass filter in this build" && exit 1)
+          ffmpeg -hide_banner -filters | grep -w ass || (echo "no libass in this ffmpeg build" && exit 1)
         shell: bash
       - run: pip install -e ".[dev]"
       # One step, invoking the same gate developers run locally. Listing the
